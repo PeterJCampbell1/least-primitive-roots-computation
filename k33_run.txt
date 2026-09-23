@@ -1,0 +1,41 @@
+Configuration:
+K: 33
+Search bound B: 1.8 x 10^54
+Prime generation limit: 4000
+Primitive root search limit: 1000
+
+Search summary:
+---------------
+K-prime supports examined: 229340721
+Supports requiring candidate search after Corollary 4: 1345681
+Candidates not covered by Corollary 4: 1595345
+Proved composite by base-2 Fermat test: 1481128
+Surviving base-2 Fermat test: 114217
+Least primitive root certified: 114217
+Grosswald inequality verified: 114217
+Grosswald inequality failed: 0
+No least primitive root certified within search limit: 0
+Largest least primitive root found: 454
+	Command being timed: "./lpr"
+	User time (seconds): 947.39
+	System time (seconds): 0.00
+	Percent of CPU this job got: 100%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 15:47.38
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 4352
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 165
+	Voluntary context switches: 1
+	Involuntary context switches: 1716
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
