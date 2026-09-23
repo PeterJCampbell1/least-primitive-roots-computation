@@ -30,6 +30,7 @@ Tested under Ubuntu 24.04 in WSL.
 On Ubuntu, GMP can be installed with:
 ```bash
 sudo apt install libgmp-dev
+```
 
 ## Build
 Compile from the repository root with:
