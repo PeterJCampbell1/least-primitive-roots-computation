@@ -188,7 +188,7 @@ Since $Qd\leq B$, it is enough to consider
 
 However, only those $d$ whose prime divisors already belong to the support are admissible. Equivalently,
 ```math
-\operatorname{rad}(d)=\prod_{\substack{\ell \mid d \\ \ell \text{ prime}}} \ell \mid Q.
+\mathrm{rad}(d)=\prod_{\substack{\ell \mid d \\ \ell \text{ prime}}} \ell \mid Q.
 ```
 This avoids introducing any new distinct prime factor into the value
 ```math
@@ -200,11 +200,11 @@ Conversely, every integer $n\leq B$ with $\omega(n)=33$ has a unique representat
 ```math
 n=Qd,
 ```
-where $Q=\operatorname{rad}(n)$. The support search generates this $Q$, and $d=n/Q$ satisfies
+where $Q=\mathrm{rad}(n)$. The support search generates this $Q$, and $d=n/Q$ satisfies
 ```math
 d\leq \left\lfloor\frac{B}{Q}\right\rfloor
 \qquad\text{and}\qquad
-\operatorname{rad}(d)\mid Q.
+\mathrm{rad}(d)\mid Q.
 ```
 Hence every such $n$ is covered by the search.
 
@@ -255,7 +255,7 @@ The order criterion used is
 ```math
 g^k\equiv1\pmod p
 \iff
-\operatorname{ord}_p(g)\mid k,
+\mathrm{ord}_p(g)\mid k,
 ```
 once $(g,p)=1$.
 
@@ -264,20 +264,20 @@ The program first checks
 g^n\equiv1\pmod p.
 ```
 
-Passing this test establishes $(g,p)=1$, so $\operatorname{ord}_p(g)$ is defined and divides $n$.
+Passing this test establishes $(g,p)=1$, so $\mathrm{ord}_p(g)$ is defined and divides $n$.
 
 The program then checks, for every distinct prime divisor $q\mid n$, that
 ```math
 g^{n/q}\not\equiv1\pmod p.
 ```
 
-If $\operatorname{ord}_p(g)$ were a proper divisor of $n$, then for some prime $q\mid n$ one would have
+If $\mathrm{ord}_p(g)$ were a proper divisor of $n$, then for some prime $q\mid n$ one would have
 ```math
-\operatorname{ord}_p(g)\mid \frac nq,
+\mathrm{ord}_p(g)\mid \frac nq,
 ```
 which would force $g^{n/q}\equiv1\pmod p$. Therefore, if none of these tests returns 1, then
 ```math
-\operatorname{ord}_p(g)=n=p-1.
+\mathrm{ord}_p(g)=n=p-1.
 ```
 
 An element of order $p-1$ also certifies that $p$ is prime: the order of a unit modulo $p$ divides $\varphi(p)$, and $\varphi(p)\leq p-1$, so order $p-1$ forces $\varphi(p)=p-1$. Since $\varphi(p)=p-1$ only when $p$ is prime, this certifies primality.
