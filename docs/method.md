@@ -18,7 +18,7 @@ on $n=p-1$. Thus every candidate considered satisfies $p-1 \leq B$. The value $B
 
 Write the distinct prime divisors of $p-1$ as
 ```math
-q_1<q_2<\cdots<q_{33},
+q_1\lt q_2\lt \cdots\lt q_{33},
 ```
 and define the squarefree support product
 ```math
@@ -152,7 +152,7 @@ F
 
 Corollary 4 gives the sufficient condition
 ```math
-4220F^{16}<p.
+4220F^{16}\lt p.
 ```
 
 All arithmetic used to form this threshold is exact. If
@@ -286,7 +286,7 @@ Because the program tests $g$ in increasing order, the first successful value is
 
 Finally, the program verifies Grosswald's inequality directly by checking
 ```math
-(g(p)+2)^2<p.
+(g(p)+2)^2\lt p.
 ```
 
 If no full-order element is found up to the search limit, the candidate is recorded as unresolved rather than silently discarded.
@@ -296,7 +296,7 @@ If no full-order element is found up to the search limit, the candidate is recor
 The program exits successfully only if
 
 - there are no unresolved candidates, and
-- no certified prime fails $(g(p)+2)^2<p$.
+- no certified prime fails $(g(p)+2)^2\lt p$.
 
 The complete output of the final `v1.0-k33` run is recorded in `k33_run.txt`.
 
