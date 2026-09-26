@@ -21,6 +21,11 @@ for the remaining range below $1.8\times 10^{54}$.
 The search uses the factorisation-specific form of Corollary 4 from Bagger's
 paper and directly verifies the remaining candidates.
 
+## Method
+
+A detailed description of the computational method is available in
+[`docs/method.md`](docs/method.md).
+
 ## Requirements
 - C++17 compiler
 - GMP and GMP C++ libraries
