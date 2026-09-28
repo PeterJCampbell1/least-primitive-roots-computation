@@ -10,7 +10,8 @@ struct Corollary4Threshold {
 };
 
 Corollary4Threshold make_corollary4_threshold(
-    const std::vector<unsigned>& support
+    const mpz_class& Q,
+    const mpz_class& S
 );
 
 bool corollary4_proves_grosswald(

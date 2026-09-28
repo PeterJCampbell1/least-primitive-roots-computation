@@ -57,6 +57,7 @@ compile_commands.json
 *.log
 *.bak
 *.swp
+**/*.dSYM
 
 # vcpkg
 vcpkg_installed/
@@ -67,3 +68,11 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Other tests/profiling
+**/*.err
+**/*.gz
+
+# Executables
+lpr
+lpr_g

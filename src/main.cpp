@@ -1,6 +1,7 @@
 #include <gmpxx.h>
 #include "corollary4.hpp"
 #include "primality.hpp"
+#include "stats.hpp"
 
 #include <cstdint>
 #include <iostream>
@@ -42,32 +43,31 @@ std::vector<unsigned> generate_primes(unsigned limit)
 void dfs(
     std::size_t next_index,
     const mpz_class& current_product,
+    const mpz_class& current_sop, // Elementary symmetric poly of deg = len(supp)-1, eval at support
     std::vector<unsigned>& support,
     const std::vector<unsigned>& primes,
     std::size_t k,
     const mpz_class& bound,
     unsigned primitive_root_search_limit,
-    std::uint64_t& total_support_count,
-    std::uint64_t& surviving_support_count,
-    std::uint64_t& candidate_count,
-    std::uint64_t& fermat_composite_count,
-    std::uint64_t& fermat_survivor_count,
-    std::uint64_t& certified_count,
-    std::uint64_t& unresolved_count,
-    std::uint64_t& certified_inequality_pass_count,
-    std::uint64_t& certified_inequality_fail_count,
-    mpz_class& largest_least_primitive_root
+    LPRStats& stats
 ) {
     if (support.size() == k) {
-        ++total_support_count;
+        if (support[0] != 2) {
+            throw std::runtime_error(
+                "Support must contain 2!"
+            );
+        }
+
+        ++stats.total_support_count;
 
         const mpz_class& Q = current_product;
+        const mpz_class& S = current_sop;
 
-        const Corollary4Threshold corollary4_threshold = make_corollary4_threshold(support);
+        const Corollary4Threshold corollary4_threshold = make_corollary4_threshold(Q, S);
         if (corollary4_proves_grosswald(Q + 1, corollary4_threshold)) {
             return;
         }
-        ++surviving_support_count;
+        ++stats.surviving_support_count;
 
         const mpz_class m = bound / Q;
 
@@ -92,29 +92,29 @@ void dfs(
                 if (corollary4_proves_grosswald(p, corollary4_threshold)) {
                     break;
                 }
-                ++candidate_count;
+                ++stats.candidate_count;
 
                 if (is_composite_base2_fermat(p)) {
-                    ++fermat_composite_count;
+                    ++stats.fermat_composite_count;
                 } else {
-                    ++fermat_survivor_count;
+                    ++stats.fermat_survivor_count;
 
                     const mpz_class n = p - 1;
                     const auto g = find_least_primitive_root(
                         p, n, support, primitive_root_search_limit
                     );
                     if (g) {
-                        ++certified_count;
+                        ++stats.certified_count;
 
-                        if (*g > largest_least_primitive_root) {
-                            largest_least_primitive_root = *g;
+                        if (*g > stats.largest_least_primitive_root) {
+                            stats.largest_least_primitive_root = *g;
                         }
 
                         const mpz_class g_plus_two = *g + 2;
                         if (g_plus_two * g_plus_two < p) {
-                            ++certified_inequality_pass_count;
+                            ++stats.certified_inequality_pass_count;
                         } else {
-                            ++certified_inequality_fail_count;
+                            ++stats.certified_inequality_fail_count;
                             std::cout << "Grosswald inequality failure: p = "
                                       << p
                                       << ", g(p) = "
@@ -122,7 +122,7 @@ void dfs(
                                       << '\n';
                         }
                     } else {
-                        ++unresolved_count;
+                        ++stats.unresolved_count;
                         std::cout << "Unresolved candidate p = "
                                   << p
                                   << '\n';
@@ -148,6 +148,9 @@ void dfs(
         mpz_class new_product =
             current_product * primes[i];
 
+        mpz_class new_sop = 
+            current_product + (primes[i] * current_sop);
+
         mpz_class minimum_complete_product =
             new_product;
 
@@ -166,21 +169,13 @@ void dfs(
         dfs(
             i + 1,
             new_product,
+            new_sop,
             support,
             primes,
             k,
             bound,
             primitive_root_search_limit,
-            total_support_count,
-            surviving_support_count,
-            candidate_count,
-            fermat_composite_count,
-            fermat_survivor_count,
-            certified_count,
-            unresolved_count,
-            certified_inequality_pass_count,
-            certified_inequality_fail_count,
-            largest_least_primitive_root
+            stats
         );
 
         support.pop_back();
@@ -250,82 +245,24 @@ int main()
     std::vector<unsigned> support;
 
     // Counters updated by dfs() through reference parameters.
-    std::uint64_t total_support_count = 0;
-    std::uint64_t surviving_support_count = 0;
-    std::uint64_t candidate_count = 0;
-    std::uint64_t fermat_composite_count = 0;
-    std::uint64_t fermat_survivor_count = 0;
-    std::uint64_t certified_count = 0;
-    std::uint64_t unresolved_count = 0;
-    std::uint64_t certified_inequality_pass_count = 0;
-    std::uint64_t certified_inequality_fail_count = 0;
-
-    mpz_class largest_least_primitive_root = 0;
+    LPRStats stats;
 
     dfs(
         0,
         1,
+        0,
         support,
         primes,
         K,
         bound,
         PRIMITIVE_ROOT_SEARCH_LIMIT,
-        total_support_count,
-        surviving_support_count,
-        candidate_count,
-        fermat_composite_count,
-        fermat_survivor_count,
-        certified_count,
-        unresolved_count,
-        certified_inequality_pass_count,
-        certified_inequality_fail_count,
-        largest_least_primitive_root
+        stats
     );
 
-    std::cout << "Search summary:\n"
-              << "---------------\n";
+    stats.print();
 
-    std::cout << "K-prime supports examined: "
-              << total_support_count
-              << '\n';
-
-    std::cout << "Supports requiring candidate search after Corollary 4: "
-              << surviving_support_count
-              << '\n';
-
-    std::cout << "Candidates not covered by Corollary 4: "
-              << candidate_count
-              << '\n';
-
-    std::cout << "Proved composite by base-2 Fermat test: "
-              << fermat_composite_count
-              << '\n';
-
-    std::cout << "Surviving base-2 Fermat test: "
-              << fermat_survivor_count
-              << '\n';
-
-    std::cout << "Least primitive root certified: "
-              << certified_count
-              << '\n';
-
-    std::cout << "Grosswald inequality verified: "
-              << certified_inequality_pass_count
-              << '\n';
-
-    std::cout << "Grosswald inequality failed: "
-              << certified_inequality_fail_count
-              << '\n';
-
-    std::cout << "No least primitive root certified within search limit: "
-              << unresolved_count
-              << '\n';
-
-    std::cout << "Largest least primitive root found: "
-              << largest_least_primitive_root
-              << '\n';
-    if (unresolved_count > 0 ||
-        certified_inequality_fail_count > 0) {
+    if (stats.unresolved_count > 0 ||
+        stats.certified_inequality_fail_count > 0) {
         return 1;
     }
 
