@@ -4,10 +4,10 @@ See method.md for original method.
 
 ---
 
-Date: **28/09/21** 
-Author: **Mittun Sudhahar**
-Commit: TODO
-OMEGA: 33
+Date: **28/09/21**   
+Author: **Mittun Sudhahar**  
+Commit: f83d8b30413553fd5a34c0fd261f6a24459b6fc9  
+OMEGA: 33  
 
 This note describes initial optimisations/changes made to the method in `method.md`.
 
@@ -25,9 +25,9 @@ This allows GMP to make further optimisations.
 The largest improvement was implemented here. We first redefine $\delta$:
 
 $$\delta := 1 - \sum_{i=1}^s p_i^{-1}$$
-
-$$ Q_j := \prod_{i=1}^j p_i; \, Q_0 := 1; \, Q := Q_s$$
-$$ S_j := \sum_{i=1}^j Q_j // p_i; \, S_0 := 0; \, S := S_s$$ where $//$ means exact integer division.
+$$ Q_j := \prod_{i=1}^j p_i; \, Q_0 := 1; \, Q := Q_s $$
+$$ S_j := \sum_{i=1}^j Q_j \mathbin{//} p_i; \, S_0 := 0; \, S := S_s $$ 
+where $\mathbin{//}$ means exact integer division.
 
 Note that $Q_j$ and $S_j$ are elementary symmetric polynomials in $j$ variables of degree $j$ and $j-1$ respectively. It follows then that,
 
