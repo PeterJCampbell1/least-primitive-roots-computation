@@ -2,6 +2,7 @@
 #include "corollary4.hpp"
 #include "primality.hpp"
 #include "stats.hpp"
+#include "parameters.hpp"
 
 #include <cstdint>
 #include <iostream>
@@ -43,7 +44,8 @@ std::vector<unsigned> generate_primes(unsigned limit)
 void dfs(
     std::size_t next_index,
     const mpz_class& current_product,
-    const mpz_class& current_sop, // Elementary symmetric poly of deg = len(supp)-1, eval at support
+    const mpz_class& current_delta_Q,
+    const mpz_class& current_delta_sop, // Elementary symmetric poly of deg = len(supp)-1, eval at support
     std::vector<unsigned>& support,
     const std::vector<unsigned>& primes,
     std::size_t k,
@@ -51,19 +53,17 @@ void dfs(
     unsigned primitive_root_search_limit,
     LPRStats& stats
 ) {
-    if (support.size() == k) {
-        if (support[0] != 2) {
-            throw std::runtime_error(
-                "Support must contain 2!"
-            );
-        }
+    using parameters::OMEGA;
+    using parameters::S;
 
+    if (support.size() == k) {
         ++stats.total_support_count;
 
         const mpz_class& Q = current_product;
-        const mpz_class& S = current_sop;
+        const mpz_class& delta_Q = current_delta_Q;
+        const mpz_class& delta_S = current_delta_sop;
 
-        const Corollary4Threshold corollary4_threshold = make_corollary4_threshold(Q, S);
+        const Corollary4Threshold corollary4_threshold = make_corollary4_threshold(delta_Q, delta_S);
         if (corollary4_proves_grosswald(Q + 1, corollary4_threshold)) {
             return;
         }
@@ -148,8 +148,16 @@ void dfs(
         mpz_class new_product =
             current_product * primes[i];
 
-        mpz_class new_sop = 
-            current_product + (primes[i] * current_sop);
+        mpz_class new_delta_Q;
+        mpz_class new_delta_sop;
+        if (support.size() >= OMEGA - S) { // TODO: When doing this iteratively, the delta product should just become indexing
+            new_delta_Q = primes[i] * current_delta_Q;
+            new_delta_sop = 
+                current_delta_Q + (primes[i] * current_delta_sop);
+        } else {
+            new_delta_Q = current_delta_Q;
+            new_delta_sop = current_delta_sop;
+        }
 
         mpz_class minimum_complete_product =
             new_product;
@@ -169,7 +177,8 @@ void dfs(
         dfs(
             i + 1,
             new_product,
-            new_sop,
+            new_delta_Q,
+            new_delta_sop,
             support,
             primes,
             k,
@@ -242,13 +251,14 @@ int main()
 
     // Working support vector used by dfs() as it recursively builds
     // and backtracks through K-prime supports.
-    std::vector<unsigned> support;
+    std::vector<unsigned> support; // TODO - seed support with 2
 
     // Counters updated by dfs() through reference parameters.
     LPRStats stats;
 
     dfs(
         0,
+        1,
         1,
         0,
         support,

@@ -1,50 +1,68 @@
 #include "corollary4.hpp"
+#include "parameters.hpp"
 
 #include <cassert>
+#include <iostream> // TODO - REMOVE
 
 Corollary4Threshold make_corollary4_threshold(
     const mpz_class& Q,
-    const mpz_class& S
+    const mpz_class& SOP
 ) {
-    // TODO - Q is not correct, should not sum/prod some of the primes!
-    // N_delta = Q - S (this represents delta * Q, the numerator of delta)
-    mpz_class N_delta = Q - S;
-    assert(N_delta > 0); // Equivalent to delta > 0
+    // Reusable memory 
+    // WARNING: the function should not be called again before these variables need to be reused
+    thread_local static mpz_class num_F;
+    thread_local static mpz_class num_delta;
+    thread_local static mpz_class g;
 
-    // Compute F = num_F / den_F = (16 * N_delta + 232 * Q) / N_delta
-    mpz_class num_F = 16 * N_delta + 232 * Q;
-    mpz_class den_F = N_delta;
+    // Set up constants
+    using parameters::OMEGA;
+    using parameters::S;
+    constexpr unsigned C1 = S + 1;
+    static_assert(OMEGA > S, "Check configuration of OMEGA/S");
+    constexpr std::size_t SHIFT = OMEGA - S;
+    
+    /*std::cout << "Config\n:" << "OMEGA: " << OMEGA << '\n'
+        << "S: " << S << '\n' 
+        << "SHIFT: " << SHIFT << '\n'
+        << "C1: " << C1 << '\n'
+        << "Q:   " << Q << '\n'
+        << "SOP: " << SOP << '\n';*/
 
-    // Reduce fraction ONCE via GCD (replacing mpq_canonicalize)
-    mpz_class g;
-    mpz_gcd(g.get_mpz_t(), num_F.get_mpz_t(), den_F.get_mpz_t());
-    if (g > 1) {
+    assert(Q > SOP); // Equivalent to delta > 0
+
+    // numerator of delta
+    num_delta = Q - SOP;
+                        
+    // Compute num_F = 2^(w-s) * ((s+1)*Q - 2*SOP)
+    mpz_mul_ui(num_F.get_mpz_t(), Q.get_mpz_t(), C1); // num_F = (s+1) * Q
+    mpz_submul_ui(num_F.get_mpz_t(), SOP.get_mpz_t(), 2); // num_F -= 2*SOP
+    mpz_mul_2exp(num_F.get_mpz_t(), num_F.get_mpz_t(), SHIFT); // num_F *= 2^(w-s)
+
+    // Reduce fraction via GCD
+    mpz_gcd(g.get_mpz_t(), num_F.get_mpz_t(), num_delta.get_mpz_t());
+    if (mpz_cmp_ui(g.get_mpz_t(), 1) > 0) {
         mpz_divexact(num_F.get_mpz_t(), num_F.get_mpz_t(), g.get_mpz_t());
-        mpz_divexact(den_F.get_mpz_t(), den_F.get_mpz_t(), g.get_mpz_t());
+        mpz_divexact(num_delta.get_mpz_t(), num_delta.get_mpz_t(), g.get_mpz_t());
     }
 
-    // Pre-allocate memory for 16th powers to avoid reallocations
+    /* TODO can we optimise this out since every thread should use
+          its own threshold until it's finished with the current support?
+          Should add to DFS State tracker.
+    */
     Corollary4Threshold threshold;
-    
-    // Estimate required bits: 16 * num_bits + safety margin
-    size_t num_bits = mpz_sizeinbase(num_F.get_mpz_t(), 2) * 16 + 64;
-    size_t den_bits = mpz_sizeinbase(den_F.get_mpz_t(), 2) * 16 + 64;
-
-    mpz_init2(threshold.numerator.get_mpz_t(), num_bits);
-    mpz_init2(threshold.denominator.get_mpz_t(), den_bits);
 
     // Exponentiation
     mpz_pow_ui(
-        threshold.numerator.get_mpz_t(),
-        num_F.get_mpz_t(),
-        16
+            threshold.numerator.get_mpz_t(),
+            num_F.get_mpz_t(),
+            16
     );
-    threshold.numerator *= 4220;
+    mpz_mul_ui(threshold.numerator.get_mpz_t(), threshold.numerator.get_mpz_t(), 4220);
 
     mpz_pow_ui(
-        threshold.denominator.get_mpz_t(),
-        den_F.get_mpz_t(),
-        16
+            threshold.denominator.get_mpz_t(),
+            num_delta.get_mpz_t(),
+            16
     );
 
     return threshold;
@@ -54,5 +72,9 @@ bool corollary4_proves_grosswald(
     const mpz_class& p,
     const Corollary4Threshold& threshold
 ) {
-    return p * threshold.denominator > threshold.numerator;
+    thread_local static mpz_class lhs;
+
+    // p * den_F > num_F
+    mpz_mul(lhs.get_mpz_t(), p.get_mpz_t(), threshold.denominator.get_mpz_t());
+    return mpz_cmp(lhs.get_mpz_t(), threshold.numerator.get_mpz_t()) > 0;
 }
