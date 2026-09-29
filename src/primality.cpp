@@ -1,4 +1,5 @@
 #include "primality.hpp"
+#include "parameters.hpp"
 
 #include <cassert>
 
@@ -20,8 +21,7 @@ bool is_composite_base2_fermat(const mpz_class& p)
 std::optional<mpz_class> find_least_primitive_root(
     const mpz_class& p,
     const mpz_class& n,
-    const std::vector<unsigned>& prime_divisors,
-    unsigned search_limit
+    const std::vector<unsigned>& prime_divisors
 ) {
     assert(p >= 2 && n == p - 1);
 
@@ -41,7 +41,7 @@ std::optional<mpz_class> find_least_primitive_root(
     // Since g is tested in increasing order, the first such g is g(p),
     // the least primitive root modulo p.
     mpz_class residue;
-    for (unsigned g = 2; g <= search_limit; ++g) {
+    for (unsigned g = 2; g <= parameters::PRIMITIVE_ROOT_SEARCH_LIMIT; ++g) {
         const mpz_class base = g;
 
         mpz_powm(

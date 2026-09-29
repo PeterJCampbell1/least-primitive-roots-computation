@@ -14,8 +14,7 @@ bool is_composite_base2_fermat(const mpz_class& p);
 std::optional<mpz_class> find_least_primitive_root(
     const mpz_class& p,
     const mpz_class& n,
-    const std::vector<unsigned>& prime_divisors,
-    unsigned search_limit
+    const std::vector<unsigned>& prime_divisors
 );
 
 #endif
