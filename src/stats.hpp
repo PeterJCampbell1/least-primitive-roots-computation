@@ -3,11 +3,14 @@
 
 #include <cstdint>
 #include <iostream>
+#include <gmpxx.h>
 
 struct LPRStats {
 	std::uint64_t total_support_count = 0;
     std::uint64_t surviving_support_count = 0;
     std::uint64_t candidate_count = 0;
+    std::uint64_t cor4_proves_grosswald_count = 0;
+    mpz_class max_d = 0;
     std::uint64_t fermat_composite_count = 0;
     std::uint64_t fermat_survivor_count = 0;
     std::uint64_t certified_count = 0;
@@ -25,6 +28,10 @@ struct LPRStats {
                   << surviving_support_count << '\n'
                   << "Candidates not covered by Corollary 4: "
                   << candidate_count << '\n'
+                  << "Number of times proves grosswald was called: " 
+                  << cor4_proves_grosswald_count << '\n'
+                  << "Largest number of repeated calls to proves grosswald: "
+                  << max_d << '\n'
                   << "Proved composite by base-2 Fermat test: "
                   << fermat_composite_count << '\n'
                   << "Surviving base-2 Fermat test: "
@@ -40,6 +47,31 @@ struct LPRStats {
 		          << "Largest least primitive root found: "
 				  << largest_least_primitive_root << '\n';
     }
+
+	void merge(const LPRStats& other) {
+		total_support_count += other.total_support_count;
+		surviving_support_count += other.surviving_support_count;
+		candidate_count += other.candidate_count;
+		cor4_proves_grosswald_count += other.cor4_proves_grosswald_count;
+		fermat_composite_count += other.fermat_composite_count;
+		fermat_survivor_count += other.fermat_survivor_count;
+		certified_count += other.certified_count;
+		unresolved_count += other.unresolved_count;
+		certified_inequality_pass_count += other.certified_inequality_pass_count;
+		certified_inequality_fail_count += other.certified_inequality_fail_count;
+
+		if (other.max_d > max_d) {
+			max_d = other.max_d;
+		}
+		if (other.largest_least_primitive_root > largest_least_primitive_root) {
+			largest_least_primitive_root = other.largest_least_primitive_root;
+		}
+	}
 };
+
+inline LPRStats& get_thread_local_stats() {
+    static thread_local LPRStats stats;
+    return stats;
+}
 
 #endif // STATS_HPP

@@ -92,7 +92,49 @@ Making `Corollary4Threshold` a unique pointer saved ~25s with that 3.6% of time.
 
 Following optimisations, taking powers in `update_corollary4_threshold` is 51% of runtime and the function itself is 57% of runtime. 6.4% of runtime is spent in multiplication in `corollary4_proves_grosswald` and 20% is spent in modular exponentation in `find_least_primitive_root`.
 
-## FUTURE STEPS:
+---
 
-Try modifying corollary 4 by taking log_2 of both sides and finding a way to guarantee approximation error that does not violate the corollary. Test and see how accurate this approximation is. This would be significantly faster if we can replace the majority of corollary 4 checks with a floating point approximation that is still sound albeit weaker.
+Date: **30/09/21**   
+Author: **Mittun Sudhahar**  
+Commit: TODO
+OMEGA: 33  
+
+This note regards the utilisation of legendre/jacobi symbols for primitve root filtering. Further, code has been further modified in preparation for parallelisation by adding thread local variables when possible for heap allocated mpz_class variables and statistics. Merge has been added for statistics as a utility tool for managing parallelism. Finally, it is now enforced that 2 is part of any support.
+
+## Updated Support
+
+We enforce that 2 is part of the initial support, and hence partially cut out some of the DFS iteration. This is also important for correctness in future, as a prime $p$ must be odd, and hence $p-1$ must be even.
+
+## Legendre/Jacobi Symbols
+
+The Legendre symbol $(g p)$ (note - non-standard notation) is defined as the quadratic residue of $g$ in *$\mathbb{Z}_p$* (in particular, this function $(\cdot\, p)$ is unique irreducible character of order 2). In particular, it is 0 if $\gcd(g, p) != 1$ and 1 if $g$ has a square root modulo $p$, otherwise it is -1. By Euler's criterion, $(g p) = g^{(p-1)/2} (mod p)$ and hence if $(g p) = 0, 1$ $g$ cannot be a primitive root. This is a stronger filter than testing $g^{p-1} == 1 (mod p)$ as we filter additional candidate primitive roots which have a square root. In addition, this means we do not need to test $g^{n/2}$ as we know this is -1.
+
+When $p$ is not prime (as we cannot guarantee $p$ is prime in `find_least_primitive_root`) the Legendre symbol becomes the Jacobi symbol. CLAIM: This is sufficient for our purposes and will still filter soundly numbers that cannot be primitive roots (since no number is a primitive root) and all other numbers passing through the filter will be rejected regardless. The only claim we need to check, is to ensure that if $\gcd(g, p) != 1$ then the Jacobi filter will also reject this.
+
+Note: Since we extend to integers where $\gcd(g, p) != 1$, we are extending to a Dirichlet character.
+
+## Thread Local Storage (prep for parallelism/avoid heap allocation)
+
+For the purpose of parallelism, statistics are accumulated at a thread local level with a merge routine provided for usage at the end of the run. Further, mpz_class objects will often require heap allocations as they grow. As a fixed number of 'scratch' multi-precision integers are required, and they do not grow to an unbounded level, we reuse these variables via static thread_local variables so that the automatic constructors/destructors are not called.
+
+## Other Experimentation
+
+Attempts have been made to take the logarithm of both sides of corollary 4. It is possible this could speed up the code, if clever tricks are used to extract an approximation of the logarithm using the top 53 bits of the integer representation, but this depends on how fast the base 2 logarithm can be taken. This would provide a small approximation error but may be sufficient in most cases.
+
+Attempted: using mpfr_t to do the above, this was extremely slow and did not work.
+
+Idea:
+Consider: $z$ an integer with $B$ bits. We can write this as $z = m_0 * 2^{B-1}$ where $m_0 \in [1, 2)$. Then, let $k < B$. Then $z >> k = z * 2^{-k} = m_0 * 2^{B - k - 1} =: m$. This gives us $m$, a $B-k$ bit integer representing an approximation of the mantissa $m_0$. Bit shifting provides under approximations naturally, so this is an under approximation. $m+1$ is an over-approximation since $m << (B-k-1) < z < (m+1) << (B-k-1)$.
+
+We then compute bounds as $\log_2 m + k < \log_2 z < \log_2 (m+1) + k$. This may or may not improve computation speed - we would need the value $B-k$ to be relatively small for this to have any possibility of being faster.
+
+## Results:
+
+After the above modifications, runtimes dropped to between 3:10 and 3:30 mins across runs, but statistical noise makes it difficult to infer how much improvement has been made. We expect these changes to become more significant in the OMEGA = 32 case as more values are likely to pass through the initial corollary 4 filter.
+
+## Future notes:
+
+At this stage, optimisations other than the log_2 change above are likely to be minor, or too small to verify. The only other optimisation currently being reviewed is the possibility of a smarter choise of S and $\delta$ within corollary 4 to maximise $S$ and minimise $\delta$ in a more dynamic manner. 
+
+The next step will be to parallelise with a work-stealing mode via OpenMP that can be run on multiple cores, with the possibility of running OMEGA = 32.
 

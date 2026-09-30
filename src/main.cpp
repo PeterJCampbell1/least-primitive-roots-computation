@@ -12,6 +12,7 @@
 #include <vector>
 #include <stdexcept>
 #include <cassert>
+#include <limits>
 
 // Anonymous namespace - restricts type visibility to this file
 namespace {
@@ -56,36 +57,46 @@ std::vector<unsigned> generate_primes(unsigned limit)
 /**
  * For a given support, processes to determine if any primes may violate 
  * Grosswald's inequality.
- *
- * TODO - Hoist variables to thread local static variables for parallelism.
  **/
 inline void process_support(
     const std::vector<unsigned>& support,
     const mpz_class& bound,
     const mpz_class& Q,
     const mpz_class& delta_Q,
-    const mpz_class& delta_sop,
-    LPRStats& stats
+    const mpz_class& delta_sop
 ) {
     assert(support[0] == 2);
+    auto& stats = get_thread_local_stats();
     ++stats.total_support_count;
 
-    update_corollary4_threshold(delta_Q, delta_sop);
-    //corollary4_eval_and_log(Q+1);
-    if (corollary4_proves_grosswald(Q + 1)) {
+    update_corollary4_threshold(Q, delta_Q, delta_sop);
+    ++stats.cor4_proves_grosswald_count;
+    unsigned prev_d = 1;
+    unsigned d = 1;
+    if (corollary4_proves_grosswald(d-prev_d)) {
         return;
     }
     ++stats.surviving_support_count;
 
-    const mpz_class m = bound / Q;
+    // Reusable memory for heap allocated objects only
+    // mpz_class calls the automatic constructor/destructor if defined locally
+    static thread_local mpz_class m;
+    static thread_local mpz_class p;
+    static thread_local mpz_class n;
+    static thread_local mpz_class g_plus_two;
+    static thread_local mpz_class g_plus_two_sqr;
 
-    for (mpz_class d = 1; d <= m; ++d) {
-        mpz_class remaining_factor = d;
+    // NOTE: We assume m fits within a 64 bit integer
+    m = bound / Q;
+    assert(m.fits_ulong_p() && "m exceeds 64-bit integer range");
+
+    for (d = 1; d <= m.get_ui(); ++d) { // Propagate d = 1 down to Fermat checks
+        unsigned remaining_factor = d;
 
         // Strip from d all prime factors that belong to the support.
         for (unsigned q : support) {
-            while (mpz_divisible_ui_p(remaining_factor.get_mpz_t(), q)) {
-                mpz_divexact_ui(remaining_factor.get_mpz_t(), remaining_factor.get_mpz_t(), q);
+            while (remaining_factor % q == 0) {
+                remaining_factor /= q;
             }
 
             if (remaining_factor == 1) {
@@ -96,19 +107,24 @@ inline void process_support(
         // If remaining_factor != 1, then d contains a prime factor
         // not already in the support, so d * Q has more than omega distinct prime factors.
         if (remaining_factor == 1) {
-            const mpz_class p = Q * d + 1;
-            //corollary4_eval_and_log(p);
-            if (corollary4_proves_grosswald(p)) {
+            n = Q * d; // TODO - Avoid GMP templates
+            p = n + 1;
+            ++stats.cor4_proves_grosswald_count;
+            if (corollary4_proves_grosswald(d-prev_d)) {
+                prev_d = d;
+                if (stats.max_d < d) {
+                    stats.max_d = d;
+                }
                 break;
             }
+            prev_d = d;
             ++stats.candidate_count;
 
-            if (is_composite_base2_fermat(p)) {
+            if (is_composite_base2_fermat(p, n)) {
                 ++stats.fermat_composite_count;
             } else {
                 ++stats.fermat_survivor_count;
 
-                const mpz_class n = p - 1;
                 const auto g = find_least_primitive_root(
                     p, n, support
                 );
@@ -119,8 +135,7 @@ inline void process_support(
                         stats.largest_least_primitive_root = *g;
                     }
 
-                    const mpz_class g_plus_two = *g + 2;
-                    mpz_class g_plus_two_sqr;
+                    g_plus_two = *g + 2;
                     mpz_mul(g_plus_two_sqr.get_mpz_t(), g_plus_two.get_mpz_t(), g_plus_two.get_mpz_t());
                     //if (g_plus_two * g_plus_two < p) {
                     if (g_plus_two_sqr < p) {
@@ -153,29 +168,38 @@ inline void process_support(
  * Supports are iterated through in lexicographic order.
  * The following stack frame is utilised as scratch space if needed.
  *
- * TODO - Add in the fact that we know 2 is part of the support.
- * TODO - Potentially hoist out and precompute all min_complete_products
+ * Note: We know that support must always contain 2 (as Q*d + 1 must be odd).
  **/
 void dfs_iter(
     const std::vector<unsigned>& primes,
-    const mpz_class& bound,
-    LPRStats& stats
+    const mpz_class& bound
 ) {
     using parameters::OMEGA;
     using parameters::S;
 
+    static_assert(OMEGA > 2, "Must have at least 2 prime factors to use Cor 4");
+    assert(!primes.empty() && primes[0] == 2);
+
     // Initialise DFS data
     std::vector<StackFrame> stack(OMEGA+1); // +1 is scratch space for final stack frame
     std::vector<unsigned> support(OMEGA);
-    std::size_t depth  = 0;
     stack[0].next_prime_idx = 0;
     stack[0].product   = 1;
     stack[0].delta_Q   = 1;
     stack[0].delta_sop = 0;
 
-    constexpr std::size_t DELTA_START_DEPTH = OMEGA - S;
+    // We know 2 \in support and the 0th frame corresponds to this
+    std::size_t depth  = 1; 
+    support[0] = primes[0]; // primes[0] == 2
+    stack[1].next_prime_idx = 1; 
+    stack[1].product = 2;
+    stack[1].delta_Q = 1;
+    stack[1].delta_sop = 0;
+    
+    // Number of primes to ignore
+    constexpr std::size_t DELTA_START_DEPTH = OMEGA - S; 
+    static_assert(DELTA_START_DEPTH > 0, "We cannot have OMEGA == S as 2 must be excluded");
     std::size_t remaining_after_choice, i;
-
     mpz_class min_complete_product;
 
     // Reserve space to avoid reallocations later
@@ -183,10 +207,10 @@ void dfs_iter(
 
     while (true) {
         remaining_after_choice = OMEGA - depth - 1;
-        i = stack[depth].next_prime_idx; // The last chosen prime
+        i = stack[depth].next_prime_idx; // The last prime chosen at this depth
         
         if (i >= primes.size() || primes.size() - (i + 1) < remaining_after_choice) {
-            if (depth == 0) break; // Traversal complete
+            if (depth == 1) break; // Traversal complete
             --depth;
             ++stack[depth].next_prime_idx; // Move to next subset through backtracking
             continue;
@@ -195,10 +219,14 @@ void dfs_iter(
         stack[depth+1].product = stack[depth].product * primes[i];
         min_complete_product = stack[depth+1].product;
         for (std::size_t j = 1; j <= remaining_after_choice; ++j) {
-            min_complete_product *= primes[i + j];
+            mpz_mul_ui(
+                min_complete_product.get_mpz_t(), 
+                min_complete_product.get_mpz_t(),
+                primes[i+j]
+            ); // min_prod *= primes[i+j];
         }
         if (min_complete_product > bound) {
-            if (depth == 0) break; // Traversal complete
+            if (depth == 1) break; // Traversal complete
             --depth;
             ++stack[depth].next_prime_idx; // Move to next subset through backtracking
             continue;
@@ -206,11 +234,24 @@ void dfs_iter(
 
         support[depth] = primes[i];
         if (depth >= DELTA_START_DEPTH) {
-            stack[depth+1].delta_Q = stack[depth].delta_Q * primes[i];
-            stack[depth+1].delta_sop = stack[depth].delta_Q + (primes[i] * stack[depth].delta_sop);
-        } else {
-            stack[depth+1].delta_Q = stack[depth].delta_Q;
-            stack[depth+1].delta_sop = stack[depth].delta_sop;
+            mpz_mul_ui(
+                stack[depth+1].delta_Q.get_mpz_t(),
+                stack[depth].delta_Q.get_mpz_t(),
+                primes[i]
+            ); // delta_Q_j = delta_Q_{j-1} * p_j
+
+            mpz_set(
+                stack[depth+1].delta_sop.get_mpz_t(),
+                stack[depth].delta_Q.get_mpz_t()
+            );
+            mpz_addmul_ui(
+                stack[depth+1].delta_sop.get_mpz_t(),
+                stack[depth].delta_sop.get_mpz_t(),
+                primes[i]
+            ); // delta_SOP_j = delta_Q_{j-1} + p_j * delta_SOP_{j-1} 
+        } else { // Ignore first few primes.
+            stack[depth+1].delta_Q = 1;
+            stack[depth+1].delta_sop = 0;
         }
 
         if (depth == OMEGA - 1) {
@@ -220,8 +261,7 @@ void dfs_iter(
                 bound,
                 stack[depth+1].product,
                 stack[depth+1].delta_Q,
-                stack[depth+1].delta_sop,
-                stats
+                stack[depth+1].delta_sop
             );
             ++stack[depth].next_prime_idx; // Move to sibling leaf node at same depth
         } else {
@@ -284,12 +324,12 @@ int main()
 
     // Working support vector used by dfs() as it recursively builds
     // and backtracks through omega-prime supports.
-    std::vector<unsigned> support; // TODO - seed support with 2
+    std::vector<unsigned> support;
 
     // Counters updated by dfs() through reference parameters.
-    LPRStats stats;
-    dfs_iter(primes, bound, stats);
+    dfs_iter(primes, bound);
 
+    auto& stats = get_thread_local_stats();
     stats.print();
 
     if (stats.unresolved_count > 0 ||
