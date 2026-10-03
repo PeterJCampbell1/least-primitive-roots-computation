@@ -11,6 +11,7 @@ struct LPRStats {
     std::uint64_t candidate_count = 0;
     std::uint64_t cor4_proves_grosswald_count = 0;
     mpz_class max_d = 0;
+    std::uint64_t small_prime_composite_count = 0;
     std::uint64_t fermat_composite_count = 0;
     std::uint64_t fermat_survivor_count = 0;
     std::uint64_t certified_count = 0;
@@ -32,6 +33,8 @@ struct LPRStats {
                   << cor4_proves_grosswald_count << '\n'
                   << "Largest number of repeated calls to proves grosswald: "
                   << max_d << '\n'
+                  << "Proved composite by small prime trial division test: "
+                  << small_prime_composite_count << '\n'
                   << "Proved composite by base-2 Fermat test: "
                   << fermat_composite_count << '\n'
                   << "Surviving base-2 Fermat test: "
@@ -53,6 +56,7 @@ struct LPRStats {
 		surviving_support_count += other.surviving_support_count;
 		candidate_count += other.candidate_count;
 		cor4_proves_grosswald_count += other.cor4_proves_grosswald_count;
+        small_prime_composite_count += other.small_prime_composite_count;
 		fermat_composite_count += other.fermat_composite_count;
 		fermat_survivor_count += other.fermat_survivor_count;
 		certified_count += other.certified_count;

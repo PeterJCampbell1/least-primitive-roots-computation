@@ -7,6 +7,7 @@
 // Analysis Tool
 //#include "analysis.hpp"
 
+#include <omp.h>
 #include <cstdint>
 #include <iostream>
 #include <vector>
@@ -104,6 +105,7 @@ inline void process_support(
             }
         }
         
+        // TODO - Is corollary 4 guaranteed to be less than the bound?
         // If remaining_factor != 1, then d contains a prime factor
         // not already in the support, so d * Q has more than omega distinct prime factors.
         if (remaining_factor == 1) {
@@ -120,7 +122,9 @@ inline void process_support(
             prev_d = d;
             ++stats.candidate_count;
 
-            if (is_composite_base2_fermat(p, n)) {
+            if (is_composite_small_prime(p)) {
+                ++stats.small_prime_composite_count;
+            } else if (is_composite_base2_fermat(p, n)) {
                 ++stats.fermat_composite_count;
             } else {
                 ++stats.fermat_survivor_count;
@@ -202,12 +206,17 @@ void dfs_iter(
     std::size_t remaining_after_choice, i;
     mpz_class min_complete_product;
 
+    // Naive approach to local bounding
+    mpz_class min_complete_delta_Q;
+    mpz_class min_complete_delta_sop;
+
     // Reserve space to avoid reallocations later
     mpz_realloc2(min_complete_product.get_mpz_t(), 1024);
 
     while (true) {
         remaining_after_choice = OMEGA - depth - 1;
         i = stack[depth].next_prime_idx; // The last prime chosen at this depth
+        support[depth] = primes[i];
         
         if (i >= primes.size() || primes.size() - (i + 1) < remaining_after_choice) {
             if (depth == 1) break; // Traversal complete
@@ -216,23 +225,6 @@ void dfs_iter(
             continue;
         }
 
-        stack[depth+1].product = stack[depth].product * primes[i];
-        min_complete_product = stack[depth+1].product;
-        for (std::size_t j = 1; j <= remaining_after_choice; ++j) {
-            mpz_mul_ui(
-                min_complete_product.get_mpz_t(), 
-                min_complete_product.get_mpz_t(),
-                primes[i+j]
-            ); // min_prod *= primes[i+j];
-        }
-        if (min_complete_product > bound) {
-            if (depth == 1) break; // Traversal complete
-            --depth;
-            ++stack[depth].next_prime_idx; // Move to next subset through backtracking
-            continue;
-        }
-
-        support[depth] = primes[i];
         if (depth >= DELTA_START_DEPTH) {
             mpz_mul_ui(
                 stack[depth+1].delta_Q.get_mpz_t(),
@@ -252,6 +244,48 @@ void dfs_iter(
         } else { // Ignore first few primes.
             stack[depth+1].delta_Q = 1;
             stack[depth+1].delta_sop = 0;
+        }
+
+        stack[depth+1].product = stack[depth].product * primes[i];
+        min_complete_product = stack[depth+1].product;
+        if (depth >= DELTA_START_DEPTH) {
+            min_complete_delta_Q = stack[depth+1].delta_Q;
+            min_complete_delta_sop = stack[depth+1].delta_sop;
+        }
+        for (std::size_t j = 1; j <= remaining_after_choice; ++j) {
+            mpz_mul_ui(
+                min_complete_product.get_mpz_t(), 
+                min_complete_product.get_mpz_t(),
+                primes[i+j]
+            ); // min_prod *= primes[i+j];
+               
+            // Naive local bounding approach
+            // TODO: figure out an optimal way to implement this
+            if (depth >= DELTA_START_DEPTH) {
+                // Calculate delta_sop first, as this uses the previous delta_Q
+                // Then after update delta_Q
+                min_complete_delta_sop *= primes[i+j];
+                min_complete_delta_sop += min_complete_delta_Q;
+                min_complete_delta_Q *= primes[i+j];
+            }
+        }
+        if (min_complete_product > bound) {
+            if (depth == 1) break; // Traversal complete
+            --depth;
+            ++stack[depth].next_prime_idx; // Move to next subset through backtracking
+            continue;
+        } // TODO - With local bounding this now is somewhat obsolete
+        if (depth >= DELTA_START_DEPTH) {
+            update_corollary4_threshold(min_complete_product, min_complete_delta_Q, min_complete_delta_sop);
+            if (corollary4_proves_grosswald(0)) { 
+                // Local Delta means all suffix's from this prefix must satisfy corollary 4, 
+                // As any larger suffix can only widen the inequality (lower lhs, raise rhs)
+                // Thus, we can prune this subtree
+                if (depth == 1) break; // Traversal complete
+                --depth;
+                ++stack[depth].next_prime_idx; // Move to next subset through backtracking
+                continue;
+            }
         }
 
         if (depth == OMEGA - 1) {
@@ -322,18 +356,32 @@ int main()
         );
     }
 
-    // Working support vector used by dfs() as it recursively builds
-    // and backtracks through omega-prime supports.
-    std::vector<unsigned> support;
+    // Master statistics block that threads will merge with 
+    // when complete.
+    LPRStats master_stats;
 
-    // Counters updated by dfs() through reference parameters.
-    dfs_iter(primes, bound);
+    #pragma omp parallel
+    {
+        
+        // For now will still be single threaded TODO
+        #pragma omp single
+        {
+            dfs_iter(primes, bound);
+        }
 
-    auto& stats = get_thread_local_stats();
-    stats.print();
+        // Merge stats from each thread.
+        // Stats initialised to 0 ensuring merging will
+        // always be correct.
+        #pragma omp critical
+        {
+            master_stats.merge(get_thread_local_stats());
+        }
+    }
 
-    if (stats.unresolved_count > 0 ||
-        stats.certified_inequality_fail_count > 0) {
+    master_stats.print();
+
+    if (master_stats.unresolved_count > 0 ||
+        master_stats.certified_inequality_fail_count > 0) {
         return 1;
     }
 

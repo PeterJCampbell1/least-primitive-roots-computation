@@ -5,13 +5,13 @@
 
 namespace parameters {
     // See paper for details on how to use parameters:
-    inline constexpr std::size_t OMEGA = 33;
-    inline constexpr unsigned S = 30; // For corollary 4
+    inline constexpr std::size_t OMEGA = 32;
+    inline constexpr unsigned S = 29; // For corollary 4
 
     // WARNING: PRIME_LIMIT is part of the exhaustive-search guarantee.
     // It must be large enough to include every prime that can occur in a
     // K-prime support with product <= bound. This is checked at runtime below.
-    inline constexpr unsigned PRIME_LIMIT = 4000;
+    inline constexpr unsigned PRIME_LIMIT = 10'000'000;
 
     // Upper bound for testing 2, 3, ..., PRIMITIVE_ROOT_SEARCH_LIMIT
     // as least primitive root g(p) candidates.
@@ -21,21 +21,5 @@ namespace parameters {
     // Search bound B = 1.8 × 10^54 = 18 × 10^53.
     inline constexpr unsigned BOUND_MULTIPLIER = 18;
     inline constexpr unsigned BOUND_EXPONENT = 53;
-
-    inline constexpr unsigned long long PRIMORIAL_CHUNKS[] = {
-        16294579238595022365ULL,
-        7145393598349078859ULL,
-        6408001374760705163ULL,
-        690862709424854779ULL,
-        4312024209383942993ULL,
-        71235931512604841ULL,
-        //192878245514479103ULL,
-        //542676746453092519ULL,
-        //1230544604996048471ULL,
-        //2618501576975440661ULL,
-        //4771180125133726009ULL,
-        //9247077179230889629ULL
-    };
-    inline constexpr size_t NUM_CHUNKS = sizeof(PRIMORIAL_CHUNKS) / sizeof(PRIMORIAL_CHUNKS[0]);
 }
 

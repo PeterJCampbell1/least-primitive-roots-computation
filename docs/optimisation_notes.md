@@ -4,7 +4,7 @@ See method.md for original method.
 
 ---
 
-Date: **28/09/21**   
+Date: **28/09/26**   
 Author: **Mittun Sudhahar**  
 Commit: f83d8b30413553fd5a34c0fd261f6a24459b6fc9  
 OMEGA: 33  
@@ -63,7 +63,7 @@ Initial timing on M2 (base chip) mac, single threaded took ~18:30 mins. Followin
 
 ---
 
-Date: **28/09/21**   
+Date: **28/09/26**   
 Author: **Mittun Sudhahar**  
 Commit: TODO
 OMEGA: 33  
@@ -137,4 +137,74 @@ After the above modifications, runtimes dropped to between 3:10 and 3:30 mins ac
 At this stage, optimisations other than the log_2 change above are likely to be minor, or too small to verify. The only other optimisation currently being reviewed is the possibility of a smarter choise of S and $\delta$ within corollary 4 to maximise $S$ and minimise $\delta$ in a more dynamic manner. 
 
 The next step will be to parallelise with a work-stealing mode via OpenMP that can be run on multiple cores, with the possibility of running OMEGA = 32.
+
+
+---
+
+Date: **03/10/26**   
+Author: **Mittun Sudhahar**  
+Commit: TODO
+OMEGA: 33  
+
+This note details corrected applications of the Jacobi filter, and a **significant structural improvement** to pruning by applying a refined version of Corollary 4 for local pruning. The code at this commit has not been cleaned up, but initial results show correctness and major speed ups have been observed (the only remaining bottleneck being finding least primitive roots and filtering composites where this is unavoidable). 
+
+## Trial GCD filter
+
+The improvements here are inspired from the function mpz_probab_prime_p.
+
+The GMP prime probabilistic test does the following. Firstly, it applies a series of gcd's with products of small primes, followed by the Miller-Rabin test, followed by the Lucas test. The Miller-Rabin test with base = 2 is a strictly stronger test than the Fermat test with only a minor performance penalty and hence may be worth implementing if many composites slip through (although up to now the Fermat test has worked well enough).
+
+The Lucas test is also unecessary for our purposes, however, we have hard coded several products of primes which fit within 64 bits to provide an initial filter by running gcd(prod, p) > 1. This filter runs approximately 30x faster than the fermat test, and hence provided it filters at least 3% of inputs is worth using. Current empirical estimates show anywhere from 10-15% of inputs are filtered, and hence it is worth keeping. It is important to note, with smaller OMEGA the efficacy of this filter should increase, as fewer small primes are known to not be factor. This does incur some wasted work as we know a certain number of small primes cannot be a factor and hence do not need to be tested in the GCD, but it is fast enough to simply use that filter anyway.
+
+## Correction to Jacobi Filter
+
+The Jacobi symbol (g p) in the case where p is prime tells us that g cannot be a primitive root unless (g p) = -1, and that g^((p-1)/2) == -1 (mod p). Thus, in the case where p is prime if g passes the Jacobi filter we can skip computing g^(n/2). If p is composite, not detecting this and falsely claiming to have found a primitive is acceptable as it does not affect the correctness of Grosswald's conjecture (and if the composite slips through and is printed as an error we can simply attempt to verify whether it is composite via g^((p-1) / 2) after the verification has run).
+
+## Local Delta bound creation and improved pruning during DFS
+
+Corollary 4 provides a global bound which is used for pruning during DFS. However, this global bound can be improved at a cost at each prefix during the DFS, allowing for significantly greater pruning.
+
+### Idea:
+
+Let, $\omega > 11$, $s \leq \omega - 3$ ($s$ can be refined, but in general choosing $s = \omega-3$ is sufficient for all possible supports) and define some global bound $B \in \mathbb{N}$.
+```math
+P := \{ (p_i)_{i=1}^\omega = (p_1,\ldots,p_\omega) \mid p_i > p_{i-1}, \, p_i \text{ prime }, \, p_i \leq B \}
+```
+This is the set of possible prefixes of support which we wish to prune - we define an ordering on this set lexicographically. Given $\tilde{p}, \tilde{q} \in P$ we say $\tilde{p} := (p_1,\ldots,p_\omega)$ *dominates* $\tilde{q} := (q_1,\ldots,q_\omega$ if $p_i \leq q_i$ for all $i$. 
+
+Next, define the following functions:
+```math
+W(x) := 2^{\omega-s}\cdot(2 + (s-1)/(1-x)); \, x \in (0, 1)
+T(y) := (y/4220)^{1/16}; \, y > 0
+```
+Clearly $W, T$ are monotone increasing functions. Given $\tilde{p} \in P$, define also the following,
+```
+A(\tilde{p}) := W( \sum_{i=\omega-s+1}^\omega 1/p_i )
+B(\tilde{p}) := T( \prod_{i=1}^\omega p_i )
+```
+
+We can then apply corollary 4, by saying for any prime $p$, where $\omega(p-1) = \omega$ and $\tilde{p} := (p_1,\ldots,p_\omega)$ where $p_i \mid p-1$, that if $A(\tilde{p}) < B(\tilde{p})$ then $p$ satisfies Grosswalds conjecture.
+
+The main improvement then comes from the following fact. If $\tilde{p}, \tilde{q} \in P$ such that $\tilde{p}$ dominates $\tilde{q}$, then $A(\tilde{p}) < B(\tilde{p}$ implies that $A(\tilde{q}) < B(\tilde{q})$.
+
+Proof:
+We know $\tilde{p}$ dominates $\tilde{q}$, so $\prod_{i=1}^\omega p_i \leq \prod_{i=1}^\omega q_i$ and since $T$ is monotonic, it follows that $B(\tilde{p}) \leq B(\tilde{q})$. Similarly, $ \sum_{i=\omega-s+1}^\omega 1/p_i \geq  \sum_{i=\omega-s+1}^\omega 1/q_i$ and by monotonicity of $W$, $A(\tilde{p}) \geq A(\tilde{q})$. Thus $A(\tilde{q}) \leq A(\tilde{p}) < B(\tilde{p}) \leq B(\tilde{q})$ as required $\square$.
+
+### Application:
+
+Fix some prefix $q_1,\ldots,q_k$, $k \leq \omega$. Let $P' := \{(p_1,\ldots,p_\omega \in P \mid p_i = q_i \, \forall i \leq k\}$. Then there exists a minimum element *$\tilde{p}_{\min} \in P'$*, which we call the *minimum extension of $(q_1,\ldots,q_k)$*. By the above, it follows that if *$A(\tilde{p}_{\min}) < B(\tilde{p}_{\min})$ then $A(\tilde{p}) < B(\tilde{p})$* for every $\tilde{p} \in P'$. For any prime with support in $P'$, this property is sufficient to imply corollary 4, and hence implies that Grosswald's conjecture is true for every $\tilde{p} \in P'$. 
+
+We can apply this, by constructing the minimum extension for each new prefix during DFS. Since we are constructing supports lexicographically, if the minimum extension *$\tilde{p}_{\min}$* of the current prefix satisfies *$A(\tilde{p}_{\min}) < B(\tilde{p}_{\min})$* then we can immediately conclude that the entire subtree from this prefix satisfies Grosswald's conjecture and can be pruned, leading to us returning to the previous depth and moving to the next prefix in lexicographic order.
+
+This in practise, produces enormous speed ups as large sections of the DFS tree are pruned immediately since we have effectively found a local version of $\Delta_\omega$ that may be significantly smaller. 
+
+## Results
+
+A naive version of the local delta bounding idea has been applied, to great effect. Following this idea, the total number of supports surviving the DFS filters dropped from ~200 million at $s=30$, $\omega=33$ down to just ~1.3 million. The runtime dropped from 3:15-3:30 minutes down to 40-45s. The proportion of runtime spent in `update_corollary4_threshold` (the previous major bottleneck) dropped from ~70% to ~2% of runtime (effectively being entirely cut out). Trial gcd composite tests filtered 207908 out of 1345681 supports, and accounted for ~5.5% of runtime. The fermat composite check then accounted for 17% of runtime, with the `find_least_primitive_root` function now being the major bottleneck at 72% of runtime.
+
+## Future Steps
+
+The current code merely implements these ideas with no particular thought to optimisation. The code needs to be cleaned up, and it may be the case that some redundant work is now being done. In particular, corollary 4 is being run tice at each support, and can be entirely removed from the function `process_support` as it is implemented during the DFS stage. Further, the minimum global bound could also be updated to be the minimum bound discovered in prefixes of the current partial support, further leading to improvements.
+
+Given that finding the least primitive root is now the main bottleneck, it makes sense to parallelise in a producer/consumer fashion, with a main producer thread applying the DFS, and any surviving supports can be passed to a concurrent task queue. Several consumer threads (pinned to cores) can then extract these tasks and perform the least primiitive root check. In fact, we can also have a two-tiered task queue system, where the first queue contains those potential primes/supports that need to be passed to the composite (gcd and Fermat) tests, and the second queue containing those remaining values for which we need to explicitly find least primitive roots. Threads may then extract batches from either queue depending on some tuned scaling factors and the lengths of each queue. 
 

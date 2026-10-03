@@ -6,6 +6,11 @@
 #include <vector>
 
 // Requires p >= 2. True proves compositeness; false does not prove primality.
+bool is_composite_small_prime(
+    const mpz_class& p
+);
+
+// Requires p >= 2. True proves compositeness; false does not prove primality.
 bool is_composite_base2_fermat(
     const mpz_class& p,
     const mpz_class& n
