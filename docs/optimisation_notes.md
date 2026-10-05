@@ -261,3 +261,29 @@ The potential parallelisation architecture now needs to be rethought.
 ## Note:
 It would make life easier to convert this to C++20 so the use of generators is possible.
 
+---
+
+Date: **05/10/26**   
+Author: **Mittun Sudhahar**  
+Commit: TODO
+OMEGA: 33  
+
+This note regards replacing the Fermat test with the Miller-Rabin test.
+
+## Miller-Rabin Base 2
+
+The Miller-Rabin test with base 2 is as follows. Let $p$ (odd) be some possible prime, $n = p-1$. Fermat's little theorem tells us that if $p$ is prime, then $2^{p-1} = 1 \pmod p$. Write $n = 2^a \cdot b$ for largest possible $a$. We then incrementally construct $2^n$ starting with $2^d$ and repeatedly squaring. As *$\mathbb{Z}_p$* is a field for prime $p$, we have the only solutions to $x^2 = 1 (\mod p)$ are 1 and $-1$. Thus, we create a sequence, $x_0,\ldots,x_s$, $x_0 := 2^b (\mod p)$ , $x_i := (x_{i-1})^2 (\mod p)$ (so $x_s = 2^n (\mod p)$). We construct the sequence lazily in order, with following early exits (based on *$\mathbb{Z}_p$* being a field and Fermat's little theorem). 
+
+* If $x_0 = 1$, then we conclude $p$ is *probably* prime. 
+* For each $x_i$, 
+    * if $x_i = -1$, we return also that $p$ is *probably* prime. 
+    * If $x_i = 1$, (but $x_{i=1} != -1$ - otherwise we would have exited already) then we return that $p$ is composite.
+
+This enables earlier exiting than the base-2 Fermat test alone, with minimal additional overhead. In particular, if we never reached $x_i = -1$, then the Fermat test is unsatisfied meaning this is a strictly stronger test than Fermat with base 2. If the end of this loop is reached, we return that $p$ is definitely composite.
+
+## Results
+
+This made minimal to no difference, likely because the computation $2^a (\mod p)$ still dominates the majority of the computation as $d$ has at most only a few prime factors of $2$. This has been removed for now - but it is possible it makes more of a difference for smaller OMEGA, where a broader range of $d$ can be found.
+
+---
+

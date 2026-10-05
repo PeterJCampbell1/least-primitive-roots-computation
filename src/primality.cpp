@@ -4,6 +4,8 @@
 #include <numeric>
 #include <cassert>
 
+/* Primality Filters */
+
 bool is_composite_small_prime(
     const mpz_class& p
 ) {
@@ -50,6 +52,84 @@ bool is_composite_base2_fermat(
     );
     return residue != 1;
 }
+
+/**
+ * The Miller-Rabin test is a strictly stronger test than the Fermat test.
+ * It also enables the possibility of early exits - leading to potentially shorter
+ * runtimes than the Fermat test.
+ *
+ * 
+ *
+ * Note: We assume that p > 2 
+ *  (Grosswald does not need to be tested for small p)
+ */
+bool is_composite_base2_miller_rabin(
+    const mpz_class& p,
+    const mpz_class& n
+) {
+    assert(p >= 3 && n == p - 1);
+    static const mpz_class base = 2;
+    static thread_local mpz_class x_i;
+    static thread_local mpz_class prev_x_i;
+    static thread_local mpz_class d;
+
+    // Write n = 2^s * d
+    int s = 0;
+    d = n;
+    while (d > 0 && (d & 1) == 0) {
+        s++;
+        d >>= 1;
+    }
+
+    // Compute x0 = 2^d (mod p)
+    mpz_powm(
+        x_i.get_mpz_t(), 
+        base.get_mpz_t(),
+        d.get_mpz_t(), 
+        p.get_mpz_t()
+    );
+
+    if (x_i == 1) { // Probably prime
+        return false;
+    }
+    
+    while (s > 0) {
+        // if x_i == -1 == n (mod p) probably prime
+        if (x_i == n) {
+            return false;
+        }
+
+        // x_i = x_{i-1}^2 (mod p)
+        x_i.swap(prev_x_i);
+        mpz_mul(
+            x_i.get_mpz_t(), 
+            prev_x_i.get_mpz_t(), 
+            prev_x_i.get_mpz_t()
+        ); // Square
+        mpz_mod(
+            x_i.get_mpz_t(), 
+            x_i.get_mpz_t(), 
+            p.get_mpz_t()
+        ); // Reduce
+        /*mpz_powm_ui(
+            x_i.get_mpz_t(), 
+            prev_x_i.get_mpz_t(), 
+            2, 
+            p.get_mpz_t()
+        );*/
+
+        // Definitely composite
+        if (x_i == 1) {
+            return true;
+        }
+        s--;
+    }
+
+    return true; // Fermat's little theorem not satisfied
+}
+
+
+/* Finding Least Primitive Roots */
 
 void _build_product_tree(
     std::array<mpz_class, parameters::TREE_SIZE>& product_tree,

@@ -135,6 +135,7 @@ inline void process_support(
             if (is_composite_small_prime(p)) {
                 ++stats.small_prime_composite_count;
             } else if (is_composite_base2_fermat(p, n)) {
+            //} else if (is_composite_base2_miller_rabin(p, n)) {
                 ++stats.fermat_composite_count;
             } else {
                 ++stats.fermat_survivor_count;
