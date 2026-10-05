@@ -51,14 +51,117 @@ bool is_composite_base2_fermat(
     return residue != 1;
 }
 
+void _build_product_tree(
+    std::array<mpz_class, parameters::TREE_SIZE>& product_tree,
+    const std::vector<unsigned>& prime_divisors,
+    const int node,
+    const int left,
+    const int right // Exclusive
+) {
+    // Product tree:
+    // This tree will be a full complete binary tree.
+    // Given omega, the root node contains the full product over all primes except 2.
+    // We then at each stage partition the prime divisors into a left and right half,
+    // with the left half being at most one greater and no less than the right in terms
+    // of number of prime divisors we take the product over.
+    // We repeat until we reach leaf nodes, which contain exactly one prime divisor.
+    //
+    // Note - this could of course be computed during the DFS loop, but it shouldn't 
+    // be the bottleneck in general.
+    //
+    // Example:
+    // Prime Divisors = [2, 3, 5, 7, 11, 13] 
+    //
+    // Root node: 3,5,7,11,13
+    //        3,5,7       11,13
+    //      3,5   7      11    13
+    //     3   5
+    //
+    // We can represent this in an array as follows:
+    // [(3,5,7,11,13), (3,5,7), (11,13), (3,5), 7, 11, 13, 3, 5]
+
+   
+    if (left == right - 1) { // Base Case:
+        product_tree[node] = prime_divisors[left];
+    } else { // Recursive Case:
+        int lChild = 2*node + 1;
+        int rChild = 2*node + 2;
+        int mid = (left + right + 1) / 2; // Ceiling divide to ensure mid - left >= right - mid
+        _build_product_tree(product_tree, prime_divisors, lChild, left, mid);
+        _build_product_tree(product_tree, prime_divisors, rChild, mid, right);
+        product_tree[node] = product_tree[lChild] * product_tree[rChild];
+    }
+}
+
+void _generate_next_residue(
+    std::array<mpz_class, parameters::TREE_SIZE>& power_tree,
+    const std::array<mpz_class, parameters::TREE_SIZE>& product_tree,
+    const mpz_class& p,
+    size_t& leaf_idx
+) {
+    using parameters::TREE_SIZE; 
+
+    // Starting call at root node
+    if (leaf_idx == 0) {
+        while (2*leaf_idx + 1 < TREE_SIZE) {
+            // Take to the power of right child
+            mpz_powm(
+                power_tree[2*leaf_idx+1].get_mpz_t(),
+                power_tree[leaf_idx].get_mpz_t(),
+                product_tree[2*leaf_idx+2].get_mpz_t(), 
+                p.get_mpz_t()
+            );
+            leaf_idx = 2*leaf_idx + 1;
+        }
+        return;
+    }
+
+    // At a leaf node - find next leaf node (in-order traversal, but we compute on descent)
+
+    // Go up until we were not the right child
+    // Note - we cannot reach root from the right unless we were the rightmost node
+    //      and in that case we should already have completed this algorithm
+    size_t parent = leaf_idx / 2;
+    while (true) { 
+        parent = leaf_idx / 2;
+        if (leaf_idx % 2 == 1) { // Left child
+            break;
+        }
+        leaf_idx = parent;
+    }
+
+    // Go to the right child
+    leaf_idx++; 
+    mpz_powm(
+        power_tree[leaf_idx].get_mpz_t(),
+        power_tree[parent].get_mpz_t(),
+        product_tree[leaf_idx-1].get_mpz_t(), 
+        p.get_mpz_t()
+    );
+
+    // Go left until reaching a leaf
+    while (2*leaf_idx + 1 < TREE_SIZE) {
+        // Take to the power of right child
+        mpz_powm(
+            power_tree[2*leaf_idx+1].get_mpz_t(),
+            power_tree[leaf_idx].get_mpz_t(),
+            product_tree[2*leaf_idx+2].get_mpz_t(), 
+            p.get_mpz_t()
+        );
+        leaf_idx = 2*leaf_idx + 1;
+    }
+}
 
 std::optional<mpz_class> find_least_primitive_root(
     const mpz_class& p,
     const mpz_class& n,
+    const unsigned& d,
     const std::vector<unsigned>& prime_divisors
 ) {
     assert(p > 2 && n == p - 1);
     assert(mpz_odd_p(p.get_mpz_t()));
+    assert(prime_divisors[0] == 2);
+    assert(prime_divisors.size() == parameters::OMEGA);
 
     // Conditional order criterion:
     //
@@ -99,15 +202,31 @@ std::optional<mpz_class> find_least_primitive_root(
     //   1) p is prime and it's least primitive root is greater than PRIMITIVE_ROOT_SEARCH_LIMIT
     //   2) p is composite
     // Both cases must be checked by hand for any failures.
+    
 
-    mpz_class residue;
+    // TODO - New idea:
+    // 1. Build product tree
+    // 2. Apply Jacobi filter
+    // 3. Compute A = g^{2d} (mod p)
+    // 4. Compute power tree, lazily
 
+    // 1. Full binary tree with n leaves contains 2n-1 nodes - ignore prime 2
+    using parameters::TREE_SIZE;
+    static thread_local std::array<mpz_class, TREE_SIZE> product_tree = {};
+    static thread_local std::array<mpz_class, TREE_SIZE> power_tree = {};
+
+    // Done recursively for simplicity, can be made iterative (full complete binary tree)
+    _build_product_tree(product_tree, prime_divisors, 0, 0, parameters::OMEGA - 1);
+
+    //mpz_class residue;
+    mpz_class exponent;
     for (unsigned g = 2;
  		 g <= parameters::PRIMITIVE_ROOT_SEARCH_LIMIT;
          ++g) {
 
         const mpz_class base = g;
 
+        // 2. Jacobi filter
         // If p is prime, a primitive root must be a quadratic
         // nonresidue, so its Jacobi/Legendre symbol must be -1.
         if (mpz_jacobi(
@@ -118,7 +237,17 @@ std::optional<mpz_class> find_least_primitive_root(
         }
 
         bool primitive_root_if_prime = true;
+        
+        // 3. Compute A = g^{2d} (mod p)
+        exponent = 2 * d;
+        mpz_powm(
+            power_tree[0].get_mpz_t(),
+            base.get_mpz_t(),
+            exponent.get_mpz_t(), 
+            p.get_mpz_t()
+        );
 
+        size_t leaf_idx = 0; // Leaf in the power tree
         for (unsigned q : prime_divisors) {
 
             // For prime p, this condition is already supplied by
@@ -127,16 +256,21 @@ std::optional<mpz_class> find_least_primitive_root(
                 continue;
             }
 
-            const mpz_class exponent = n / q;
+            // 4. Lazily compute power tree with early exit
+            _generate_next_residue(power_tree, product_tree, p, leaf_idx); 
+            //residue = power_tree[leaf_idx];
+
+            /*
+            exponent = n / q;
 
             mpz_powm(
                 residue.get_mpz_t(),
                 base.get_mpz_t(),
                 exponent.get_mpz_t(),
                 p.get_mpz_t()
-            );
+            );*/
 
-            if (residue == 1) {
+            if (power_tree[leaf_idx] == 1) {
                 primitive_root_if_prime = false;
                 break;
             }
@@ -149,115 +283,4 @@ std::optional<mpz_class> find_least_primitive_root(
 
     return std::nullopt;
 }
-
-
-/*
-std::optional<mpz_class> find_least_primitive_root(
-    const mpz_class& p,
-    const mpz_class& n,
-    const std::vector<unsigned>& prime_divisors
-) {
-    assert(p > 2 && n == p - 1);
-    assert(mpz_odd_p(p.get_mpz_t()));
-
-    const mpz_class half_n = n / 2;
-
-    // Order criterion:
-    //
-    // Let n = p - 1. We do not yet assume that p is prime.
-    //
-    // First, the Jacobi symbol is used only as a cheap filter.
-    // If p is prime and g is a primitive root modulo p, then g is a
-    // quadratic nonresidue, so (g/p) = -1. Thus a value with Jacobi
-    // symbol != -1 cannot be the least primitive root of a prime p.
-    //
-    // For a surviving g, explicitly require
-    //
-    //     g^(n/2) == -1 (mod p).
-    //
-    // This implies gcd(g,p) = 1 and, after squaring,
-    //
-    //     g^n == 1 (mod p).
-    //
-    // Hence ord_p(g) is defined and divides n. Also,
-    // ord_p(g) does not divide n/2.
-    //
-    // For every odd prime divisor q of n, we then require
-    //
-    //     g^(n/q) != 1 (mod p).
-    //
-    // If ord_p(g) were a proper divisor of n, then ord_p(g) would
-    // divide n/q for some prime q | n. The q = 2 case has already
-    // been excluded by g^(n/2) == -1, and the remaining odd q are
-    // checked explicitly.
-    //
-    // Therefore ord_p(g) = n = p - 1.
-    //
-    // An element modulo p of order p - 1 also certifies that p is prime.
-    // Since g is tested in increasing order, the first successful g is
-    // the least primitive root g(p).
-    mpz_class residue;
-    for (unsigned g = 2; g <= parameters::PRIMITIVE_ROOT_SEARCH_LIMIT; ++g) {
-        const mpz_class base = g;
-
-        // A primitive root modulo a prime must be a quadratic nonresidue.
-        // For prime p, the Jacobi symbol is the Legendre symbol.
-        if (mpz_jacobi(
-                base.get_mpz_t(),
-                p.get_mpz_t()
-            ) != -1) {
-            continue;
-        }
-
-        mpz_powm(
-            residue.get_mpz_t(),
-            base.get_mpz_t(),
-            half_n.get_mpz_t(),
-            p.get_mpz_t()
-        );
-
-        // Require g^(n/2) == -1 == p - 1 == n (mod p).
-        if (residue != n) {
-            continue;
-        }
-
-        // Reaching this point means g^n == 1 (mod p), which implies
-        // gcd(g, p) = 1. Hence ord_p(g) is defined and divides n.
-        // Since g^(n/2) == -1 (mod p),
-        //     g^n == 1 (mod p),
-        // and g^(n/2) != 1 (mod p).
-        //
-        // Thus ord_p(g) is defined, divides n,
-        // and does not divide n/2.
-        bool full_order = true;
-
-        for (unsigned q : prime_divisors) {
-            // Already handled by g^(n/2) == -1.
-            if (q == 2) {
-                continue;
-            }
-
-            const mpz_class exponent = n / q;
-
-            mpz_powm(
-                residue.get_mpz_t(),
-                base.get_mpz_t(),
-                exponent.get_mpz_t(),
-                p.get_mpz_t()
-            );
-
-            if (residue == 1) {
-                full_order = false;
-                break;
-            }
-        }
-
-        if (full_order) {
-            return mpz_class(g);
-        }
-    }
-
-    return std::nullopt;
-}
-*/
 

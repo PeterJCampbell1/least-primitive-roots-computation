@@ -58,26 +58,34 @@ std::vector<unsigned> generate_primes(unsigned limit)
 /**
  * For a given support, processes to determine if any primes may violate 
  * Grosswald's inequality.
+ *
+ * Note: with the local delta bounding update, we no longer need to compute
+ * Corollary 4 threshold's in this function.
  **/
 inline void process_support(
     const std::vector<unsigned>& support,
     const mpz_class& bound,
-    const mpz_class& Q,
-    const mpz_class& delta_Q,
-    const mpz_class& delta_sop
+    const mpz_class& Q
+    // TODO - don't need these anymore as corollary 4 already satisfied
+    //const mpz_class& delta_Q,
+    //const mpz_class& delta_sop
 ) {
     assert(support[0] == 2);
     auto& stats = get_thread_local_stats();
     ++stats.total_support_count;
 
-    update_corollary4_threshold(Q, delta_Q, delta_sop);
+    // TODO - this has already been updated
+    //update_corollary4_threshold(Q, delta_Q, delta_sop);
     ++stats.cor4_proves_grosswald_count;
     unsigned prev_d = 1;
     unsigned d = 1;
-    if (corollary4_proves_grosswald(d-prev_d)) {
+    // TODO - this has already been checked at DFS stage
+    /* if (corollary4_proves_grosswald(d-prev_d)) {
         return;
     }
-    ++stats.surviving_support_count;
+    */
+    // TODO - total support count is now the same as surviving support count
+    //++stats.surviving_support_count;
 
     // Reusable memory for heap allocated objects only
     // mpz_class calls the automatic constructor/destructor if defined locally
@@ -92,6 +100,8 @@ inline void process_support(
     assert(m.fits_ulong_p() && "m exceeds 64-bit integer range");
 
     for (d = 1; d <= m.get_ui(); ++d) { // Propagate d = 1 down to Fermat checks
+        // TODO - generate d via Q-smooth number generator since knowing the factorisation
+        // will be useful.
         unsigned remaining_factor = d;
 
         // Strip from d all prime factors that belong to the support.
@@ -109,7 +119,7 @@ inline void process_support(
         // If remaining_factor != 1, then d contains a prime factor
         // not already in the support, so d * Q has more than omega distinct prime factors.
         if (remaining_factor == 1) {
-            n = Q * d; // TODO - Avoid GMP templates
+            n = Q * d;
             p = n + 1;
             ++stats.cor4_proves_grosswald_count;
             if (corollary4_proves_grosswald(d-prev_d)) {
@@ -130,7 +140,7 @@ inline void process_support(
                 ++stats.fermat_survivor_count;
 
                 const auto g = find_least_primitive_root(
-                    p, n, support
+                    p, n, d, support
                 );
                 if (g) {
                     ++stats.certified_count;
@@ -293,9 +303,10 @@ void dfs_iter(
             process_support(
                 support,
                 bound,
-                stack[depth+1].product,
-                stack[depth+1].delta_Q,
-                stack[depth+1].delta_sop
+                stack[depth+1].product
+                // TODO - don't need these anymore as corollary 4 already satisfied
+                //stack[depth+1].delta_Q,
+                //stack[depth+1].delta_sop
             );
             ++stack[depth].next_prime_idx; // Move to sibling leaf node at same depth
         } else {

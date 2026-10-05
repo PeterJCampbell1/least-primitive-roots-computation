@@ -254,5 +254,10 @@ Finally, we can account for the fact that we do not need to recompute $g^(p-1/2)
 
 ## Results:
 
-YET TO IMPLEMENT, NEED TO SEE IF THIS HELPS.
+Results are significant. The percentage of runtime from `find_least_primitive_root` has dropped from ~70% down to 28%, and now the Fermat test is 47% of runtime whilst the trial gcd is 16% of runtime and updating the corollary 4 threshold is now around 7% of runtime. The overall runtime dropped from ~40s to ~15s and whilst the code needs to be verified, initial computations agree with previous computations.
+
+The potential parallelisation architecture now needs to be rethought.
+
+## Note:
+It would make life easier to convert this to C++20 so the use of generators is possible.
 

@@ -6,6 +6,7 @@
 namespace parameters {
     // See paper for details on how to use parameters:
     inline constexpr std::size_t OMEGA = 33;
+    inline constexpr std::size_t TREE_SIZE = 2*(OMEGA - 1) - 1; // For finding least primitive roots
     inline constexpr unsigned S = 30; // For corollary 4
 
     // WARNING: PRIME_LIMIT is part of the exhaustive-search guarantee.
