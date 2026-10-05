@@ -208,3 +208,51 @@ The current code merely implements these ideas with no particular thought to opt
 
 Given that finding the least primitive root is now the main bottleneck, it makes sense to parallelise in a producer/consumer fashion, with a main producer thread applying the DFS, and any surviving supports can be passed to a concurrent task queue. Several consumer threads (pinned to cores) can then extract these tasks and perform the least primiitive root check. In fact, we can also have a two-tiered task queue system, where the first queue contains those potential primes/supports that need to be passed to the composite (gcd and Fermat) tests, and the second queue containing those remaining values for which we need to explicitly find least primitive roots. Threads may then extract batches from either queue depending on some tuned scaling factors and the lengths of each queue. 
 
+---
+
+Date: **05/10/26**   
+Author: **Mittun Sudhahar**  
+Commit: TODO
+OMEGA: 32/33  
+
+This note focuses on the idea of adapting the Pippenger algorithm specifically with the use of binary product trees to accelerate finding the least primitive root.
+
+## Binary Product Trees:
+
+We know that $p = Qd + 1$ where $Q := \prod_{i=1}^\omega q_i$ is the squarefree core of $Qd$. We wish to compute for each $i$, $g^(p-1/q_i) (\mod p)$ with early termination if this equals 1, and we also note that we can skip $q_i = 2$. The current algorithm computes this directly, and the modular exponentation within `find_least_primitive_root` is 71% of runtime.
+
+Instead, we can exploit the structure of our problem as follows. Define,
+```math
+A := g^(p-1/Q) = g^d (\mod p)
+Q_j := Q/q_j
+```
+
+Then it follows that,
+```math
+g^(p-1/q_i) = A^{Q_j} (\mod p)
+```
+
+We can then structure the computation of A^{Q_j} as follows (example with $\omega=4$):
+
+Initial Product Tree:  
+(Root) Node $q1q2q3q4$. Left child $q1q2$. Right child $q3q4$.  
+Node $q1q2$. Left child $q1$. Right child $q2$.  
+Node $q3q4$. Left child $q3$. Right child $q4$.  
+
+We then associate to each node of this product tree a value by raising each child to the power of the other child to construct the following:
+
+Power Tree:
+(Root) Node $A$. Left child $A^{q3q4}$. Right child $A^{q1q4}$.  
+Node $A^{q3q4}$. Left child $(A^{q3q4})^q2$. Right child $(A^{q3q4})^q1$.  
+Node $A^{q1q2}$. Left child $(A^{q1q2})^q4$. Right child $(A^{q1q2})^q3$.  
+
+This allows us to lazily compute each $g^(p-1/q_i)$ whilst reusing previous information to significantly reduce the amount of major modular exponentiations (each step into the tree becomes exponentially cheaper).
+
+In the case where $\omega=2^k$ this tree forms a perfect binary tree. Even if not, the algorithm can be adapated to be computable via an array (rather than a linked tree structure) using the same techniques as would be done for a heap and pushing all larger products to the left (splitting by the ceiling and floor of half the remaining product).
+
+Finally, we can account for the fact that we do not need to recompute $g^(p-1/2)$ (via the previous Jacobi filter) by seeding the root of the power tree with $A^2 = g^{2d}$ instead.
+
+## Results:
+
+YET TO IMPLEMENT, NEED TO SEE IF THIS HELPS.
+
