@@ -132,7 +132,7 @@ inline void process_support(
             prev_d = d;
             ++stats.candidate_count;
 
-            if (is_composite_small_prime(p)) {
+            if (is_composite_small_prime(p, stats)) {
                 ++stats.small_prime_composite_count;
             } else if (is_composite_base2_fermat(p, n)) {
             //} else if (is_composite_base2_miller_rabin(p, n)) {

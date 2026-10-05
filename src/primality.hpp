@@ -1,13 +1,16 @@
 #ifndef LPR_PRIMALITY_HPP
 #define LPR_PRIMALITY_HPP
 
+#include "stats.hpp"
+
 #include <gmpxx.h>
 #include <optional>
 #include <vector>
 
 // Requires p >= 2. True proves compositeness; false does not prove primality.
 bool is_composite_small_prime(
-    const mpz_class& p
+    const mpz_class& p,
+    LPRStats& stats
 );
 
 // Requires p >= 2. True proves compositeness; false does not prove primality.

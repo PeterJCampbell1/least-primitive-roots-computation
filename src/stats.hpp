@@ -18,6 +18,7 @@ struct LPRStats {
     std::uint64_t unresolved_count = 0;
     std::uint64_t certified_inequality_pass_count = 0;
     std::uint64_t certified_inequality_fail_count = 0;
+    std::array<int, 6> composite_caught_at = {};
     mpz_class largest_least_primitive_root = 0;
 
     void print() const {
@@ -35,7 +36,12 @@ struct LPRStats {
                   << max_d << '\n'
                   << "Proved composite by small prime trial division test: "
                   << small_prime_composite_count << '\n'
-                  << "Proved composite by base-2 Fermat test: "
+                  << "Primes were each caught at: ";
+        for (int x : composite_caught_at) {
+            std::cout << x << " ";
+        }
+        std::cout << "\n";
+        std::cout << "Proved composite by base-2 Fermat test: "
                   << fermat_composite_count << '\n'
                   << "Surviving base-2 Fermat test: "
                   << fermat_survivor_count << '\n'
@@ -63,6 +69,10 @@ struct LPRStats {
 		unresolved_count += other.unresolved_count;
 		certified_inequality_pass_count += other.certified_inequality_pass_count;
 		certified_inequality_fail_count += other.certified_inequality_fail_count;
+
+        for (size_t i = 0; i < composite_caught_at.size(); ++i) {
+            composite_caught_at[i] += other.composite_caught_at[i];
+        }
 
 		if (other.max_d > max_d) {
 			max_d = other.max_d;
