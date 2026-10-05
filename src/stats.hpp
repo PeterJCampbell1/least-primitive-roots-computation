@@ -1,6 +1,7 @@
 #ifndef STATS_HPP
 #define STATS_HPP
 
+#include "parameters.hpp"
 #include <cstdint>
 #include <iostream>
 #include <gmpxx.h>
@@ -18,7 +19,7 @@ struct LPRStats {
     std::uint64_t unresolved_count = 0;
     std::uint64_t certified_inequality_pass_count = 0;
     std::uint64_t certified_inequality_fail_count = 0;
-    std::array<int, 6> composite_caught_at = {};
+    std::array<int, parameters::NUM_CHUNKS> composite_caught_at = {};
     mpz_class largest_least_primitive_root = 0;
 
     void print() const {
