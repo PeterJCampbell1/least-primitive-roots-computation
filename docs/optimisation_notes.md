@@ -254,9 +254,13 @@ Finally, we can account for the fact that we do not need to recompute $g^(p-1/2)
 
 ## Results:
 
-Results are significant. The percentage of runtime from `find_least_primitive_root` has dropped from ~70% down to 28%, and now the Fermat test is 47% of runtime whilst the trial gcd is 16% of runtime and updating the corollary 4 threshold is now around 7% of runtime. The overall runtime dropped from ~40s to ~15s and whilst the code needs to be verified, initial computations agree with previous computations.
+Results are significant. The percentage of runtime from `find_least_primitive_root` has dropped from ~70% down to 42%, and now the Fermat test is 38% of runtime whilst the trial gcd is 13% of runtime and updating the corollary 4 threshold is now around 5.5% of runtime. The overall runtime dropped from ~40s to ~18s and whilst the code needs to be verified, initial computations agree with previous computations.
 
 The potential parallelisation architecture now needs to be rethought.
+
+## BUG:
+
+Initial implementation of product tree had bugs. This has since been fixed and produces the same results as previously found.
 
 ## Note:
 It would make life easier to convert this to C++20 so the use of generators is possible.
