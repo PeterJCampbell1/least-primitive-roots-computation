@@ -57,6 +57,7 @@ compile_commands.json
 *.log
 *.bak
 *.swp
+**/.DS_Store
 **/*.dSYM
 
 # vcpkg
@@ -76,3 +77,4 @@ Testing/
 # Executables
 lpr
 lpr_g
+dfs_test

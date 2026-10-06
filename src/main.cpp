@@ -5,7 +5,6 @@
 #include "generate_supports.hpp"
 #include "process_support.hpp"
 
-#include <omp.h> // TODO - Probably remove this and replace with lower primitives for merge
 #include <iostream>
 #include <vector>
 #include <gmpxx.h>
