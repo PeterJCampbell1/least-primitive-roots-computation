@@ -1,20 +1,21 @@
 #include "primality.hpp"
 #include "parameters.hpp"
-#include "stats.hpp" // TODO - REMOVE LATER
+#include "stats.hpp" 
 
 #include <numeric>
 #include <cassert>
 
 /* Primality Filters */
+// TODO - ADD A NAMESPACE FOR THIS TO INCLUDE IT UNDER lpr
 
 bool is_composite_small_prime(
-    const mpz_class& p,
-    LPRStats& stats
+    const mpz_class& p
 ) {
     assert(p >= 3);
     
+    auto& stats = lpr::stats::get_thread_local_stats();
+
     // Alternative method that first does trial gcd
-    // TODO - CHECK IF THIS IDEA CAN BE USED
     using parameters::PRIMORIAL_CHUNKS;
     using parameters::NUM_CHUNKS;
     for (size_t i = 0; i < NUM_CHUNKS; ++i) {

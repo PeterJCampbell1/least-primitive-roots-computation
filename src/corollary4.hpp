@@ -11,15 +11,17 @@ struct Corollary4Threshold {
 // Warning: only 1 Corollary4Threshold should exist per thread at any time!
 Corollary4Threshold& get_thread_local_threshold();
 
-void update_corollary4_threshold(
+unsigned create_corollary4_threshold(
     const mpz_class& full_prod,
     const mpz_class& Q,
     const mpz_class& SOP,
     Corollary4Threshold& threshold = get_thread_local_threshold()
 );
 
+/*
 bool corollary4_proves_grosswald(
     const unsigned& d,
     Corollary4Threshold& threshold = get_thread_local_threshold()
 );
+*/
 

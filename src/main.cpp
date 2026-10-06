@@ -1,13 +1,15 @@
-#include "corollary4.hpp"
+//#include "corollary4.hpp"
 #include "primality.hpp"
 #include "stats.hpp"
 #include "parameters.hpp"
-#include "generate_supports.hpp" // TODO - REMOVE LATER WHEN MAKING CONCURRENT
+#include "generate_supports.hpp"
+#include "process_support.hpp"
 
 #include <omp.h> // TODO - Probably remove this and replace with lower primitives for merge
 #include <iostream>
 #include <vector>
 #include <gmpxx.h>
+#include <thread>
 #include <stdexcept>
 #include <cassert>
 
@@ -45,11 +47,36 @@ std::vector<unsigned> generate_primes(unsigned limit)
     return primes;
 } // generate_primes
 
+/*
+ * TODO - If --s or --single passed, return one. 
+ *  If --threads n or --t n specified, return that number
+ *  Otherwise return number of available physical cores if obtainable.
+ *  Otherwise if this failed, choose to fall back to single thread or default multi-thread 
+ * (maybe give an option --multi that makes program crash if we can't obtain number of threads)
+ */
+unsigned get_target_thread_count(int argc, char* argv[]) {
+    (void)argv; // TODO - REMOVE
+    if (argc > 1) {
+        return 8; // TODO - MULTI-THREAD PROPERLY
+    } else {
+        return 1;
+    }
+}
+
 } // namespace
 
 
-int main()
+int main(int argc, char* argv[])
 {
+    (void)argv;
+	unsigned threadCount = get_target_thread_count(argc, argv); 
+    if (threadCount == 1) {
+        std::cout << "Running single-threaded computation" << '\n' << '\n';
+    } else {
+        std::cout << "Running multi-threaded computation" << '\n'
+                  << "Using: " << threadCount << " threads" << '\n' << '\n';
+    }
+
     using parameters::PRIME_LIMIT;
 
     mpz_class bound;
@@ -93,28 +120,35 @@ int main()
         );
     }
 
-    // Master statistics block that threads will merge with 
-    // when complete.
-    LPRStats master_stats;
+    if (threadCount == 1) {
+        lpr::producer::generate_supports(primes, bound);
+    } else {
+        lpr::parallel::HysteresisQueue<> queue;
 
-    #pragma omp parallel
-    {
-        
-        // For now will still be single threaded TODO
-        #pragma omp single
-        {
-            dfs_iter(primes, bound);
+        // Spawn single producer
+        std::thread producer([&primes, &bound, &queue]() {
+            lpr::producer::generate_supports_parallel(primes, bound, queue);
+        });
+        threadCount--;
+
+        // Spawn specified number of consumer threads
+        std::vector<std::thread> consumers;
+        consumers.reserve(threadCount);
+        for (unsigned i = 0; i < threadCount; ++i) {
+            consumers.emplace_back([&queue]() {
+                lpr::consumer::start_consumer(queue);
+            });
         }
-
-        // Merge stats from each thread.
-        // Stats initialised to 0 ensuring merging will
-        // always be correct.
-        #pragma omp critical
-        {
-            master_stats.merge(get_thread_local_stats());
+        
+        producer.join(); // End producer thread
+        for (auto& consumer : consumers) { // End consumer threads
+            consumer.join();
         }
     }
 
+    // Stats for other threads automatically merged (see stats.hpp)
+    lpr::stats::flush_thread_local_stats();
+    auto& master_stats = lpr::stats::get_master_stats();
     master_stats.print();
 
     if (master_stats.unresolved_count > 0 ||

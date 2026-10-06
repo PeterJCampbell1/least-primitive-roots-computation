@@ -291,3 +291,37 @@ This made minimal to no difference, likely because the computation $2^a (\mod p)
 
 ---
 
+Date: **06/10/26**   
+Author: **Mittun Sudhahar**  
+Commit: TODO
+OMEGA: 32/33  
+
+This note focuses on the first multi-threaded version of the code base (this is still a very rough version, but appears to work).
+
+## General Parallelisation Architecture
+
+A low/high water mark hysteresis queue structure is used. This is a concurrent queue with several producer/consumers. We utilise it with a single producer, and aim to have sufficient consumers to use all other physical cores whilst minimising thread contention.
+
+The singular producer follows the pruned DFS (using corollary 4) to generate supports, and passes the resulting supports as jobs. Alongside this, it also passed the precomputed product of the support, and the number of valid $d$ such that $p = Qd + 1$ is not already verified. Thus, the `LPRJob` struct contains a small vector of primes 
+
+TODO...
+ 
+## Converting Update Corollary 4
+
+For the purpose of parallelism, we do not wish to have significant amounts of data within the concurrent queue - and in particular, we do not wish to have the large values within `Corollary4Threshold`. As such, we immediately in the producer use `Corollary4Threshold` to obtain `d_max`, the maximum $d$ as stated above. This occurs via a division - although it has not yet been optimised or fully checked for correctness (although initial results match single-threaded cases).
+
+TODO...
+
+## New API:
+
+TODO - Explain new api with command line args for doing both multi and single threaded work (this isn't cleaned up properly yet).
+
+## Results:
+
+Significant speed up - on my mac with 8 physical cores, using 7 consumer threads and 1 producer threads with batch size of 256 and HVM of 512, LVM of 128 brings time down to 3.3s on OMEGA=33.
+TODO...
+
+## Future Notes:
+
+If we wish, we could precompute the longest unique prefix and store this separately as a global read only variable to save space. Significant clean up of the source code itself should be done now to avoid technical debt and make this presentable, as it is probably close to the point where running other values of OMEGA is reasonable. Still need to decide how to work with this if we adapt to a situtation where there can be many more consumer threads (e.g., on a HPC cluster) and then the producer is outpaced by the number of consumers (just need a way to split the work in a hybrid DFS/BFS manner). Still also need to clean up how command line arguments are handled and how namespaces are organised to make coding easier.
+TODO...

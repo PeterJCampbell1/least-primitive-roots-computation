@@ -1,22 +1,20 @@
-#pragma once
-
 /**
- * TODO - EVENTUALLY THIS FILE ITSELF SHOULD BE CPP WITH ANONYMOUS
- * NAMESPACE FOR THE INNER DETAILS, ONLY EXPOSING THE EXTERNAL 
- * FUNCTION FOR CALLING THE PARALLELISED PRODUCER.
+ * FILE DESCRIPTION - TODO
+ *
  *
  * THE MAIN PARALLELISATION PIPELINE CAN HAPPEN IN main.cpp
  **/
 
-#include "stats.hpp"
+#include "hysteresis_queue.hpp"
 #include "parameters.hpp"
-#include "process_support.hpp" // TODO - REMOVE THIS WHEN MOVING TO PRODUCER/CONSUMER QUEUE
+#include "process_support.hpp" 
 
 #include <vector>
 #include <cassert>
 #include <gmpxx.h>
 #include <limits>
 
+namespace { // Anonymous namespace for internal use only
 struct StackFrame {
     std::size_t next_prime_idx;
     mpz_class product;
@@ -38,9 +36,11 @@ struct StackFrame {
  *
  * Note: We know that support must always contain 2 (as Q*d + 1 must be odd).
  **/
-inline void dfs_iter(
+template <typename Callable>
+__attribute__((always_inline)) void dfs_iter_(
     const std::vector<unsigned>& primes,
-    const mpz_class& bound
+    const mpz_class& bound,
+    Callable process_job
 ) {
     using parameters::OMEGA;
     using parameters::S;
@@ -76,7 +76,8 @@ inline void dfs_iter(
 
     // Reserve space to avoid reallocations later
     mpz_realloc2(min_complete_product.get_mpz_t(), 1024);
-
+    
+    unsigned d_max = 0; // DO THIS IN A BETTER WAY
     while (true) {
         remaining_after_choice = OMEGA - depth - 1;
         i = stack[depth].next_prime_idx; // The last prime chosen at this depth
@@ -140,8 +141,9 @@ inline void dfs_iter(
             continue;
         } // TODO - With local bounding this now is somewhat obsolete (might still be useful to keep)
         if (depth >= DELTA_START_DEPTH) {
-            update_corollary4_threshold(min_complete_product, min_complete_delta_Q, min_complete_delta_sop);
-            if (corollary4_proves_grosswald(0)) { 
+            d_max = create_corollary4_threshold(min_complete_product, min_complete_delta_Q, min_complete_delta_sop);
+            //if (corollary4_proves_grosswald(0)) { 
+            if (d_max == 0) { // No values of d escape Cor4 in p = Qd + 1
                 // Local Delta means all suffix's from this prefix must satisfy corollary 4, 
                 // As any larger suffix can only widen the inequality (lower lhs, raise rhs)
                 // Thus, we can prune this subtree
@@ -154,15 +156,69 @@ inline void dfs_iter(
 
         if (depth == OMEGA - 1) {
             // depth+1 is now scratch space
-            process_support(
+            process_job(
+                {
                 support,
-                bound, 
-                stack[depth+1].product
-            );
+                stack[depth+1].product,
+                d_max
+                }
+            ); // Works for both single/multi-threaded calls
             ++stack[depth].next_prime_idx; // Move to sibling leaf node at same depth
         } else {
             stack[++depth].next_prime_idx = i + 1; // Move to next depth and use later primes 
         }
     } // while (true)
 }
+
+} // namespace
+
+namespace lpr::producer {
+
+void generate_supports(
+    const std::vector<unsigned>& primes,
+    const mpz_class& global_bound
+) {
+    dfs_iter_(primes, global_bound, consumer::process_support);
+}
+
+/*
+ * Wrapper around DFS to generate supports.
+ *
+ * Auto-handles batching jobs, and pushing batches to the concurrent queue.
+ */
+template <typename QueueType>
+void generate_supports_parallel(
+    const std::vector<unsigned>& primes,
+    const mpz_class& global_bound,
+    QueueType& queue
+) {
+    using parameters::BATCH_SIZE;
+    using parallel::LPRBatch;
+    using parallel::LPRJob;
+    LPRBatch current_batch;
+    current_batch.reserve(BATCH_SIZE);
+
+    // Lambda passed into generate_supports to emit candidate supports
+    auto emit_job = [&](LPRJob job) {
+        current_batch.push_back(job);
+
+        if (current_batch.size() == BATCH_SIZE) {
+            queue.push(std::move(current_batch));
+            current_batch = LPRBatch(); // Reset batch buffer
+            current_batch.reserve(BATCH_SIZE);
+        }
+    };
+
+    // Run DFS candidate generator
+    dfs_iter_(primes, global_bound, emit_job);
+
+    // Flush remaining candidates in final batch
+    if (!current_batch.empty()) {
+        queue.push(std::move(current_batch));
+    }
+
+    queue.set_finished();
+}
+
+} // lpr::producer
 
