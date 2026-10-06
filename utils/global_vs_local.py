@@ -1,4 +1,4 @@
-TARGET_DEPTH = 26
+TARGET_DEPTH = 24
 import sympy
 import time
 

@@ -5,14 +5,14 @@
 
 namespace parameters {
     // See paper for details on how to use parameters:
-    inline constexpr std::size_t OMEGA = 33;
+    inline constexpr std::size_t OMEGA = 32;
     inline constexpr std::size_t TREE_SIZE = 2*(OMEGA - 1) - 1; // For finding least primitive roots
-    inline constexpr unsigned S = 30; // For corollary 4
+    inline constexpr unsigned S = OMEGA - 3; // For corollary 4 - default for now to OMEGA-3
 
     // WARNING: PRIME_LIMIT is part of the exhaustive-search guarantee.
     // It must be large enough to include every prime that can occur in a
     // K-prime support with product <= bound. This is checked at runtime in the main function.
-    inline constexpr unsigned PRIME_LIMIT = 4000;
+    inline constexpr unsigned PRIME_LIMIT = 10'000'000;
 
     // Upper bound for testing 2, 3, ..., PRIMITIVE_ROOT_SEARCH_LIMIT
     // as least primitive root g(p) candidates.

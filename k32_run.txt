@@ -1,0 +1,26 @@
+mittun@c4-35-d9-87-dc-13 least-primitive-roots-computation % ./lpr -abc
+Running multi-threaded computation
+Using: 8 threads
+
+Configuration:
+omega: 32
+Search bound B: 1.8 x 10^54
+Prime generation limit: 10000000
+Primitive root search limit: 1000
+
+Search summary:
+---------------
+K-prime supports examined: 6063768373
+Candidates not covered by Corollary 4: 8995362733
+Number of times proves grosswald was called: 15059131106
+Largest number of repeated calls to proves grosswald: 0
+Proved composite by small prime trial division test: 968871748
+Primes were each caught at: 368496967 324150800 276223981 
+Proved composite by base-2 Fermat test: 7386043861
+Surviving base-2 Fermat test: 640447124
+Least primitive root certified: 640447124
+Grosswald inequality verified: 640447124
+Grosswald inequality failed: 0
+No least primitive root certified within search limit: 0
+Largest least primitive root found: 678
+
