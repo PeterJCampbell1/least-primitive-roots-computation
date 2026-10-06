@@ -1,5 +1,4 @@
-#ifndef LPR_COROLLARY4_HPP
-#define LPR_COROLLARY4_HPP
+#pragma once
 
 #include <gmpxx.h>
 
@@ -24,4 +23,3 @@ bool corollary4_proves_grosswald(
     Corollary4Threshold& threshold = get_thread_local_threshold()
 );
 
-#endif

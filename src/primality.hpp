@@ -30,7 +30,6 @@ bool is_composite_base2_miller_rabin(
 // No result means unresolved within the limit, not composite or a counterexample.
 std::optional<mpz_class> find_least_primitive_root(
     const mpz_class& p,
-    const mpz_class& n,
     const unsigned& d,
     const std::vector<unsigned>& prime_divisors
 );

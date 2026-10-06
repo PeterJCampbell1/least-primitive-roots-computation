@@ -11,7 +11,7 @@ namespace parameters {
 
     // WARNING: PRIME_LIMIT is part of the exhaustive-search guarantee.
     // It must be large enough to include every prime that can occur in a
-    // K-prime support with product <= bound. This is checked at runtime below.
+    // K-prime support with product <= bound. This is checked at runtime in the main function.
     inline constexpr unsigned PRIME_LIMIT = 4000;
 
     // Upper bound for testing 2, 3, ..., PRIMITIVE_ROOT_SEARCH_LIMIT
@@ -38,5 +38,10 @@ namespace parameters {
         //9247077179230889629ULL
     };
     inline constexpr size_t NUM_CHUNKS = sizeof(PRIMORIAL_CHUNKS) / sizeof(PRIMORIAL_CHUNKS[0]);
+
+    /* Hysteresis Queue Constants */
+    inline constexpr size_t BATCH_SIZE = 256;
+    inline constexpr size_t HWM = 512;
+    inline constexpr size_t LWM = 128;
 }
 
