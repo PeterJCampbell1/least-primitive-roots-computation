@@ -38,8 +38,20 @@ struct LPRStats {
     std::uint64_t unresolved_count = 0;
     std::uint64_t certified_inequality_pass_count = 0;
     std::uint64_t certified_inequality_fail_count = 0;
+    std::array<int, parameters::PRIMITIVE_ROOT_SEARCH_LIMIT+2> prim_roots_count = {};
+    std::array<int, parameters::PRIMITIVE_ROOT_SEARCH_LIMIT+2> surviving_legendre_count = {};
     std::array<int, parameters::NUM_CHUNKS> composite_caught_at = {};
+    std::uint64_t used_2_3 = 0;
     mpz_class largest_least_primitive_root = 0;
+
+    // Producer (support enumeration) statistics
+    std::uint64_t dfs_nodes_visited = 0;
+    std::uint64_t cor4_evaluations = 0;
+    std::uint64_t cor4_reused = 0; // First child reuses its parent's minimal completion
+    std::uint64_t inherited_bound_prunes = 0; // Pruned by parent's Cor 4 bound before evaluating Cor 4
+    std::uint64_t supports_emitted = 0;
+    std::uint64_t d_max_sum = 0;
+    std::uint64_t d_max_max = 0;
 
     LPRStats() = default;
 
@@ -71,9 +83,27 @@ struct LPRStats {
         unresolved_count += other.unresolved_count;
         certified_inequality_pass_count += other.certified_inequality_pass_count;
         certified_inequality_fail_count += other.certified_inequality_fail_count;
+        used_2_3 += other.used_2_3;
+        dfs_nodes_visited += other.dfs_nodes_visited;
+        cor4_evaluations += other.cor4_evaluations;
+        cor4_reused += other.cor4_reused;
+        inherited_bound_prunes += other.inherited_bound_prunes;
+        supports_emitted += other.supports_emitted;
+        d_max_sum += other.d_max_sum;
+        if (other.d_max_max > d_max_max) {
+            d_max_max = other.d_max_max;
+        }
 
         for (size_t i = 0; i < composite_caught_at.size(); ++i) {
             composite_caught_at[i] += other.composite_caught_at[i];
+        }
+
+        for (size_t i = 0; i < prim_roots_count.size(); ++i) {
+            prim_roots_count[i] += other.prim_roots_count[i];
+        }
+
+        for (size_t i = 0; i < surviving_legendre_count.size(); ++i) {
+            surviving_legendre_count[i] += other.surviving_legendre_count[i];
         }
 
         if (other.max_d > max_d) {
@@ -117,7 +147,51 @@ struct LPRStats {
                   << "No least primitive root certified within search limit: "
                   << unresolved_count << '\n'
                   << "Largest least primitive root found: "
-                  << largest_least_primitive_root << '\n';
+                  << largest_least_primitive_root << '\n'
+                  << "Number of times 2 and 3 were available and 12 or 18 was computed: " 
+                  << used_2_3 << '\n';
+
+        /*
+        std::cout << "Least primitive roots were: " << '\n';
+        int i = 0;
+        for (int x : prim_roots_count) {
+            std::cout << i << " : " << x << '\n';  
+            if (i > largest_least_primitive_root) {
+                break;
+            }
+            i++;
+        }  
+
+        std::cout << '\n' << '\n' << "Checking for least primitive root count: " << '\n';
+        i = 0;
+        for (int x : surviving_legendre_count) {
+            std::cout << i << " : " << x << '\n';  
+            if (i > largest_least_primitive_root) {
+                break;
+            }
+            i++;
+        }*/
+    }
+
+    void print_producer() const {
+        std::lock_guard<MutexType> lock(mutex_);
+
+        std::cout << "Producer summary:\n"
+                  << "-----------------\n"
+                  << "DFS nodes visited: "
+                  << dfs_nodes_visited << '\n'
+                  << "Corollary 4 evaluations: "
+                  << cor4_evaluations << '\n'
+                  << "Corollary 4 results reused by first child: "
+                  << cor4_reused << '\n'
+                  << "Pruned by inherited Corollary 4 bound: "
+                  << inherited_bound_prunes << '\n'
+                  << "Supports emitted: "
+                  << supports_emitted << '\n'
+                  << "Sum of d_max over emitted supports: "
+                  << d_max_sum << '\n'
+                  << "Largest d_max: "
+                  << d_max_max << '\n';
     }
 
 private:
@@ -133,8 +207,18 @@ private:
         unresolved_count = other.unresolved_count;
         certified_inequality_pass_count = other.certified_inequality_pass_count;
         certified_inequality_fail_count = other.certified_inequality_fail_count;
+        prim_roots_count = other.prim_roots_count;
+        surviving_legendre_count = other.surviving_legendre_count;
         composite_caught_at = other.composite_caught_at;
+        used_2_3 = other.used_2_3;
         largest_least_primitive_root = other.largest_least_primitive_root;
+        dfs_nodes_visited = other.dfs_nodes_visited;
+        cor4_evaluations = other.cor4_evaluations;
+        cor4_reused = other.cor4_reused;
+        inherited_bound_prunes = other.inherited_bound_prunes;
+        supports_emitted = other.supports_emitted;
+        d_max_sum = other.d_max_sum;
+        d_max_max = other.d_max_max;
     }
 };
 

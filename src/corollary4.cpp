@@ -9,15 +9,10 @@ Corollary4Threshold& get_thread_local_threshold() {
     return instance;
 }
 
-// TODO - UPDATE SO THIS RETURNS THE MAXIMUM VALUE OF d IN p = Q*d + 1
-/**
- * Uses corollary 4 to determine the maximum value of d in p = Q*d+1 where
- * corollary 4 does not automatically prove Grosswald's conjecture.
- **/
-unsigned create_corollary4_threshold(
-    const mpz_class& full_prod,
+void corollary4_qd_bound(
     const mpz_class& Q,
     const mpz_class& SOP,
+    mpz_class& qd_bound,
     Corollary4Threshold& threshold
 ) {
     // Set up constants
@@ -26,9 +21,6 @@ unsigned create_corollary4_threshold(
     constexpr unsigned C1 = S + 1;
     static_assert(OMEGA > S, "Check configuration of OMEGA/S");
     constexpr std::size_t SHIFT = OMEGA - S;
-
-    static thread_local mpz_class d_max;
-
 
     assert(Q > SOP); // Equivalent to delta > 0
 
@@ -46,10 +38,17 @@ unsigned create_corollary4_threshold(
             threshold.lhs.get_mpz_t(),
             16
     );
+    
+    /* 
+     * Sieve factor is (4/9)*pi^8 + epsilon ~= 4217.13
+     * We use the upper bound of 4218 for simplicity.
+     */
+    
+    constexpr unsigned SIEVE_FACTOR_MULT = 4218;
     mpz_mul_ui(
         threshold.lhs.get_mpz_t(), 
         threshold.lhs.get_mpz_t(), 
-        4220
+        SIEVE_FACTOR_MULT
     );
 
     mpz_pow_ui(
@@ -58,55 +57,32 @@ unsigned create_corollary4_threshold(
             16
     );
 
-    // RHS(d) = d*(Q*Fd) + Fd (begin with d = 1) TODO - EDIT THIS - DON'T WANT THIS ANYMORE!
-    /*
-    mpz_mul(
-        threshold.increment.get_mpz_t(), 
-        threshold.rhs.get_mpz_t(), 
-        full_prod.get_mpz_t()
-    );
-    mpz_add(
-        threshold.rhs.get_mpz_t(), 
-        threshold.rhs.get_mpz_t(), 
-        threshold.increment.get_mpz_t()
-    );*/
-    
-    // TODO - CHECK IF WE CAN DO THIS MORE EFFECTIVELY, JUST A SIMPLE THING TO MAKE IT WORK FOR NOW
-
-    // TODO - CHECK IF THIS ACTUALLY WORKS:
-    /*if (threshold.lhs < threshold.rhs) {
-        return false; // Using bool to indicate if any d are possible
-    }*/
-
-    // Want maximum d s.t. Q*d + 1 <= lhs/rhs
-    // d_max = floor( (lhs/rhs - 1) / Q ) = floor( (lhs - rhs) / (Q*rhs) )
-    // TODO - Can threshold.rhs ever be greater than threshold.lhs?
+    // Want maximum Q*d s.t. Q*d + 1 <= lhs/rhs
+    // qd_bound = floor(lhs/rhs - 1) = floor( (lhs - rhs) / rhs )
     if (threshold.lhs < threshold.rhs) {
-        return 0;
+        qd_bound = 0;
+        return;
     }
-    d_max = (threshold.lhs - threshold.rhs) / (full_prod * threshold.rhs);
-
-    // We assume d_max fits in a uint64_t for now
-    assert(d_max.fits_ulong_p() && "d_max exceeds unsigned integer range");
-    return d_max.get_ui();
+    mpz_sub(threshold.lhs.get_mpz_t(), threshold.lhs.get_mpz_t(), threshold.rhs.get_mpz_t());
+    mpz_fdiv_q(qd_bound.get_mpz_t(), threshold.lhs.get_mpz_t(), threshold.rhs.get_mpz_t());
 }
 
-/*
-bool corollary4_proves_grosswald(
-    const unsigned& d,
-    Corollary4Threshold& threshold
+void corollary4_global_bound(
+    const std::vector<unsigned>& primes,
+    mpz_class& global_bound
 ) {
-    // lhs < (Q*d + 1)*p
-    // d is delta d - TODO UPDATE NAMING FOR ALL THIS
-    if (d > 0) {
-        // RHS(d) = d*(Q*Fd) + Fd (begin with d = 1)
-        mpz_addmul_ui(
-            threshold.rhs.get_mpz_t(),     
-            threshold.increment.get_mpz_t(), 
-            d                     
-        );
-    }
-    return mpz_cmp(threshold.lhs.get_mpz_t(), threshold.rhs.get_mpz_t()) < 0;
-}
-*/
+    using parameters::OMEGA;
+    using parameters::S;
+    assert(primes.size() >= OMEGA);
 
+    // Elementary symmetric polynomials of the last S of the first OMEGA primes,
+    // using the same recurrence as the DFS
+    mpz_class Q = 1;
+    mpz_class SOP = 0;
+    for (std::size_t j = OMEGA - S; j < OMEGA; ++j) {
+        SOP *= primes[j];
+        SOP += Q;
+        Q *= primes[j];
+    }
+    corollary4_qd_bound(Q, SOP, global_bound);
+}

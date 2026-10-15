@@ -1,18 +1,33 @@
 /**
- * FILE DESCRIPTION - TODO
+ * generate_supports.hpp: support enumeration (the producer).
  *
+ * Enumerates, in lexicographic order, every increasing OMEGA-tuple of primes
+ * containing 2 (a "support") whose product Q is at most the search bound and
+ * for which Corollary 4 leaves some d in p = Q*d + 1 uncovered. Each one is
+ * passed to a caller-supplied callable as LPRJob{support, Q, d_max}.
  *
- * THE MAIN PARALLELISATION PIPELINE CAN HAPPEN IN main.cpp
+ * A prefix's subtree is pruned using its minimal completion (the prefix
+ * extended by the next consecutive primes). If that completion's product
+ * exceeds the bound, or Corollary 4 covers every d for it, then by domination
+ * the same holds for every completion of the prefix.
+ *
+ * Entry points (lpr::producer): generate_supports (single-threaded, processes
+ * jobs inline), generate_supports_parallel (batches jobs into a
+ * HysteresisQueue) and generate_supports_dry_run (only counts jobs).
  **/
 
+#pragma once
+
+#include "corollary4.hpp"
 #include "hysteresis_queue.hpp"
 #include "parameters.hpp"
-#include "process_support.hpp" 
+#include "process_support.hpp"
+#include "stats.hpp"
 
+#include <array>
 #include <vector>
 #include <cassert>
 #include <gmpxx.h>
-#include <limits>
 
 namespace { // Anonymous namespace for internal use only
 struct StackFrame {
@@ -20,6 +35,60 @@ struct StackFrame {
     mpz_class product;
     mpz_class delta_Q;
     mpz_class delta_sop;
+    mpz_class cor4_bound; // Bound on Q*d for every leaf below the node (see dfs_iter_)
+};
+
+/**
+ * Explicit DFS stack over prime indices.
+ *
+ * Frame k holds the index of the prime chosen at depth k (next_prime_idx)
+ * and the values for the prefix of the k primes chosen before it.
+ * Frame depth+1 receives the values for the prefix including the current
+ * choice, and doubles as scratch space at the final depth.
+ * Frame 0 corresponds to the prime 2, which every support must contain.
+ **/
+class DfsStack {
+public:
+    explicit DfsStack(const mpz_class& root_bound) {
+        frames_[0].next_prime_idx = 0;
+        frames_[0].product   = 1;
+        frames_[0].delta_Q   = 1;
+        frames_[0].delta_sop = 0;
+
+        frames_[1].next_prime_idx = 1;
+        frames_[1].product   = 2;
+        frames_[1].delta_Q   = 1;
+        frames_[1].delta_sop = 0;
+        frames_[1].cor4_bound = root_bound; // Bound for the root node {2}
+    }
+
+    __attribute__((always_inline)) std::size_t depth() const { return depth_; }
+    __attribute__((always_inline)) StackFrame& current() { return frames_[depth_]; }
+    __attribute__((always_inline)) StackFrame& child() { return frames_[depth_ + 1]; }
+    __attribute__((always_inline)) StackFrame& parent() { return frames_[depth_ - 1]; }
+
+    // Descend one level, starting the choice at first_idx
+    __attribute__((always_inline)) void push(std::size_t first_idx) {
+        frames_[++depth_].next_prime_idx = first_idx;
+    }
+
+    // Move to the next sibling at the current depth
+    __attribute__((always_inline)) void advance() {
+        ++frames_[depth_].next_prime_idx;
+    }
+
+    // Pop the current depth and advance the parent.
+    // Returns false once the traversal is complete.
+    __attribute__((always_inline)) bool backtrack() {
+        if (depth_ == 1) return false;
+        --depth_;
+        advance();
+        return true;
+    }
+
+private:
+    std::array<StackFrame, parameters::OMEGA + 1> frames_;
+    std::size_t depth_ = 1; // Depth 0 (the prime 2) is fixed
 };
 
 /** 
@@ -27,19 +96,30 @@ struct StackFrame {
  *
  * Maintains that support contains an increasing list of primes.
  * Supports are iterated through in lexicographic order.
- * The following stack frame is utilised as scratch space if needed.
  *
  * Prunes branches based on Corollary 4 (TODO - CITE PAPER)
  * In particular, prunes via the minimum suffix extensions of each prefix
  * alongside the fact that if one support dominates another, and
  * satisfies corollary 4, then so does the other.
+ * Since minimal completions only grow across siblings, any prune
+ * also discards all later siblings (hence backtrack, not advance).
+ *
+ * Each node stores a bound on Q*d for every leaf below it: the root is
+ * seeded with the global bound (Cor 4 for the first OMEGA primes), nodes
+ * shallower than DELTA_START_DEPTH copy their parent's bound, and deeper
+ * nodes store min(parent's bound, Cor 4 bound of their minimal completion).
+ * The Cor 4 bound only decreases under domination, so a child whose minimal
+ * completion already exceeds its parent's bound is pruned without
+ * evaluating Corollary 4. A first child (the next consecutive prime) has
+ * the same minimal completion as its parent, so it reuses the parent's
+ * bound and skips all checks.
  *
  * Note: We know that support must always contain 2 (as Q*d + 1 must be odd).
  **/
 template <typename Callable>
 __attribute__((always_inline)) void dfs_iter_(
     const std::vector<unsigned>& primes,
-    const mpz_class& bound,
+    const mpz_class& global_bound,
     Callable process_job
 ) {
     using parameters::OMEGA;
@@ -47,125 +127,133 @@ __attribute__((always_inline)) void dfs_iter_(
 
     static_assert(OMEGA > 2, "Must have at least 2 prime factors to use Cor 4");
     assert(!primes.empty() && primes[0] == 2);
+    auto& stats = lpr::stats::get_thread_local_stats();
 
     // Initialise DFS data
-    std::vector<StackFrame> stack(OMEGA+1); // +1 is scratch space for final stack frame
+    DfsStack stack(global_bound);
     std::vector<unsigned> support(OMEGA);
-    stack[0].next_prime_idx = 0;
-    stack[0].product   = 1;
-    stack[0].delta_Q   = 1;
-    stack[0].delta_sop = 0;
-
-    // We know 2 \in support and the 0th frame corresponds to this
-    std::size_t depth  = 1; 
     support[0] = primes[0]; // primes[0] == 2
-    stack[1].next_prime_idx = 1; 
-    stack[1].product = 2;
-    stack[1].delta_Q = 1;
-    stack[1].delta_sop = 0;
     
     // Number of primes to ignore
     constexpr std::size_t DELTA_START_DEPTH = OMEGA - S; 
     static_assert(DELTA_START_DEPTH > 0, "We cannot have OMEGA == S as 2 must be excluded");
-    std::size_t remaining_after_choice, i;
-    mpz_class min_complete_product;
+    static_assert(DELTA_START_DEPTH < OMEGA, "Need S >= 1 so leaves always have a Cor 4 bound");
 
-    // Naive approach to local bounding
+    mpz_class min_complete_product;
     mpz_class min_complete_delta_Q;
     mpz_class min_complete_delta_sop;
 
     // Reserve space to avoid reallocations later
     mpz_realloc2(min_complete_product.get_mpz_t(), 1024);
     
-    unsigned d_max = 0; // DO THIS IN A BETTER WAY
+    mpz_class d_max_mpz;
     while (true) {
-        remaining_after_choice = OMEGA - depth - 1;
-        i = stack[depth].next_prime_idx; // The last prime chosen at this depth
-        support[depth] = primes[i];
-        
+        const std::size_t depth = stack.depth();
+        const std::size_t remaining_after_choice = OMEGA - depth - 1;
+        const std::size_t i = stack.current().next_prime_idx; // The prime chosen at this depth
+
         if (i >= primes.size() || primes.size() - (i + 1) < remaining_after_choice) {
-            if (depth == 1) break; // Traversal complete
-            --depth;
-            ++stack[depth].next_prime_idx; // Move to next subset through backtracking
+            if (!stack.backtrack()) break;
             continue;
         }
+        support[depth] = primes[i];
+        ++stats.dfs_nodes_visited;
 
+        StackFrame& cur = stack.current();
+        StackFrame& next = stack.child();
         if (depth >= DELTA_START_DEPTH) {
             mpz_mul_ui(
-                stack[depth+1].delta_Q.get_mpz_t(),
-                stack[depth].delta_Q.get_mpz_t(),
+                next.delta_Q.get_mpz_t(),
+                cur.delta_Q.get_mpz_t(),
                 primes[i]
             ); // delta_Q_j = delta_Q_{j-1} * p_j
 
             mpz_set(
-                stack[depth+1].delta_sop.get_mpz_t(),
-                stack[depth].delta_Q.get_mpz_t()
+                next.delta_sop.get_mpz_t(),
+                cur.delta_Q.get_mpz_t()
             );
             mpz_addmul_ui(
-                stack[depth+1].delta_sop.get_mpz_t(),
-                stack[depth].delta_sop.get_mpz_t(),
+                next.delta_sop.get_mpz_t(),
+                cur.delta_sop.get_mpz_t(),
                 primes[i]
             ); // delta_SOP_j = delta_Q_{j-1} + p_j * delta_SOP_{j-1} 
         } else { // Ignore first few primes.
-            stack[depth+1].delta_Q = 1;
-            stack[depth+1].delta_sop = 0;
+            next.delta_Q = 1;
+            next.delta_sop = 0;
         }
 
-        stack[depth+1].product = stack[depth].product * primes[i];
-        min_complete_product = stack[depth+1].product;
-        if (depth >= DELTA_START_DEPTH) {
-            min_complete_delta_Q = stack[depth+1].delta_Q;
-            min_complete_delta_sop = stack[depth+1].delta_sop;
-        }
-        for (std::size_t j = 1; j <= remaining_after_choice; ++j) {
-            mpz_mul_ui(
-                min_complete_product.get_mpz_t(), 
-                min_complete_product.get_mpz_t(),
-                primes[i+j]
-            ); // min_prod *= primes[i+j];
-               
-            // Naive local bounding approach
-            // TODO: figure out an optimal way to implement this
+        mpz_mul_ui(next.product.get_mpz_t(), cur.product.get_mpz_t(), primes[i]);
+
+        // The parent node (depth - 1) stored its bound in cur.cor4_bound.
+        // It evaluated Cor 4 itself only if its depth >= DELTA_START_DEPTH.
+        const bool parent_evaluated_cor4 = depth > DELTA_START_DEPTH;
+        if (parent_evaluated_cor4 && i == stack.parent().next_prime_idx + 1) {
+            // Same minimal completion as the parent, which passed every check
+            ++stats.cor4_reused;
+            mpz_set(next.cor4_bound.get_mpz_t(), cur.cor4_bound.get_mpz_t());
+        } else {
+            min_complete_product = next.product;
             if (depth >= DELTA_START_DEPTH) {
-                // Calculate delta_sop first, as this uses the previous delta_Q
-                // Then after update delta_Q
-                min_complete_delta_sop *= primes[i+j];
-                min_complete_delta_sop += min_complete_delta_Q;
-                min_complete_delta_Q *= primes[i+j];
+                min_complete_delta_Q = next.delta_Q;
+                min_complete_delta_sop = next.delta_sop;
             }
-        }
-        if (min_complete_product > bound) {
-            if (depth == 1) break; // Traversal complete
-            --depth;
-            ++stack[depth].next_prime_idx; // Move to next subset through backtracking
-            continue;
-        } // TODO - With local bounding this now is somewhat obsolete (might still be useful to keep)
-        if (depth >= DELTA_START_DEPTH) {
-            d_max = create_corollary4_threshold(min_complete_product, min_complete_delta_Q, min_complete_delta_sop);
-            //if (corollary4_proves_grosswald(0)) { 
-            if (d_max == 0) { // No values of d escape Cor4 in p = Qd + 1
-                // Local Delta means all suffix's from this prefix must satisfy corollary 4, 
-                // As any larger suffix can only widen the inequality (lower lhs, raise rhs)
-                // Thus, we can prune this subtree
-                if (depth == 1) break; // Traversal complete
-                --depth;
-                ++stack[depth].next_prime_idx; // Move to next subset through backtracking
+            for (std::size_t j = 1; j <= remaining_after_choice; ++j) {
+                mpz_mul_ui(
+                    min_complete_product.get_mpz_t(), 
+                    min_complete_product.get_mpz_t(),
+                    primes[i+j]
+                ); // min_prod *= primes[i+j];
+                   
+                if (depth >= DELTA_START_DEPTH) {
+                    // Calculate delta_sop first, as this uses the previous delta_Q
+                    // Then after update delta_Q
+                    min_complete_delta_sop *= primes[i+j];
+                    min_complete_delta_sop += min_complete_delta_Q;
+                    min_complete_delta_Q *= primes[i+j];
+                }
+            }
+            if (min_complete_product > cur.cor4_bound) { // Parent's (or the global) bound
+                ++stats.inherited_bound_prunes;
+                if (!stack.backtrack()) break;
                 continue;
+            }
+            if (depth >= DELTA_START_DEPTH) {
+                ++stats.cor4_evaluations;
+                corollary4_qd_bound(
+                    min_complete_delta_Q, 
+                    min_complete_delta_sop,
+                    next.cor4_bound
+                );
+                if (min_complete_product > next.cor4_bound) { // No values of d escape Cor4 in p = Qd + 1
+                    if (!stack.backtrack()) break;
+                    continue;
+                }
+                if (cur.cor4_bound < next.cor4_bound) { // Keep bounds <= the global bound
+                    mpz_set(next.cor4_bound.get_mpz_t(), cur.cor4_bound.get_mpz_t());
+                }
+            } else {
+                mpz_set(next.cor4_bound.get_mpz_t(), cur.cor4_bound.get_mpz_t());
             }
         }
 
         if (depth == OMEGA - 1) {
-            // depth+1 is now scratch space
-            process_job(
-                {
-                support,
-                stack[depth+1].product,
-                d_max
-                }
-            ); // Works for both single/multi-threaded calls
-            ++stack[depth].next_prime_idx; // Move to sibling leaf node at same depth
+            mpz_fdiv_q(
+                d_max_mpz.get_mpz_t(),
+                next.cor4_bound.get_mpz_t(),
+                next.product.get_mpz_t()
+            ); // d_max = floor(bound / Q)
+            assert(d_max_mpz.fits_uint_p() && "d_max exceeds unsigned integer range");
+            const unsigned d_max = d_max_mpz.get_ui();
+
+            ++stats.supports_emitted;
+            stats.d_max_sum += d_max;
+            if (d_max > stats.d_max_max) {
+                stats.d_max_max = d_max;
+            }
+            process_job({support, next.product, d_max}); // Works for both single/multi-threaded calls
+            stack.advance(); // Move to sibling leaf node at same depth
         } else {
-            stack[++depth].next_prime_idx = i + 1; // Move to next depth and use later primes 
+            stack.push(i + 1); // Move to next depth and use later primes 
         }
     } // while (true)
 }
@@ -174,11 +262,22 @@ __attribute__((always_inline)) void dfs_iter_(
 
 namespace lpr::producer {
 
-void generate_supports(
+inline void generate_supports(
     const std::vector<unsigned>& primes,
     const mpz_class& global_bound
 ) {
     dfs_iter_(primes, global_bound, consumer::process_support);
+}
+
+/*
+ * Runs the DFS without processing any supports, to measure producer speed.
+ * Producer statistics (including supports emitted) are gathered by dfs_iter_.
+ */
+inline void generate_supports_dry_run(
+    const std::vector<unsigned>& primes,
+    const mpz_class& global_bound
+) {
+    dfs_iter_(primes, global_bound, [](const parallel::LPRJob&) {});
 }
 
 /*

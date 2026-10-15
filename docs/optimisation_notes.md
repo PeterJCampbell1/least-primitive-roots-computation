@@ -325,3 +325,55 @@ TODO...
 
 If we wish, we could precompute the longest unique prefix and store this separately as a global read only variable to save space (or just pass a copy to each thread tbh). Significant clean up of the source code itself should be done now to avoid technical debt and make this presentable, as it is probably close to the point where running other values of OMEGA is reasonable. Still need to decide how to work with this if we adapt to a situtation where there can be many more consumer threads (e.g., on a HPC cluster) and then the producer is outpaced by the number of consumers (just need a way to split the work in a hybrid DFS/BFS manner). Still also need to clean up how command line arguments are handled and how namespaces are organised to make coding easier. It is also possible to implement a strategy where rather than falling asleep, the producer does Producer Co-Processing where it handles it's own batch if the push to queue fails (due to HVM being hit) and that way you don't need to have any thread go to sleep at all in the event the producer is too fast for the consumers. We can also have consumer co-generation once multiple producers are implemented (this is where a consumer turns into a producer when LVM is hit or (a probably better choice) if queue.pop fails - would need to change behaviour here a bit) This allows us to have more flexibility with the number of consumers/producers in such a way that they self balance with minimal overhead and little to no context switching. Should also look into thread pinning to avoid threads jumping cores. Further, this is still only ready for a single server - switching to a HPC cluster would require more advanced code likely wiht an OpenMP wrapper to handle NUMA nodes. Should also implement work stealing if we want multiple producers (where we steal the oldest modifiable stack frame - where stack frame prefixes form jobs for the producers). Perhaps implement a Chase-Lev Work Stealing Deque, with exponential backoff for termination condition (or distributed Dijkstra ring token for multi-node clusters). Also add logging and binary file state saving (necessary for later use on Slurm on HPC cluster). This needs to be buffered to occur on some master thread periodically (say every few minutes) so that we can track states. We also need to be able to use lexicographic ordering to maintain what is the latest support for which all earlier jobs have been definitely completed (i.e., such that we can restart and save state with minimal overhead). Also remove/update/store global bound within stack frames - the global bound isn't really necessary.
 TODO...
+
+## Idea Used: 
+
+Peter mentioned if a is a perfect power a = b^k and b generated a proper subgroup, then so does a (easy proof). Can use this to cut out several numbers like 8 = 2^3, 32 = 2^5, 27 = 3^3 etc., and this saved 7% of runtime. 
+
+Separate idea, is to maintain availability sets with products of factors, and use the multiplicativity of characters to fill in tables of the availability sets (seeded with things that escaped Legendre) and then determining exactly which products could generate the number before replacing some exponentations with multiplications.
+
+
+---
+
+Date: **15/10/26**   
+Author: **Mittun Sudhahar**  
+Commit: TODO
+OMEGA: 33  
+
+This note covers a clean up of the producer (`generate_supports.hpp`), a dry-run mode for measuring the producer on its own, and two reductions in the number of Corollary 4 evaluations. Emitted supports and their `d_max` values are unchanged, and the search summary matches the previous run exactly.
+
+## Dry Run and Command Line Modes
+
+`./lpr` now takes `--single` (default), `--parallel` (still the hardcoded 8 thread logic) or `--dry-run`. A dry run performs the full DFS but discards each emitted support, then prints a producer summary (DFS nodes visited, Corollary 4 evaluations/reuses/inherited prunes, supports emitted, sum and maximum of `d_max`) and the wall time. The sum of `d_max` gives an upper bound on the number of $d$ the consumers loop over. Producer statistics are also printed after normal runs. "Supports emitted" in a dry run must equal "K-prime supports examined" in a full run.
+
+At $\omega = 33$ the producer takes ~1.2s of a ~16s single-threaded run, so the producer is not currently the bottleneck on a single machine (it matters once many consumers are available).
+
+## DfsStack
+
+The DFS stack is now a small class (`DfsStack`) holding a fixed-size `std::array` of frames with `push` (descend), `advance` (next sibling) and `backtrack` (pop and advance, returning false when the traversal is complete), removing three duplicated backtracking blocks. Everything is force-inlined, and dry-run timings are unchanged (1.19s before and after). The bounds check on `next_prime_idx` now happens before `support[depth]` is written, fixing an out-of-bounds read of `primes`.
+
+## Inherited Corollary 4 Bound
+
+`create_corollary4_threshold` has been replaced with `corollary4_qd_bound`, which returns the largest $Qd$ not covered by Corollary 4, $\lfloor (\text{lhs} - \text{rhs}) / \text{rhs} \rfloor$, rather than $d_{\max}$. At a leaf, $d_{\max} = \lfloor \text{bound} / Q \rfloor$, which equals the previous value since $\lfloor \lfloor a/b \rfloor / Q \rfloor = \lfloor a / (Qb) \rfloor$. The bound depends only on the last $s$ primes and decreases under domination (by the argument in the local delta note), and every completion of a child is a completion of its parent. So each frame stores its node's bound, and a child whose minimal completion product already exceeds its parent's bound is pruned (backtracking, as the minimal completion only grows across siblings) without evaluating Corollary 4. The global bound is kept as a separate check, so leaf `d_max` values are not capped by it and consumer counts are unchanged.
+
+## First Child Reuse
+
+If a node chooses the prime immediately after its parent's choice, its minimal completion is the same tuple as its parent's minimal completion, so its product, deltas and Corollary 4 bound are identical and the parent has already passed every check. These nodes skip both the minimal completion loop and Corollary 4, and copy the parent's bound.
+
+## Results
+
+At $\omega = 33$: DFS nodes visited 1617129, Corollary 4 evaluations dropped from 1617125 to 1457518 (136631 reused by first children, 22976 inherited bound prunes). Dry-run time dropped from ~1.19s to ~1.14s. The full search summary (single, parallel and debug builds) is identical to the previous run.
+
+## Computed Global Bound
+
+The search bound $B$ is no longer a parameter (`BOUND_MULTIPLIER`/`BOUND_EXPONENT` have been removed). Every support is dominated by the first $\omega$ primes, so `corollary4_global_bound` computes $B$ as the Corollary 4 bound on $Qd$ for that support, $\lfloor X_{root} - 1 \rfloor \approx 1.786366 \times 10^{54}$ at $\omega = 33$, $s = 30$ (previously the hand-chosen $1.8 \times 10^{54}$). Every $p$ with $p - 1 > B$ is covered by Corollary 4, so the computation now covers every $p$ with $\omega(p-1) = \omega$. $B$ is printed in the configuration and used for the `PRIME_LIMIT` check.
+
+$B$ seeds the root frame's bound, so the separate global check in the DFS is gone: nodes shallower than $\omega - s$ copy their parent's bound, and deeper nodes store $\min(\text{parent's bound}, \text{own Cor 4 bound})$ (the minimum keeps every bound $\leq B$ regardless of parameters; at the current parameters it never changes a value, since every local bound is already $\leq B$). The floor in each bound loses nothing since $Qd$ is an integer, and is monotone, so the floored global bound is still at least every floored local bound. Emitted supports and the search summary are unchanged; the two nodes previously pruned by the global check are now counted as inherited bound prunes (22978).
+
+## Sieve Constant: 4218 vs Upper Dyadic Approximation
+
+Benchmarked (not adopted) replacing `mpz_mul_ui(lhs, 4218)` with $M / 2^{64}$, $M = \lceil \tfrac{4}{9}\pi^8 \cdot 2^{64} \rceil$ (a 77-bit, 2 limb constant), either rounding $\lceil lhs \cdot M / 2^{64} \rceil$ or multiplying $rhs$ by $2^{64}$ instead (both sound). Both variants are ~5.5% slower per Corollary 4 call (~790 vs ~835 ns in a microbenchmark) and ~5% slower in a dry run (~1.15s vs ~1.21s), despite emitting 758 fewer supports (1343104 vs 1343862; certified 113994 vs 114064). Full single (~15.8s) and parallel (~2.8s) runtimes were indistinguishable within noise, since the 0.06% fewer candidates do not offset the extra cost. Not worth adopting at $\omega = 33$.
+
+## Future Notes
+
+Incrementally updating the minimal completion across siblings (it changes by exactly one prime, so $Q$, $\delta_Q$ and $\delta_{SOP}$ can be updated with an exact division and multiplication from the previous set of values if those are stored) was not done: the minimal completion loop is short near the leaves where most nodes are. Worth revisiting only if profiling shows it matters, e.g. once the producer is parallelised and becomes the bottleneck.

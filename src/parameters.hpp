@@ -5,13 +5,13 @@
 
 namespace parameters {
     // See paper for details on how to use parameters:
-    inline constexpr std::size_t OMEGA = 32;
+    inline constexpr std::size_t OMEGA = 33;
     inline constexpr std::size_t TREE_SIZE = 2*(OMEGA - 1) - 1; // For finding least primitive roots
     inline constexpr unsigned S = OMEGA - 3; // For corollary 4 - default for now to OMEGA-3
 
     // WARNING: PRIME_LIMIT is part of the exhaustive-search guarantee.
     // It must be large enough to include every prime that can occur in a
-    // K-prime support with product <= bound. This is checked at runtime in the main function.
+    // K-prime support with product <= the (computed) bound. This is checked at runtime in the main function.
     inline constexpr unsigned PRIME_LIMIT = 10'000'000;
 
     // Upper bound for testing 2, 3, ..., PRIMITIVE_ROOT_SEARCH_LIMIT
@@ -19,9 +19,8 @@ namespace parameters {
     // WARNING: Increasing this substantially may greatly increase runtime.
     inline constexpr unsigned PRIMITIVE_ROOT_SEARCH_LIMIT = 1000;
 
-    // Search bound B = 1.8 × 10^54 = 18 × 10^53.
-    inline constexpr unsigned BOUND_MULTIPLIER = 18;
-    inline constexpr unsigned BOUND_EXPONENT = 53;
+    // The search bound is no longer a parameter: it is computed at runtime as
+    // the Corollary 4 bound for the first OMEGA primes (corollary4_global_bound).
 
     inline constexpr unsigned long long PRIMORIAL_CHUNKS[] = {
         //16294579238595022365ULL,

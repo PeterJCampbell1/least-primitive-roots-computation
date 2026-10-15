@@ -62,16 +62,6 @@ inline void process_support(
             p = n + 1;
             ++stats.cor4_proves_grosswald_count;
 
-            /* Already know this is true for d <= d_max now
-            if (corollary4_proves_grosswald(d-prev_d)) {
-                prev_d = d;
-                if (stats.max_d < d) {
-                    stats.max_d = d;
-                }
-                break;
-            }
-            */
-            //prev_d = d;
             ++stats.candidate_count;
 
             if (is_composite_small_prime(p)) {
@@ -88,6 +78,8 @@ inline void process_support(
                 if (g) {
                     ++stats.certified_count;
 
+                    ++(stats.prim_roots_count[g->get_ui()]);
+                    
                     if (*g > stats.largest_least_primitive_root) {
                         stats.largest_least_primitive_root = *g;
                     }

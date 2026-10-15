@@ -1,16 +1,20 @@
-//#include "corollary4.hpp"
 #include "primality.hpp"
 #include "stats.hpp"
 #include "parameters.hpp"
+#include "corollary4.hpp"
 #include "generate_supports.hpp"
 #include "process_support.hpp"
 
+#include <iomanip>
 #include <iostream>
 #include <vector>
 #include <gmpxx.h>
 #include <thread>
 #include <stdexcept>
 #include <cassert>
+#include <chrono>
+#include <optional>
+#include <string>
 
 // Anonymous namespace - restricts type visibility to this file
 namespace {
@@ -46,65 +50,94 @@ std::vector<unsigned> generate_primes(unsigned limit)
     return primes;
 } // generate_primes
 
+enum class RunMode { Single, Parallel, DryRun };
+
 /*
- * TODO - If --s or --single passed, return one. 
- *  If --threads n or --t n specified, return that number
- *  Otherwise return number of available physical cores if obtainable.
- *  Otherwise if this failed, choose to fall back to single thread or default multi-thread 
- * (maybe give an option --multi that makes program crash if we can't obtain number of threads)
+ * --single (default): producer processes each support inline.
+ * --parallel: one producer thread and PARALLEL_THREAD_COUNT - 1 consumers.
+ * --dry-run: runs the producer only, emitted supports are discarded.
+ * Returns std::nullopt on an unrecognised argument.
  */
-unsigned get_target_thread_count(int argc, char* argv[]) {
-    (void)argv; // TODO - REMOVE
-    if (argc > 1) {
-        return 8; // TODO - MULTI-THREAD PROPERLY
-    } else {
-        return 1;
+std::optional<RunMode> parse_run_mode(int argc, char* argv[]) {
+    RunMode mode = RunMode::Single;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--single") {
+            mode = RunMode::Single;
+        } else if (arg == "--parallel") {
+            mode = RunMode::Parallel;
+        } else if (arg == "--dry-run") {
+            mode = RunMode::DryRun;
+        } else {
+            return std::nullopt;
+        }
     }
+    return mode;
 }
+
+// TODO - Choose thread count properly (e.g. --threads n, or detected cores
+// for the UQ HPC clusters) once the parallel design is settled.
+constexpr unsigned PARALLEL_THREAD_COUNT = 8;
 
 } // namespace
 
 
 int main(int argc, char* argv[])
 {
-    (void)argv;
-	unsigned threadCount = get_target_thread_count(argc, argv); 
-    if (threadCount == 1) {
+    const std::optional<RunMode> parsed_mode = parse_run_mode(argc, argv);
+    if (!parsed_mode) {
+        std::cerr << "Usage: " << argv[0] << " [--single | --parallel | --dry-run]\n";
+        return 2;
+    }
+    const RunMode mode = *parsed_mode;
+
+    unsigned threadCount = 1;
+    switch (mode) {
+    case RunMode::Single:
         std::cout << "Running single-threaded computation" << '\n' << '\n';
-    } else {
+        break;
+    case RunMode::Parallel:
+        threadCount = PARALLEL_THREAD_COUNT;
         std::cout << "Running multi-threaded computation" << '\n'
                   << "Using: " << threadCount << " threads" << '\n' << '\n';
+        break;
+    case RunMode::DryRun:
+        std::cout << "DRY RUN: no primes were tested or verified" << '\n' << '\n';
+        break;
     }
 
     using parameters::PRIME_LIMIT;
 
+    std::vector<unsigned> primes =
+        generate_primes(PRIME_LIMIT);
+
+    // The global bound needs the first omega primes.
+    if (primes.size() < parameters::OMEGA) {
+        throw std::runtime_error(
+            "PRIME_LIMIT is too small to generate the first omega primes."
+        );
+    }
+
+    // Largest Q*d (p = Q*d + 1) not covered by Corollary 4 for any support.
+    // Every p with omega(p-1) = omega and p - 1 > bound satisfies Grosswald by Cor 4.
     mpz_class bound;
-    mpz_ui_pow_ui(bound.get_mpz_t(), 10, parameters::BOUND_EXPONENT);
-    bound *= parameters::BOUND_MULTIPLIER;
+    corollary4_global_bound(primes, bound);
 
     // Print initial configuration settings
     std::cout << "Configuration:\n"
               << "omega: " << parameters::OMEGA  << '\n'
-              << "Search bound B: "
-              << parameters::BOUND_MULTIPLIER / 10.0
-              << " x 10^" << parameters::BOUND_EXPONENT + 1 << '\n'
+              << "s: " << parameters::S << '\n'
+              << "Search bound B (Cor 4 global bound on p - 1): "
+              << std::scientific << std::setprecision(6) << bound.get_d()
+              << std::defaultfloat << '\n'
+              << "B (exact): " << bound << '\n'
               << "Prime generation limit: " << PRIME_LIMIT << '\n'
               << "Primitive root search limit: "
               << parameters::PRIMITIVE_ROOT_SEARCH_LIMIT
               << "\n\n";
 
-    std::vector<unsigned> primes =
-        generate_primes(PRIME_LIMIT);
-
-    // We need to check that floor(bound / p_(omega-1)#) <= PRIME_LIMIT.
-    // First check that primes contains enough primes to compute p_(omega-1)#.
-    if (primes.size() < parameters::OMEGA - 1) {
-        throw std::runtime_error(
-            "PRIME_LIMIT is too small to generate the first omega - 1 primes."
-        );
-    }
-
-    // Then check that floor(bound / p_(omega-1)#) <= PRIME_LIMIT.
+    // We need to check that floor(bound / p_(omega-1)#) <= PRIME_LIMIT,
+    // as the largest prime of any support with product <= bound is at most this.
     mpz_class smallest_product = 1;
     for (std::size_t i = 0; i < parameters::OMEGA - 1; ++i) {
         smallest_product *= primes[i];
@@ -119,7 +152,11 @@ int main(int argc, char* argv[])
         );
     }
 
-    if (threadCount == 1) {
+    const auto start_time = std::chrono::steady_clock::now();
+
+    if (mode == RunMode::DryRun) {
+        lpr::producer::generate_supports_dry_run(primes, bound);
+    } else if (mode == RunMode::Single) {
         lpr::producer::generate_supports(primes, bound);
     } else {
         lpr::parallel::HysteresisQueue<> queue;
@@ -146,9 +183,21 @@ int main(int argc, char* argv[])
     }
 
     // Stats for other threads automatically merged (see stats.hpp)
+    const std::chrono::duration<double> elapsed =
+        std::chrono::steady_clock::now() - start_time;
+
     lpr::stats::flush_thread_local_stats();
     auto& master_stats = lpr::stats::get_master_stats();
+    if (mode == RunMode::DryRun) {
+        master_stats.print_producer();
+        std::cout << "Elapsed time: " << elapsed.count() << " s\n"
+                  << "DRY RUN: no primes were tested or verified\n";
+        return 0;
+    }
     master_stats.print();
+    std::cout << '\n';
+    master_stats.print_producer();
+    std::cout << "Elapsed time: " << elapsed.count() << " s\n";
 
     if (master_stats.unresolved_count > 0 ||
         master_stats.certified_inequality_fail_count > 0) {

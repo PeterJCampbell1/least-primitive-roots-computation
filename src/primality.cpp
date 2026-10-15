@@ -236,6 +236,9 @@ void _generate_next_residue(
     }
 }
 
+bool _is_perfect_power(unsigned g) {
+    return IS_PERFECT_POWER_TABLE[g];
+}
 
 std::optional<mpz_class> find_least_primitive_root(
     const mpz_class& p,
@@ -246,6 +249,8 @@ std::optional<mpz_class> find_least_primitive_root(
     assert(mpz_odd_p(p.get_mpz_t()));
     assert(prime_divisors[0] == 2);
     assert(prime_divisors.size() == parameters::OMEGA);
+
+    auto& stats = lpr::stats::get_thread_local_stats();
 
     // Conditional order criterion:
     //
@@ -303,10 +308,21 @@ std::optional<mpz_class> find_least_primitive_root(
     _build_product_tree(product_tree, prime_divisors, 0, 1, parameters::OMEGA);
 
     //mpz_class residue;
+    bool u2 = false;
+    bool u3 = false;
     mpz_class exponent;
     for (unsigned g = 2;
  		 g <= parameters::PRIMITIVE_ROOT_SEARCH_LIMIT;
          ++g) {
+
+        // Perfect powers -- TODO - clean up
+        /*if (g == 8 || g == 32 || g == 128 || g == 512 || g == 27 || g == 243 || g == 125 || g == 216 ||
+                g == 343 || g == 729) {
+            continue;
+        }*/
+        if (_is_perfect_power(g)) {
+            continue;
+        }
 
         const mpz_class base = g;
 
@@ -319,6 +335,15 @@ std::optional<mpz_class> find_least_primitive_root(
             ) != -1) {
             continue;
         }
+
+        if (g == 2) {u2 = true;}
+        if (g == 3) {u3 = true;}
+        if ((g == 12 || g == 18) && u2 && u3) {
+            ++stats.used_2_3;
+        }
+
+
+        ++(stats.surviving_legendre_count[g]);
 
         bool primitive_root_if_prime = true;
         

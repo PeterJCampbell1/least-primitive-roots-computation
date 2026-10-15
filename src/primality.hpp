@@ -2,10 +2,14 @@
 #define LPR_PRIMALITY_HPP
 
 #include "stats.hpp"
+#include "parameters.hpp"
 
 #include <gmpxx.h>
 #include <optional>
 #include <vector>
+#include <array>
+#include <cstddef>
+#include <cstdint>
 
 // Requires p >= 2. True proves compositeness; false does not prove primality.
 bool is_composite_small_prime(
@@ -32,5 +36,17 @@ std::optional<mpz_class> find_least_primitive_root(
     const unsigned& d,
     const std::vector<unsigned>& prime_divisors
 );
+
+template <unsigned N> 
+constexpr std::array<bool, N + 1> make_table() {
+    std::array<bool, N + 1> t{};
+    for (std::uint64_t a = 2; a * a <= N; ++a)
+        for (std::uint64_t v = a * a; v <= N; v *= a)
+            t[static_cast<std::size_t>(v)] = true;
+    return t;
+}
+
+inline constexpr auto IS_PERFECT_POWER_TABLE = make_table<parameters::PRIMITIVE_ROOT_SEARCH_LIMIT>();
+
 
 #endif
