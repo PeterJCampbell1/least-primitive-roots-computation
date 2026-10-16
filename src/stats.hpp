@@ -8,7 +8,7 @@
 #include <array>
 #include <type_traits>
 
-namespace { // Anonymous namespace for internal usage
+namespace lpr::stats::detail { // Internal; named (not anonymous) as this header is included from several .cpp files
 
 // Dummy lock for single-threaded/thread-local case 
 struct NullMutex {
@@ -52,6 +52,18 @@ struct LPRStats {
     std::uint64_t supports_emitted = 0;
     std::uint64_t d_max_sum = 0;
     std::uint64_t d_max_max = 0;
+    std::uint64_t batches_pushed = 0; // Batches handed to the queue
+    std::uint64_t batches_coprocessed = 0; // Batches the producer processed itself (queue full)
+    std::uint64_t consumer_waits = 0; // Consumer pops that found the queue empty
+
+    // Least primitive root search statistics (find_least_primitive_root)
+    std::uint64_t lpr_jacobi_calls = 0; // Candidates g reaching the Jacobi filter
+    std::uint64_t lpr_legendre_survivors = 0; // Candidates g tested with the power tree
+    std::uint64_t lpr_root_powm_count = 0; // g^(2d) computations (root of the power tree)
+    std::uint64_t lpr_tree_powm_count = 0; // mpz_powm calls inside the power tree
+    std::uint64_t lpr_reuse_candidates = 0; // Tested g with some nodes derivable from earlier g (same p)
+    std::uint64_t lpr_reuse_tree_powm = 0; // Upper bound on tree mpz_powm calls avoidable by reuse
+    std::array<std::uint64_t, 16> winners_by_class = {}; // Index (p mod 8)*2 + (d mod 2)
 
     LPRStats() = default;
 
@@ -90,6 +102,18 @@ struct LPRStats {
         inherited_bound_prunes += other.inherited_bound_prunes;
         supports_emitted += other.supports_emitted;
         d_max_sum += other.d_max_sum;
+        batches_pushed += other.batches_pushed;
+        batches_coprocessed += other.batches_coprocessed;
+        consumer_waits += other.consumer_waits;
+        lpr_jacobi_calls += other.lpr_jacobi_calls;
+        lpr_legendre_survivors += other.lpr_legendre_survivors;
+        lpr_root_powm_count += other.lpr_root_powm_count;
+        lpr_tree_powm_count += other.lpr_tree_powm_count;
+        lpr_reuse_candidates += other.lpr_reuse_candidates;
+        lpr_reuse_tree_powm += other.lpr_reuse_tree_powm;
+        for (size_t i = 0; i < winners_by_class.size(); ++i) {
+            winners_by_class[i] += other.winners_by_class[i];
+        }
         if (other.d_max_max > d_max_max) {
             d_max_max = other.d_max_max;
         }
@@ -151,6 +175,24 @@ struct LPRStats {
                   << "Number of times 2 and 3 were available and 12 or 18 was computed: " 
                   << used_2_3 << '\n';
 
+        const double certified = certified_count ? static_cast<double>(certified_count) : 1.0;
+        std::cout << "\nLeast primitive root search:\n"
+                  << "Jacobi filter calls: " << lpr_jacobi_calls
+                  << " (" << lpr_jacobi_calls / certified << " per prime)\n"
+                  << "Legendre survivors tested: " << lpr_legendre_survivors
+                  << " (" << lpr_legendre_survivors / certified << " per prime, the last being g(p))\n"
+                  << "Root powm (g^(2d)) calls: " << lpr_root_powm_count << '\n'
+                  << "Power tree powm calls: " << lpr_tree_powm_count
+                  << " (" << lpr_tree_powm_count / certified << " per prime)\n"
+                  << "Tested g with nodes derivable from earlier g: " << lpr_reuse_candidates << '\n'
+                  << "Upper bound on power tree powm calls avoidable by reuse: "
+                  << lpr_reuse_tree_powm << '\n'
+                  << "Winners by p mod 8 (d even / d odd):\n";
+        for (unsigned r = 1; r < 8; r += 2) {
+            std::cout << "  p = " << r << " mod 8: "
+                      << winners_by_class[2*r] << " / " << winners_by_class[2*r + 1] << '\n';
+        }
+
         /*
         std::cout << "Least primitive roots were: " << '\n';
         int i = 0;
@@ -191,7 +233,13 @@ struct LPRStats {
                   << "Sum of d_max over emitted supports: "
                   << d_max_sum << '\n'
                   << "Largest d_max: "
-                  << d_max_max << '\n';
+                  << d_max_max << '\n'
+                  << "Batches pushed to queue: "
+                  << batches_pushed << '\n'
+                  << "Batches co-processed by producer: "
+                  << batches_coprocessed << '\n'
+                  << "Consumer waits on empty queue: "
+                  << consumer_waits << '\n';
     }
 
 private:
@@ -219,16 +267,26 @@ private:
         supports_emitted = other.supports_emitted;
         d_max_sum = other.d_max_sum;
         d_max_max = other.d_max_max;
+        batches_pushed = other.batches_pushed;
+        batches_coprocessed = other.batches_coprocessed;
+        consumer_waits = other.consumer_waits;
+        lpr_jacobi_calls = other.lpr_jacobi_calls;
+        lpr_legendre_survivors = other.lpr_legendre_survivors;
+        lpr_root_powm_count = other.lpr_root_powm_count;
+        lpr_tree_powm_count = other.lpr_tree_powm_count;
+        lpr_reuse_candidates = other.lpr_reuse_candidates;
+        lpr_reuse_tree_powm = other.lpr_reuse_tree_powm;
+        winners_by_class = other.winners_by_class;
     }
 };
 
-} // namespace
+} // namespace lpr::stats::detail
 
 namespace lpr::stats {
 
 // 1. Declarations / Aliases
-using LocalStats = LPRStats<false>;
-using MasterStats = LPRStats<true>;
+using LocalStats = detail::LPRStats<false>;
+using MasterStats = detail::LPRStats<true>;
 
 // 2. Master Stats Singleton
 inline MasterStats& get_master_stats() {
@@ -246,6 +304,14 @@ struct ManagedStats {
             get_master_stats().merge(stats);
             stats = LocalStats{};
             flushed = true;
+        }
+    }
+
+    // Merge into the master and reset, keeping the thread able to publish again
+    void publish() {
+        if (!flushed) {
+            get_master_stats().merge(stats);
+            stats = LocalStats{};
         }
     }
 
@@ -269,6 +335,12 @@ inline LocalStats& get_thread_local_stats() {
 // statistics we can set up a signal handler to print stats on Ctrl+C
 inline void flush_thread_local_stats() {
     get_managed_stats().flush();
+}
+
+// Makes this thread's statistics so far visible in the master statistics
+// (used for periodic progress logging). Call at batch granularity.
+inline void publish_thread_local_stats() {
+    get_managed_stats().publish();
 }
 
 } // namespace lpr::stats

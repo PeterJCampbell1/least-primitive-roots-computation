@@ -38,9 +38,9 @@ namespace parameters {
     };
     inline constexpr size_t NUM_CHUNKS = sizeof(PRIMORIAL_CHUNKS) / sizeof(PRIMORIAL_CHUNKS[0]);
 
-    /* Hysteresis Queue Constants */
+    /* Job queue constants: jobs per batch, and maximum queued batches before
+       the producer processes batches itself (producer co-processing) */
     inline constexpr size_t BATCH_SIZE = 256;
     inline constexpr size_t HWM = 512;
-    inline constexpr size_t LWM = 128;
 }
 

@@ -2,11 +2,12 @@
 
 #include "corollary4.hpp"
 #include "hysteresis_queue.hpp"
+#include "logging.hpp"
 #include "stats.hpp"
 
 #include <gmpxx.h>
 #include <vector>
-#include <iostream>
+#include <sstream>
 #include <cassert>
 
 namespace lpr::consumer {
@@ -90,17 +91,15 @@ inline void process_support(
                         ++stats.certified_inequality_pass_count;
                     } else {
                         ++stats.certified_inequality_fail_count;
-                        std::cout << "Grosswald inequality failure: p = "
-                                  << p
-                                  << ", g(p) = "
-                                  << *g
-                                  << '\n';
+                        std::ostringstream msg;
+                        msg << "Grosswald inequality failure: p = " << p << ", g(p) = " << *g;
+                        lpr::log::warn(msg.str());
                     }
                 } else {
                     ++stats.unresolved_count;
-                    std::cout << "Unresolved candidate p = "
-                              << p
-                              << '\n';
+                    std::ostringstream msg;
+                    msg << "Unresolved candidate p = " << p;
+                    lpr::log::warn(msg.str());
                 }
             }
         }
@@ -121,6 +120,7 @@ void start_consumer(QueueType& queue) {
         for (auto& job : batch) {
             process_support(job);
         }
+        lpr::stats::publish_thread_local_stats();
     }
 }
 

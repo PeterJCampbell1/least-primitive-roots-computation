@@ -4,20 +4,36 @@
 #include "corollary4.hpp"
 #include "generate_supports.hpp"
 #include "process_support.hpp"
+#include "cli.hpp"
+#include "logging.hpp"
 
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <vector>
 #include <gmpxx.h>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <stdexcept>
 #include <cassert>
 #include <chrono>
+#include <csignal>
+#include <functional>
+#include <cstdlib>
+#include <ctime>
 #include <optional>
 #include <string>
+#include <unistd.h> // gethostname
+
+#ifndef LPR_GIT_COMMIT
+#define LPR_GIT_COMMIT "unknown"
+#endif
 
 // Anonymous namespace - restricts type visibility to this file
 namespace {
+
+constexpr int EXIT_INTERRUPTED = 3;
 
 // Generate all primes <= limit using the Sieve of Eratosthenes.
 std::vector<unsigned> generate_primes(unsigned limit)
@@ -50,63 +66,181 @@ std::vector<unsigned> generate_primes(unsigned limit)
     return primes;
 } // generate_primes
 
-enum class RunMode { Single, Parallel, DryRun };
+// Set by the signal handler, polled by the monitor thread
+volatile std::sig_atomic_t g_signal = 0;
 
-/*
- * --single (default): producer processes each support inline.
- * --parallel: one producer thread and PARALLEL_THREAD_COUNT - 1 consumers.
- * --dry-run: runs the producer only, emitted supports are discarded.
- * Returns std::nullopt on an unrecognised argument.
- */
-std::optional<RunMode> parse_run_mode(int argc, char* argv[]) {
-    RunMode mode = RunMode::Single;
-    for (int i = 1; i < argc; ++i) {
-        const std::string arg = argv[i];
-        if (arg == "--single") {
-            mode = RunMode::Single;
-        } else if (arg == "--parallel") {
-            mode = RunMode::Parallel;
-        } else if (arg == "--dry-run") {
-            mode = RunMode::DryRun;
-        } else {
-            return std::nullopt;
-        }
-    }
-    return mode;
+void on_signal(int sig) {
+    g_signal = sig;
 }
 
-// TODO - Choose thread count properly (e.g. --threads n, or detected cores
-// for the UQ HPC clusters) once the parallel design is settled.
-constexpr unsigned PARALLEL_THREAD_COUNT = 8;
+std::string local_time_string() {
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+    localtime_r(&now, &local);
+    std::ostringstream out;
+    out << std::put_time(&local, "%Y-%m-%d %H:%M:%S %Z");
+    return out.str();
+}
+
+std::string hostname() {
+    char name[256] = {};
+    if (gethostname(name, sizeof(name) - 1) != 0) {
+        return "unknown";
+    }
+    return name;
+}
+
+// One line of key=value progress fields from a statistics snapshot
+std::string progress_line(
+    const lpr::stats::MasterStats& s,
+    double supports_per_second,
+    const std::optional<std::size_t>& queue_size
+) {
+    std::ostringstream out;
+    out << "progress:"
+        << " supports_emitted=" << s.supports_emitted
+        << " supports_processed=" << s.total_support_count
+        << " (" << std::fixed << std::setprecision(1) << supports_per_second << "/s)"
+        << " candidates=" << s.candidate_count
+        << " fermat_survivors=" << s.fermat_survivor_count
+        << " certified=" << s.certified_count
+        << " failed=" << s.certified_inequality_fail_count
+        << " unresolved=" << s.unresolved_count
+        << " largest_g=" << s.largest_least_primitive_root
+        << " queue=" << (queue_size ? std::to_string(*queue_size) : std::string("-"))
+        << " coprocessed=" << s.batches_coprocessed
+        << " consumer_waits=" << s.consumer_waits
+        << " position=" << lpr::producer::dfs_position_string();
+    return out.str();
+}
+
+/*
+ * Background thread that logs progress every log_interval seconds (if non-zero)
+ * and handles SIGTERM/SIGINT. It wakes once per second; on a signal it prints
+ * the statistics so far (stdout and log) and exits with EXIT_INTERRUPTED.
+ */
+class Monitor {
+public:
+    Monitor(
+        unsigned log_interval,
+        std::chrono::steady_clock::time_point start,
+        std::function<std::optional<std::size_t>()> queue_size
+    ) : log_interval_(log_interval), start_(start), queue_size_(std::move(queue_size)) {
+        thread_ = std::thread([this]() { run(); });
+    }
+
+    Monitor(const Monitor&) = delete;
+    Monitor& operator=(const Monitor&) = delete;
+
+    ~Monitor() { stop(); }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+private:
+    unsigned log_interval_;
+    std::chrono::steady_clock::time_point start_;
+    std::function<std::optional<std::size_t>()> queue_size_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+    std::thread thread_;
+
+    void run() {
+        using clock = std::chrono::steady_clock;
+        auto last_log = clock::now();
+        std::uint64_t last_processed = 0;
+
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                if (cv_.wait_for(lock, std::chrono::seconds(1), [this]() { return stop_; })) {
+                    return;
+                }
+            }
+
+            if (g_signal != 0) {
+                handle_interrupt();
+            }
+
+            const auto now = clock::now();
+            if (log_interval_ > 0 && now - last_log >= std::chrono::seconds(log_interval_)) {
+                const lpr::stats::MasterStats snapshot(lpr::stats::get_master_stats());
+                const double seconds = std::chrono::duration<double>(now - last_log).count();
+                const double rate = (snapshot.total_support_count - last_processed) / seconds;
+                lpr::log::info(progress_line(snapshot, rate, queue_size_()));
+                last_processed = snapshot.total_support_count;
+                last_log = now;
+            }
+        }
+    }
+
+    [[noreturn]] void handle_interrupt() {
+        const int sig = g_signal;
+        const lpr::stats::MasterStats snapshot(lpr::stats::get_master_stats());
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
+
+        const std::string notice = "INTERRUPTED by signal " + std::to_string(sig)
+            + " after " + std::to_string(elapsed) + " s: partial run, nothing has been verified";
+        lpr::log::info(notice);
+        lpr::log::info(progress_line(snapshot, 0.0, queue_size_()));
+
+        std::cout << '\n' << notice << '\n'
+                  << "DFS position: " << lpr::producer::dfs_position_string() << "\n\n";
+        snapshot.print();
+        std::cout << '\n';
+        snapshot.print_producer();
+        std::cout << "Elapsed time: " << elapsed << " s\n" << notice << '\n';
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(EXIT_INTERRUPTED);
+    }
+};
 
 } // namespace
 
 
 int main(int argc, char* argv[])
 {
-    const std::optional<RunMode> parsed_mode = parse_run_mode(argc, argv);
-    if (!parsed_mode) {
-        std::cerr << "Usage: " << argv[0] << " [--single | --parallel | --dry-run]\n";
+    using lpr::cli::RunMode;
+    using parameters::PRIME_LIMIT;
+
+    const lpr::cli::ParseResult parsed = lpr::cli::parse(argc, argv);
+    if (!parsed.options) {
+        std::cerr << "Error: " << parsed.error << "\n\n" << lpr::cli::usage(argv[0]);
         return 2;
     }
-    const RunMode mode = *parsed_mode;
+    const lpr::cli::Options options = *parsed.options;
+    if (options.help) {
+        std::cout << lpr::cli::usage(argv[0]);
+        return 0;
+    }
+    if (!options.log_file.empty() && !lpr::log::open_file(options.log_file)) {
+        std::cerr << "Error: cannot open log file '" << options.log_file << "'\n";
+        return 2;
+    }
 
-    unsigned threadCount = 1;
+    const RunMode mode = options.mode;
     switch (mode) {
     case RunMode::Single:
         std::cout << "Running single-threaded computation" << '\n' << '\n';
         break;
     case RunMode::Parallel:
-        threadCount = PARALLEL_THREAD_COUNT;
         std::cout << "Running multi-threaded computation" << '\n'
-                  << "Using: " << threadCount << " threads" << '\n' << '\n';
+                  << "Using: " << options.threads << " threads" << '\n' << '\n';
         break;
     case RunMode::DryRun:
         std::cout << "DRY RUN: no primes were tested or verified" << '\n' << '\n';
         break;
     }
-
-    using parameters::PRIME_LIMIT;
 
     std::vector<unsigned> primes =
         generate_primes(PRIME_LIMIT);
@@ -123,7 +257,26 @@ int main(int argc, char* argv[])
     mpz_class bound;
     corollary4_global_bound(primes, bound);
 
-    // Print initial configuration settings
+    // Print run and configuration settings
+    const std::string log_target = options.log_file.empty() ? "stderr" : options.log_file;
+    std::cout << "Run:\n"
+              << "mode: " << lpr::cli::mode_name(mode) << '\n';
+    if (mode == RunMode::Parallel) {
+        std::cout << "threads: " << options.threads
+                  << " (from " << lpr::cli::thread_source_name(options.thread_source) << ")\n";
+    }
+    std::cout << "progress log: ";
+    if (options.log_interval == 0) {
+        std::cout << "disabled\n";
+    } else {
+        std::cout << "every " << options.log_interval << " s to " << log_target << '\n';
+    }
+    std::cout << "host: " << hostname() << '\n'
+              << "started: " << local_time_string() << '\n'
+              << "build: commit " << LPR_GIT_COMMIT
+              << ", compiler " << __VERSION__
+              << ", GMP " << gmp_version << "\n\n";
+
     std::cout << "Configuration:\n"
               << "omega: " << parameters::OMEGA  << '\n'
               << "s: " << parameters::S << '\n'
@@ -135,6 +288,7 @@ int main(int argc, char* argv[])
               << "Primitive root search limit: "
               << parameters::PRIMITIVE_ROOT_SEARCH_LIMIT
               << "\n\n";
+    std::cout.flush();
 
     // We need to check that floor(bound / p_(omega-1)#) <= PRIME_LIMIT,
     // as the largest prime of any support with product <= bound is at most this.
@@ -153,33 +307,47 @@ int main(int argc, char* argv[])
     }
 
     const auto start_time = std::chrono::steady_clock::now();
+    lpr::log::set_start(start_time);
+    lpr::log::info(std::string("started: mode=") + lpr::cli::mode_name(mode)
+                   + " threads=" + std::to_string(mode == RunMode::Parallel ? options.threads : 1)
+                   + " omega=" + std::to_string(parameters::OMEGA)
+                   + " commit=" + LPR_GIT_COMMIT);
 
-    if (mode == RunMode::DryRun) {
-        lpr::producer::generate_supports_dry_run(primes, bound);
-    } else if (mode == RunMode::Single) {
-        lpr::producer::generate_supports(primes, bound);
-    } else {
-        lpr::parallel::HysteresisQueue<> queue;
+    std::signal(SIGTERM, on_signal);
+    std::signal(SIGINT, on_signal);
 
-        // Spawn single producer
-        std::thread producer([&primes, &bound, &queue]() {
-            lpr::producer::generate_supports_parallel(primes, bound, queue);
+    lpr::parallel::HysteresisQueue<> queue; // Only used in parallel mode
+    {
+        Monitor monitor(options.log_interval, start_time, [&]() -> std::optional<std::size_t> {
+            if (mode != RunMode::Parallel) return std::nullopt;
+            return queue.size();
         });
-        threadCount--;
 
-        // Spawn specified number of consumer threads
-        std::vector<std::thread> consumers;
-        consumers.reserve(threadCount);
-        for (unsigned i = 0; i < threadCount; ++i) {
-            consumers.emplace_back([&queue]() {
-                lpr::consumer::start_consumer(queue);
+        if (mode == RunMode::DryRun) {
+            lpr::producer::generate_supports_dry_run(primes, bound);
+        } else if (mode == RunMode::Single) {
+            lpr::producer::generate_supports(primes, bound);
+        } else {
+            // Spawn single producer (it also co-processes, and consumes once finished)
+            std::thread producer([&primes, &bound, &queue]() {
+                lpr::producer::generate_supports_parallel(primes, bound, queue);
             });
+
+            // Spawn the remaining threads as consumers
+            std::vector<std::thread> consumers;
+            consumers.reserve(options.threads - 1);
+            for (unsigned i = 0; i + 1 < options.threads; ++i) {
+                consumers.emplace_back([&queue]() {
+                    lpr::consumer::start_consumer(queue);
+                });
+            }
+
+            producer.join(); // End producer thread
+            for (auto& consumer : consumers) { // End consumer threads
+                consumer.join();
+            }
         }
-        
-        producer.join(); // End producer thread
-        for (auto& consumer : consumers) { // End consumer threads
-            consumer.join();
-        }
+        monitor.stop();
     }
 
     // Stats for other threads automatically merged (see stats.hpp)
@@ -188,6 +356,9 @@ int main(int argc, char* argv[])
 
     lpr::stats::flush_thread_local_stats();
     auto& master_stats = lpr::stats::get_master_stats();
+    lpr::log::info("finished after " + std::to_string(elapsed.count()) + " s");
+    lpr::log::info(progress_line(lpr::stats::MasterStats(master_stats), 0.0, std::nullopt));
+
     if (mode == RunMode::DryRun) {
         master_stats.print_producer();
         std::cout << "Elapsed time: " << elapsed.count() << " s\n"

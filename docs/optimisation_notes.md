@@ -374,6 +374,49 @@ $B$ seeds the root frame's bound, so the separate global check in the DFS is gon
 
 Benchmarked (not adopted) replacing `mpz_mul_ui(lhs, 4218)` with $M / 2^{64}$, $M = \lceil \tfrac{4}{9}\pi^8 \cdot 2^{64} \rceil$ (a 77-bit, 2 limb constant), either rounding $\lceil lhs \cdot M / 2^{64} \rceil$ or multiplying $rhs$ by $2^{64}$ instead (both sound). Both variants are ~5.5% slower per Corollary 4 call (~790 vs ~835 ns in a microbenchmark) and ~5% slower in a dry run (~1.15s vs ~1.21s), despite emitting 758 fewer supports (1343104 vs 1343862; certified 113994 vs 114064). Full single (~15.8s) and parallel (~2.8s) runtimes were indistinguishable within noise, since the 0.06% fewer candidates do not offset the extra cost. Not worth adopting at $\omega = 33$.
 
+## Profile and Least Primitive Root Instrumentation
+
+Profiled a single-threaded $\omega = 33$ run with macOS `sample` (release build with symbols, ~10,300 samples): `find_least_primitive_root` ~45% (almost entirely `mpz_powm` in the power tree), base-2 Fermat ~43%, small prime trial division ~5%, `corollary4_qd_bound` ~5%, `mpz_jacobi` ~0.1%.
+
+New counters in the search summary ("Least primitive root search"): 9.4 Jacobi calls and 4.5 Legendre survivors tested per prime (the last being $g(p)$), ~97 power tree `mpz_powm` calls per prime (11,118,678 total), and winners by $p \bmod 8$ and parity of $d$ ($p \equiv 1 \bmod 8$: 1280, all $d$ even; $3$: 50064, all $d$ odd; $5$: 12432, all $d$ even; $7$: 50288, all $d$ odd).
+
+## Reuse of Power Tree Nodes Across Candidates (measured, not adopted)
+
+Idea: within one $p$, a node of the power tree for $g = ab$ is the product of the same node for $a$ and $b$, so nodes already computed for earlier candidates could replace `mpz_powm` calls. The lazy traversal computes the paths to leaves $0..k-1$, so the stored nodes of a candidate are described by $k$ alone, and availability is $\text{avail}(y) = \max(\text{own}(y), \max_{ab = y} \min(\text{avail}(a), \text{avail}(b)))$. Counting only (no change to the computation), the upper bound on avoidable power tree `mpz_powm` calls is 173,748 of 11,118,678 (1.6%), from 32,138 of 510,955 tested candidates, i.e. at most ~0.7% of total runtime. The main limitation: quadratic residues are never tested so never have nodes, and most non-residue composites contain one (e.g. $5 \mid Q$ is always a residue, and 6 is a non-residue only when exactly one of 2, 3 is). Not worth implementing.
+
+## Namespace Fix
+
+`LPRStats`/`NullMutex` (`stats.hpp`) and `StackFrame`/`DfsStack`/`dfs_iter_` (`generate_supports.hpp`) were in anonymous namespaces in headers but used by `inline` functions with external linkage. `stats.hpp` is included from both `main.cpp` and `primality.cpp`, so each translation unit had its own `LPRStats` type behind the same accessors (an ODR violation that only worked as the layouts matched). They are now in `lpr::stats::detail` and `lpr::producer::detail`.
+
 ## Future Notes
 
 Incrementally updating the minimal completion across siblings (it changes by exactly one prime, so $Q$, $\delta_Q$ and $\delta_{SOP}$ can be updated with an exact division and multiplication from the previous set of values if those are stored) was not done: the minimal completion loop is short near the leaves where most nodes are. Worth revisiting only if profiling shows it matters, e.g. once the producer is parallelised and becomes the bottleneck.
+
+---
+
+Date: **15/10/26** (second entry)   
+Author: **Mittun Sudhahar**  
+Commit: TODO
+OMEGA: 33  
+
+This note covers producer co-processing, live progress logging, signal handling, a new command line interface and cluster readiness. Search results are unchanged in every mode.
+
+## Producer Co-Processing
+
+The queue (`hysteresis_queue.hpp`) is now a bounded queue with a non-blocking `try_push`. When the queue holds `HWM` batches, the producer processes the batch itself instead of sleeping, then continues the DFS. After the DFS it marks the queue finished and becomes a consumer to help drain it. The low water mark (`LWM`) and the producer sleep/wake path are gone. New producer statistics: batches pushed, batches co-processed, and consumer waits (a consumer found the queue empty, i.e. the producer is behind). With 2 threads, 2254 of 5250 batches were co-processed (one consumer cannot keep up); with 8 threads, 175.
+
+## Live Statistics and Logging
+
+Thread-local statistics are now published into the master statistics after every batch (`publish_thread_local_stats`, a merge and reset that costs a few µs per ~3 ms batch), so they can be read during the run. A monitor thread logs a single `progress:` line every `--log-interval` seconds (default 120) to `--log-file` or stderr. The line gives supports emitted/processed and rate, candidates, Fermat survivors, certified, failed, unresolved, largest $g(p)$, queue length, co-processed batches, consumer waits, and the DFS position (e.g. `2..101,109,113,127,...`, the leading run of consecutive primes abbreviated). Grosswald failures and unresolved candidates are reported through `log::warn`, which always writes to stderr (and to the log file if set) instead of stdout.
+
+## Signals and Exit Codes
+
+On SIGTERM/SIGINT the monitor prints the statistics so far and the DFS position, marks the run as partial, and exits with code 3. Exit codes: 0 complete, 1 failure/unresolved, 2 usage error, 3 interrupted. There is no resume yet; the design for checkpointing together with a parallel producer is in `docs/parallelise_producer.md`.
+
+## Command Line Interface
+
+`--single` (default), `--parallel`, `--dry-run`, `--threads N` (total threads for `--parallel`, at least 2; defaults to `SLURM_CPUS_PER_TASK`, then the hardware thread count), `--log-interval SECONDS`, `--log-file PATH`, `--help`. The run header prints the mode, thread count and its source, log target, host, start time, and the build (git commit, compiler, GMP version).
+
+## Cluster Readiness
+
+The `Makefile` is now tracked and portable (macOS/Homebrew or Linux with `-pthread`; `GMP_PREFIX` for non-standard GMP installs; unused OpenMP flags removed; git commit compiled in). `scripts/slurm/lpr.slurm` is a generic single-node Slurm template using `--signal=TERM@300`. `docs/current_method.md` is a full write-up of the current method.

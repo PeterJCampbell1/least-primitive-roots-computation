@@ -3,6 +3,7 @@
 #include "stats.hpp" 
 
 #include <numeric>
+#include <algorithm>
 #include <cassert>
 
 /* Primality Filters */
@@ -181,7 +182,8 @@ void _generate_next_residue(
     std::array<mpz_class, parameters::TREE_SIZE>& power_tree,
     const std::array<mpz_class, parameters::TREE_SIZE>& product_tree,
     const mpz_class& p,
-    size_t& leaf_idx
+    size_t& leaf_idx,
+    std::uint64_t& powm_count
 ) {
     using parameters::TREE_SIZE; 
 
@@ -189,6 +191,7 @@ void _generate_next_residue(
     if (leaf_idx == 0) {
         while (2*leaf_idx + 1 < TREE_SIZE) {
             // Take to the power of right child
+            ++powm_count;
             mpz_powm(
                 power_tree[2*leaf_idx+1].get_mpz_t(),
                 power_tree[leaf_idx].get_mpz_t(),
@@ -216,6 +219,7 @@ void _generate_next_residue(
 
     // Go to the right child
     leaf_idx++; 
+    ++powm_count;
     mpz_powm(
         power_tree[leaf_idx].get_mpz_t(),
         power_tree[parent].get_mpz_t(),
@@ -226,6 +230,7 @@ void _generate_next_residue(
     // Go left until reaching a leaf
     while (2*leaf_idx + 1 < TREE_SIZE) {
         // Take to the power of right child
+        ++powm_count;
         mpz_powm(
             power_tree[2*leaf_idx+1].get_mpz_t(),
             power_tree[leaf_idx].get_mpz_t(),
@@ -239,6 +244,52 @@ void _generate_next_residue(
 bool _is_perfect_power(unsigned g) {
     return IS_PERFECT_POWER_TABLE[g];
 }
+
+/*
+ * Instrumentation only (does not affect the computation): measures how many
+ * power tree nodes of a tested g could instead be formed from the stored nodes
+ * of previously tested g at the same p, as val(a*b, N) = val(a, N) * val(b, N).
+ *
+ * The lazy traversal computes the root-to-leaf paths of leaves 0..k-1 for a g
+ * that exits at leaf k-1, so a g's stored nodes are described by k alone.
+ * Intersections become min and unions become max:
+ *   avail(y) = max(own(y), max over a*b = y, 1 < a <= b, of min(avail(a), avail(b)))
+ */
+namespace { // Internal to this translation unit
+struct ReuseTracker {
+    static constexpr unsigned LIMIT = parameters::PRIMITIVE_ROOT_SEARCH_LIMIT;
+    std::array<std::uint16_t, LIMIT + 1> own{};  // Leaves computed for tested y (0 if untested)
+    std::array<std::int16_t, LIMIT + 1> memo{};  // avail(y), -1 if not yet computed
+    std::array<std::uint64_t, parameters::OMEGA> cum_powm{}; // Tree powm calls to reach leaf j
+    std::vector<unsigned> touched;
+
+    ReuseTracker() { memo.fill(-1); }
+
+    void reset() { // Per p
+        for (unsigned y : touched) { own[y] = 0; memo[y] = -1; }
+        touched.clear();
+    }
+
+    int avail(unsigned y) {
+        if (memo[y] >= 0) return memo[y];
+        int m = own[y];
+        for (unsigned a = 2; a * a <= y; ++a) {
+            if (y % a == 0) {
+                m = std::max(m, std::min(avail(a), avail(y / a)));
+            }
+        }
+        memo[y] = static_cast<std::int16_t>(m);
+        touched.push_back(y);
+        return m;
+    }
+
+    void record(unsigned g, unsigned leaves) {
+        own[g] = static_cast<std::uint16_t>(leaves);
+        if (memo[g] < static_cast<int>(leaves)) memo[g] = static_cast<std::int16_t>(leaves);
+        touched.push_back(g);
+    }
+};
+} // namespace
 
 std::optional<mpz_class> find_least_primitive_root(
     const mpz_class& p,
@@ -308,6 +359,9 @@ std::optional<mpz_class> find_least_primitive_root(
     _build_product_tree(product_tree, prime_divisors, 0, 1, parameters::OMEGA);
 
     //mpz_class residue;
+    static thread_local ReuseTracker reuse;
+    reuse.reset();
+
     bool u2 = false;
     bool u3 = false;
     mpz_class exponent;
@@ -325,6 +379,7 @@ std::optional<mpz_class> find_least_primitive_root(
         }
 
         const mpz_class base = g;
+        ++stats.lpr_jacobi_calls;
 
         // 2. Jacobi filter
         // If p is prime, a primitive root must be a quadratic
@@ -344,11 +399,14 @@ std::optional<mpz_class> find_least_primitive_root(
 
 
         ++(stats.surviving_legendre_count[g]);
+        ++stats.lpr_legendre_survivors;
+        const int avail_leaves = reuse.avail(g); // Before g's own nodes are recorded
 
         bool primitive_root_if_prime = true;
         
         // 3. Compute A = g^{2d} (mod p)
         //exponent = 2 * d; // TODO - This can be mpz_powm_ui
+        ++stats.lpr_root_powm_count;
         mpz_powm_ui(
             power_tree[0].get_mpz_t(),
             base.get_mpz_t(),
@@ -357,6 +415,8 @@ std::optional<mpz_class> find_least_primitive_root(
         );
 
         size_t leaf_idx = 0; // Leaf in the power tree
+        std::uint64_t tree_powm = 0;
+        unsigned leaves = 0;
         for (unsigned q : prime_divisors) {
 
             // For prime p, this condition is already supplied by
@@ -366,7 +426,8 @@ std::optional<mpz_class> find_least_primitive_root(
             }
 
             // 4. Lazily compute power tree with early exit
-            _generate_next_residue(power_tree, product_tree, p, leaf_idx); 
+            _generate_next_residue(power_tree, product_tree, p, leaf_idx, tree_powm); 
+            reuse.cum_powm[leaves++] = tree_powm;
 
             if (power_tree[leaf_idx] == 1) {
                 primitive_root_if_prime = false;
@@ -374,7 +435,17 @@ std::optional<mpz_class> find_least_primitive_root(
             }
         }
 
+        stats.lpr_tree_powm_count += tree_powm;
+        const unsigned reusable = std::min<unsigned>(avail_leaves, leaves);
+        if (reusable > 0) {
+            ++stats.lpr_reuse_candidates;
+            stats.lpr_reuse_tree_powm += reuse.cum_powm[reusable - 1];
+        }
+        reuse.record(g, leaves);
+
         if (primitive_root_if_prime) {
+            const unsigned p_mod_8 = mpz_fdiv_ui(p.get_mpz_t(), 8);
+            ++stats.winners_by_class[2*p_mod_8 + (d & 1)];
             return mpz_class(g);
         }
     }

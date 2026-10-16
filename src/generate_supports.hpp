@@ -25,11 +25,13 @@
 #include "stats.hpp"
 
 #include <array>
+#include <atomic>
+#include <string>
 #include <vector>
 #include <cassert>
 #include <gmpxx.h>
 
-namespace { // Anonymous namespace for internal use only
+namespace lpr::producer::detail { // Internal; named (not anonymous) as this is a header
 struct StackFrame {
     std::size_t next_prime_idx;
     mpz_class product;
@@ -258,15 +260,72 @@ __attribute__((always_inline)) void dfs_iter_(
     } // while (true)
 }
 
-} // namespace
+} // namespace lpr::producer::detail
 
 namespace lpr::producer {
 
+// The most recently emitted support, as a progress indicator for logging
+// (relaxed atomics: the value is only informational, and may mix two supports).
+inline std::array<std::atomic<unsigned>, parameters::OMEGA> dfs_position{};
+inline std::array<std::atomic<unsigned>, parameters::OMEGA> dfs_first_primes{};
+
+inline void set_dfs_first_primes(const std::vector<unsigned>& primes) {
+    for (std::size_t i = 0; i < dfs_first_primes.size() && i < primes.size(); ++i) {
+        dfs_first_primes[i].store(primes[i], std::memory_order_relaxed);
+    }
+}
+
+inline void update_dfs_position(const std::vector<unsigned>& support) {
+    for (std::size_t i = 0; i < dfs_position.size() && i < support.size(); ++i) {
+        dfs_position[i].store(support[i], std::memory_order_relaxed);
+    }
+}
+
+// E.g. "2..61,71,73,79,83,89,97,..." : the leading run of consecutive primes
+// is abbreviated, then the next few primes of the support are shown
+inline std::string dfs_position_string() {
+    constexpr std::size_t SHOWN = 6;
+    std::size_t k = 0; // First index where the support leaves the consecutive primes
+    while (k < dfs_position.size()
+           && dfs_position[k].load(std::memory_order_relaxed)
+              == dfs_first_primes[k].load(std::memory_order_relaxed)) {
+        ++k;
+    }
+    if (dfs_position[0].load(std::memory_order_relaxed) == 0) {
+        return "none yet";
+    }
+    std::string out;
+    if (k > 0) {
+        out += "2.." + std::to_string(dfs_position[k - 1].load(std::memory_order_relaxed));
+    }
+    for (std::size_t i = k; i < dfs_position.size() && i < k + SHOWN; ++i) {
+        out += (out.empty() ? "" : ",") + std::to_string(dfs_position[i].load(std::memory_order_relaxed));
+    }
+    if (k + SHOWN < dfs_position.size()) {
+        out += ",...";
+    }
+    return out;
+}
+
+/*
+ * Single-threaded: processes each support as soon as it is emitted.
+ * Statistics are published every BATCH_SIZE supports for progress logging.
+ */
 inline void generate_supports(
     const std::vector<unsigned>& primes,
     const mpz_class& global_bound
 ) {
-    dfs_iter_(primes, global_bound, consumer::process_support);
+    set_dfs_first_primes(primes);
+    std::size_t since_publish = 0;
+    detail::dfs_iter_(primes, global_bound, [&](const parallel::LPRJob& job) {
+        consumer::process_support(job);
+        if (++since_publish == parameters::BATCH_SIZE) {
+            since_publish = 0;
+            update_dfs_position(job.support);
+            stats::publish_thread_local_stats();
+        }
+    });
+    stats::publish_thread_local_stats();
 }
 
 /*
@@ -277,13 +336,24 @@ inline void generate_supports_dry_run(
     const std::vector<unsigned>& primes,
     const mpz_class& global_bound
 ) {
-    dfs_iter_(primes, global_bound, [](const parallel::LPRJob&) {});
+    set_dfs_first_primes(primes);
+    std::size_t since_publish = 0;
+    detail::dfs_iter_(primes, global_bound, [&](const parallel::LPRJob& job) {
+        if (++since_publish == parameters::BATCH_SIZE) {
+            since_publish = 0;
+            update_dfs_position(job.support);
+            stats::publish_thread_local_stats();
+        }
+    });
+    stats::publish_thread_local_stats();
 }
 
 /*
- * Wrapper around DFS to generate supports.
+ * Producer for the multi-threaded mode.
  *
- * Auto-handles batching jobs, and pushing batches to the concurrent queue.
+ * Batches jobs and offers each full batch to the queue. If the queue is full
+ * the producer processes the batch itself (producer co-processing), so it never
+ * sleeps. After the DFS it marks the queue finished and helps drain it.
  */
 template <typename QueueType>
 void generate_supports_parallel(
@@ -291,33 +361,47 @@ void generate_supports_parallel(
     const mpz_class& global_bound,
     QueueType& queue
 ) {
+    set_dfs_first_primes(primes);
     using parameters::BATCH_SIZE;
     using parallel::LPRBatch;
     using parallel::LPRJob;
+    auto& stats = lpr::stats::get_thread_local_stats();
     LPRBatch current_batch;
     current_batch.reserve(BATCH_SIZE);
 
-    // Lambda passed into generate_supports to emit candidate supports
-    auto emit_job = [&](LPRJob job) {
-        current_batch.push_back(job);
+    auto submit_batch = [&]() {
+        update_dfs_position(current_batch.back().support);
+        if (queue.try_push(current_batch)) {
+            ++stats.batches_pushed;
+        } else { // Consumers are behind: process this batch here
+            for (const LPRJob& job : current_batch) {
+                consumer::process_support(job);
+            }
+            ++stats.batches_coprocessed;
+        }
+        current_batch = LPRBatch(); // Reset batch buffer
+        current_batch.reserve(BATCH_SIZE);
+        stats::publish_thread_local_stats();
+    };
 
+    // Lambda passed into dfs_iter_ to emit candidate supports
+    auto emit_job = [&](LPRJob job) {
+        current_batch.push_back(std::move(job));
         if (current_batch.size() == BATCH_SIZE) {
-            queue.push(std::move(current_batch));
-            current_batch = LPRBatch(); // Reset batch buffer
-            current_batch.reserve(BATCH_SIZE);
+            submit_batch();
         }
     };
 
     // Run DFS candidate generator
-    dfs_iter_(primes, global_bound, emit_job);
+    detail::dfs_iter_(primes, global_bound, emit_job);
 
     // Flush remaining candidates in final batch
     if (!current_batch.empty()) {
-        queue.push(std::move(current_batch));
+        submit_batch();
     }
 
     queue.set_finished();
+    consumer::start_consumer(queue); // Help drain the queue
 }
 
 } // lpr::producer
-
