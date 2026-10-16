@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "config.hpp"
 #include "corollary4.hpp"
 #include "hysteresis_queue.hpp"
 #include "parameters.hpp"
@@ -89,7 +90,7 @@ public:
     }
 
 private:
-    std::array<StackFrame, parameters::OMEGA + 1> frames_;
+    std::array<StackFrame, parameters::MAX_OMEGA + 1> frames_; // Uses search_config().omega + 1
     std::size_t depth_ = 1; // Depth 0 (the prime 2) is fixed
 };
 
@@ -124,10 +125,10 @@ __attribute__((always_inline)) void dfs_iter_(
     const mpz_class& global_bound,
     Callable process_job
 ) {
-    using parameters::OMEGA;
-    using parameters::S;
+    const auto& config = lpr::config::search_config();
+    const std::size_t OMEGA = config.omega;
 
-    static_assert(OMEGA > 2, "Must have at least 2 prime factors to use Cor 4");
+    assert(OMEGA > 2 && OMEGA <= parameters::MAX_OMEGA && "Must have at least 2 prime factors to use Cor 4");
     assert(!primes.empty() && primes[0] == 2);
     auto& stats = lpr::stats::get_thread_local_stats();
 
@@ -137,9 +138,9 @@ __attribute__((always_inline)) void dfs_iter_(
     support[0] = primes[0]; // primes[0] == 2
     
     // Number of primes to ignore
-    constexpr std::size_t DELTA_START_DEPTH = OMEGA - S; 
-    static_assert(DELTA_START_DEPTH > 0, "We cannot have OMEGA == S as 2 must be excluded");
-    static_assert(DELTA_START_DEPTH < OMEGA, "Need S >= 1 so leaves always have a Cor 4 bound");
+    const std::size_t DELTA_START_DEPTH = config.delta_start_depth(); 
+    assert(DELTA_START_DEPTH > 0 && "We cannot have OMEGA == S as 2 must be excluded");
+    assert(DELTA_START_DEPTH < OMEGA && "Need S >= 1 so leaves always have a Cor 4 bound");
 
     mpz_class min_complete_product;
     mpz_class min_complete_delta_Q;
@@ -266,8 +267,8 @@ namespace lpr::producer {
 
 // The most recently emitted support, as a progress indicator for logging
 // (relaxed atomics: the value is only informational, and may mix two supports).
-inline std::array<std::atomic<unsigned>, parameters::OMEGA> dfs_position{};
-inline std::array<std::atomic<unsigned>, parameters::OMEGA> dfs_first_primes{};
+inline std::array<std::atomic<unsigned>, parameters::MAX_OMEGA> dfs_position{};
+inline std::array<std::atomic<unsigned>, parameters::MAX_OMEGA> dfs_first_primes{};
 
 inline void set_dfs_first_primes(const std::vector<unsigned>& primes) {
     for (std::size_t i = 0; i < dfs_first_primes.size() && i < primes.size(); ++i) {
@@ -285,8 +286,9 @@ inline void update_dfs_position(const std::vector<unsigned>& support) {
 // is abbreviated, then the next few primes of the support are shown
 inline std::string dfs_position_string() {
     constexpr std::size_t SHOWN = 6;
+    const std::size_t n = lpr::config::search_config().omega; // Entries in use
     std::size_t k = 0; // First index where the support leaves the consecutive primes
-    while (k < dfs_position.size()
+    while (k < n
            && dfs_position[k].load(std::memory_order_relaxed)
               == dfs_first_primes[k].load(std::memory_order_relaxed)) {
         ++k;
@@ -298,10 +300,10 @@ inline std::string dfs_position_string() {
     if (k > 0) {
         out += "2.." + std::to_string(dfs_position[k - 1].load(std::memory_order_relaxed));
     }
-    for (std::size_t i = k; i < dfs_position.size() && i < k + SHOWN; ++i) {
+    for (std::size_t i = k; i < n && i < k + SHOWN; ++i) {
         out += (out.empty() ? "" : ",") + std::to_string(dfs_position[i].load(std::memory_order_relaxed));
     }
-    if (k + SHOWN < dfs_position.size()) {
+    if (k + SHOWN < n) {
         out += ",...";
     }
     return out;

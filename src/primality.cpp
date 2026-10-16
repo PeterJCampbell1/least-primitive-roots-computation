@@ -1,4 +1,5 @@
 #include "primality.hpp"
+#include "config.hpp"
 #include "parameters.hpp"
 #include "stats.hpp" 
 
@@ -137,7 +138,7 @@ bool is_composite_base2_miller_rabin(
 /* Finding Least Primitive Roots */
 
 void _build_product_tree(
-    std::array<mpz_class, parameters::TREE_SIZE>& product_tree,
+    std::array<mpz_class, parameters::MAX_TREE_SIZE>& product_tree,
     const std::vector<unsigned>& prime_divisors,
     const int node,
     const int left,
@@ -179,13 +180,13 @@ void _build_product_tree(
 }
 
 void _generate_next_residue(
-    std::array<mpz_class, parameters::TREE_SIZE>& power_tree,
-    const std::array<mpz_class, parameters::TREE_SIZE>& product_tree,
+    std::array<mpz_class, parameters::MAX_TREE_SIZE>& power_tree,
+    const std::array<mpz_class, parameters::MAX_TREE_SIZE>& product_tree,
     const mpz_class& p,
     size_t& leaf_idx,
     std::uint64_t& powm_count
 ) {
-    using parameters::TREE_SIZE; 
+    const std::size_t TREE_SIZE = lpr::config::search_config().tree_size(); 
 
     // Starting call at root node
     if (leaf_idx == 0) {
@@ -260,7 +261,7 @@ struct ReuseTracker {
     static constexpr unsigned LIMIT = parameters::PRIMITIVE_ROOT_SEARCH_LIMIT;
     std::array<std::uint16_t, LIMIT + 1> own{};  // Leaves computed for tested y (0 if untested)
     std::array<std::int16_t, LIMIT + 1> memo{};  // avail(y), -1 if not yet computed
-    std::array<std::uint64_t, parameters::OMEGA> cum_powm{}; // Tree powm calls to reach leaf j
+    std::array<std::uint64_t, parameters::MAX_OMEGA> cum_powm{}; // Tree powm calls to reach leaf j
     std::vector<unsigned> touched;
 
     ReuseTracker() { memo.fill(-1); }
@@ -299,7 +300,8 @@ std::optional<mpz_class> find_least_primitive_root(
     assert(p > 2);
     assert(mpz_odd_p(p.get_mpz_t()));
     assert(prime_divisors[0] == 2);
-    assert(prime_divisors.size() == parameters::OMEGA);
+    const std::size_t OMEGA = lpr::config::search_config().omega;
+    assert(prime_divisors.size() == OMEGA);
 
     auto& stats = lpr::stats::get_thread_local_stats();
 
@@ -351,12 +353,12 @@ std::optional<mpz_class> find_least_primitive_root(
     // 4. Compute power tree, lazily
 
     // 1. Full binary tree with n leaves contains 2n-1 nodes - ignore prime 2
-    using parameters::TREE_SIZE;
-    static thread_local std::array<mpz_class, TREE_SIZE> product_tree = {};
-    static thread_local std::array<mpz_class, TREE_SIZE> power_tree = {};
+    // Fixed maximum size; only the first search_config().tree_size() nodes are used
+    static thread_local std::array<mpz_class, parameters::MAX_TREE_SIZE> product_tree = {};
+    static thread_local std::array<mpz_class, parameters::MAX_TREE_SIZE> power_tree = {};
 
     // Done recursively for simplicity, can be made iterative (full complete binary tree)
-    _build_product_tree(product_tree, prime_divisors, 0, 1, parameters::OMEGA);
+    _build_product_tree(product_tree, prime_divisors, 0, 1, OMEGA);
 
     //mpz_class residue;
     static thread_local ReuseTracker reuse;

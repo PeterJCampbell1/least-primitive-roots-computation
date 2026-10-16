@@ -2,7 +2,7 @@
 
 This note describes the method as currently implemented (October 2026). It supersedes the description of release `v1.0-k33` in [`method.md`](method.md), whose notation it follows. Dated details of each optimisation, with measurements, are in [`optimisation_notes.md`](optimisation_notes.md).
 
-The program follows the finite-search strategy of Gustav Kjærbye Bagger's *A Note on Least Primitive Roots* (arXiv:2608.20431). For a fixed $\omega$ (`OMEGA` in `src/parameters.hpp`, currently 33) it verifies Grosswald's inequality
+The program follows the finite-search strategy of Gustav Kjærbye Bagger's *A Note on Least Primitive Roots* (arXiv:2608.20431). For a fixed $\omega$ (chosen at runtime with `--omega` or a `--config` file; default 33) it verifies Grosswald's inequality
 ```math
 (g(p)+2)^2 < p,
 ```
@@ -71,7 +71,7 @@ B = 1786365837793136794888149451900656359669584286707872106 \approx 1.786366 \ti
 ```
 (Release `v1.0-k33` used the hand-chosen $1.8 \times 10^{54}$, a decimal upper bound for this value.) Hence the run covers **every** prime $p$ with $\omega(p-1) = \omega$, not only those below a fixed bound.
 
-**Prime-list completeness.** If $r$ is the largest prime of a support with $Q \le B$, then $p_{\omega-1}\#\, r \le Q \le B$, so $r \le \lfloor B / p_{\omega-1}\# \rfloor$. `main` checks that `PRIME_LIMIT` is at least this value and that the first $\omega$ primes were generated, and stops otherwise.
+**Prime-list completeness.** If $r$ is the largest prime of a support with $Q \le B$, then $p_{\omega-1}\#\, r \le Q \le B$, so $r \le \lfloor B / p_{\omega-1}\# \rfloor$. `main` therefore sieves all primes up to $\lfloor B / p_{\omega-1}\# \rfloor$ (3396, i.e. 478 primes, for $\omega = 33$, $s = 30$), after first sieving a small range to obtain the first $\omega$ primes needed for $B$. It then validates that the list starts with the first $\omega$ primes and covers that limit, and stops otherwise; the limit is capped by `MAX_PRIME_LIMIT`. Supports needing a prime beyond the end of the list are skipped by the DFS, which is safe because any such support has $Q > B$.
 
 ## 4. Enumerating supports
 
@@ -189,10 +189,11 @@ Profile of a single-threaded run (macOS `sample`): least-primitive-root power tr
 
 ## 11. Code layout
 
-- `src/main.cpp`: prime sieve, global bound and `PRIME_LIMIT` check, run modes, threads, monitor and signal handling, final summary.
+- `src/main.cpp`: prime sieve up to the computed limit and its validation, global bound, run modes, threads, monitor and signal handling, final summary.
 - `src/cli.hpp`: command-line parsing.
 - `src/logging.hpp`: timestamped progress log and warnings.
-- `src/parameters.hpp`: `OMEGA`, `S`, `PRIME_LIMIT`, `PRIMITIVE_ROOT_SEARCH_LIMIT`, trial-division chunks, batch and queue sizes.
+- `src/config.hpp`: runtime $\omega$ and $s$ (`--config`, `--omega`, `--s`; $s$ defaults to $\omega - 3$).
+- `src/parameters.hpp`: compile-time settings: `DEFAULT_OMEGA`, `MAX_OMEGA` (34), `MAX_PRIME_LIMIT`, `PRIMITIVE_ROOT_SEARCH_LIMIT`, trial-division chunks, batch and queue sizes.
 - `src/corollary4.{hpp,cpp}`: $\beta$ (`corollary4_qd_bound`) and $B$ (`corollary4_global_bound`).
 - `src/generate_supports.hpp`: the DFS (`DfsStack`, `dfs_iter_`) and the single, dry-run and parallel producers.
 - `src/process_support.hpp`: enumerating $d$ per support and the filter pipeline; consumer loop.
@@ -200,4 +201,3 @@ Profile of a single-threaded run (macOS `sample`): least-primitive-root power tr
 - `src/hysteresis_queue.hpp`: the bounded batch queue (`try_push`/`pop`).
 - `src/stats.hpp`: thread-local and master statistics.
 
-(`docs/method2.md` is an empty file.)

@@ -5,8 +5,11 @@
 #include "generate_supports.hpp"
 #include "process_support.hpp"
 #include "cli.hpp"
+#include "config.hpp"
 #include "logging.hpp"
 
+#include <algorithm>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -36,20 +39,22 @@ namespace {
 constexpr int EXIT_INTERRUPTED = 3;
 
 // Generate all primes <= limit using the Sieve of Eratosthenes.
+// 64-bit indices so that limits close to UINT_MAX do not overflow.
 std::vector<unsigned> generate_primes(unsigned limit)
 {
-    std::vector<bool> is_prime(limit + 1, true);
+    const std::uint64_t n = limit;
+    std::vector<bool> is_prime(n + 1, true);
 
     is_prime[0] = false;
-    is_prime[1] = false;
+    if (n >= 1) is_prime[1] = false;
 
-    for (unsigned p = 2; p * p <= limit; ++p) {
+    for (std::uint64_t p = 2; p * p <= n; ++p) {
         if (!is_prime[p]) {
             continue;
         }
 
-        for (unsigned multiple = p * p;
-             multiple <= limit;
+        for (std::uint64_t multiple = p * p;
+             multiple <= n;
              multiple += p) {
             is_prime[multiple] = false;
         }
@@ -57,9 +62,9 @@ std::vector<unsigned> generate_primes(unsigned limit)
 
     std::vector<unsigned> primes;
 
-    for (unsigned p = 2; p <= limit; ++p) {
+    for (std::uint64_t p = 2; p <= n; ++p) {
         if (is_prime[p]) {
-            primes.push_back(p);
+            primes.push_back(static_cast<unsigned>(p));
         }
     }
 
@@ -211,7 +216,6 @@ private:
 int main(int argc, char* argv[])
 {
     using lpr::cli::RunMode;
-    using parameters::PRIME_LIMIT;
 
     const lpr::cli::ParseResult parsed = lpr::cli::parse(argc, argv);
     if (!parsed.options) {
@@ -228,6 +232,28 @@ int main(int argc, char* argv[])
         return 2;
     }
 
+    // Resolve omega and s (command line over config file over defaults)
+    lpr::config::Overrides file_overrides;
+    if (!options.config_file.empty()) {
+        const std::string error = lpr::config::read_config_file(options.config_file, file_overrides);
+        if (!error.empty()) {
+            std::cerr << "Error: " << error << '\n';
+            return 2;
+        }
+    }
+    lpr::config::SearchConfig search;
+    {
+        const std::string error = lpr::config::resolve(
+            file_overrides, options.config_file, options.search, search
+        );
+        if (!error.empty()) {
+            std::cerr << "Error: " << error << '\n';
+            return 2;
+        }
+    }
+    lpr::config::set_search_config(search); // Read-only from here on
+    const std::size_t OMEGA = search.omega;
+
     const RunMode mode = options.mode;
     switch (mode) {
     case RunMode::Single:
@@ -242,20 +268,54 @@ int main(int argc, char* argv[])
         break;
     }
 
-    std::vector<unsigned> primes =
-        generate_primes(PRIME_LIMIT);
-
-    // The global bound needs the first omega primes.
-    if (primes.size() < parameters::OMEGA) {
-        throw std::runtime_error(
-            "PRIME_LIMIT is too small to generate the first omega primes."
-        );
+    // The global bound needs the first omega primes: sieve a small range first
+    std::vector<unsigned> first_primes;
+    for (unsigned small_limit = 256; first_primes.size() < OMEGA; small_limit *= 2) {
+        first_primes = generate_primes(small_limit);
     }
 
     // Largest Q*d (p = Q*d + 1) not covered by Corollary 4 for any support.
     // Every p with omega(p-1) = omega and p - 1 > bound satisfies Grosswald by Cor 4.
     mpz_class bound;
-    corollary4_global_bound(primes, bound);
+    corollary4_global_bound(first_primes, bound);
+
+    // If r is the largest prime of a support with product Q <= B, then
+    // p_(omega-1)# * r <= Q <= B, so r <= floor(B / p_(omega-1)#). Generating every
+    // prime up to this limit makes the support enumeration exhaustive.
+    mpz_class smallest_product = 1; // p_(omega-1)#
+    for (std::size_t i = 0; i < OMEGA - 1; ++i) {
+        smallest_product *= first_primes[i];
+    }
+    const mpz_class required_prime_limit = bound / smallest_product;
+
+    if (required_prime_limit > parameters::MAX_PRIME_LIMIT) {
+        std::cerr << "Error: the prime limit floor(B / p_(omega-1)#) = " << required_prime_limit
+                  << " for omega = " << OMEGA << ", s = " << search.s
+                  << " exceeds MAX_PRIME_LIMIT (" << parameters::MAX_PRIME_LIMIT
+                  << ") in src/parameters.hpp.\n";
+        return 2;
+    }
+    // Also cover the first omega primes (needed when no support is possible)
+    const unsigned prime_limit = std::max<unsigned>(
+        static_cast<unsigned>(required_prime_limit.get_ui()), first_primes[OMEGA - 1]
+    );
+
+    std::vector<unsigned> primes =
+        generate_primes(prime_limit);
+
+    // Validation: the list must contain the first omega primes (the global bound
+    // and the minimal completions use them) and every prime up to the required limit.
+    if (primes.size() < OMEGA
+        || !std::equal(first_primes.begin(), first_primes.begin() + OMEGA, primes.begin())) {
+        std::cerr << "Error: the generated prime list does not start with the first omega primes.\n";
+        return 2;
+    }
+    if (mpz_class(prime_limit) < required_prime_limit
+        || mpz_class(primes.back()) > mpz_class(prime_limit)) {
+        std::cerr << "Error: the generated prime list does not cover floor(B / p_(omega-1)#) = "
+                  << required_prime_limit << "; support enumeration would not be exhaustive.\n";
+        return 2;
+    }
 
     // Print run and configuration settings
     const std::string log_target = options.log_file.empty() ? "stderr" : options.log_file;
@@ -278,39 +338,26 @@ int main(int argc, char* argv[])
               << ", GMP " << gmp_version << "\n\n";
 
     std::cout << "Configuration:\n"
-              << "omega: " << parameters::OMEGA  << '\n'
-              << "s: " << parameters::S << '\n'
+              << "omega: " << OMEGA << " (" << search.omega_source << ")\n"
+              << "s: " << search.s << " (" << search.s_source << ")\n"
               << "Search bound B (Cor 4 global bound on p - 1): "
               << std::scientific << std::setprecision(6) << bound.get_d()
               << std::defaultfloat << '\n'
               << "B (exact): " << bound << '\n'
-              << "Prime generation limit: " << PRIME_LIMIT << '\n'
+              << "Prime generation limit: " << prime_limit
+              << " (floor(B / p_(omega-1)#) = " << required_prime_limit << ", "
+              << primes.size() << " primes)\n"
               << "Primitive root search limit: "
               << parameters::PRIMITIVE_ROOT_SEARCH_LIMIT
               << "\n\n";
     std::cout.flush();
 
-    // We need to check that floor(bound / p_(omega-1)#) <= PRIME_LIMIT,
-    // as the largest prime of any support with product <= bound is at most this.
-    mpz_class smallest_product = 1;
-    for (std::size_t i = 0; i < parameters::OMEGA - 1; ++i) {
-        smallest_product *= primes[i];
-    }
-
-    const mpz_class required_prime_limit =
-        bound / smallest_product;
-
-    if (mpz_class(PRIME_LIMIT) < required_prime_limit) {
-        throw std::runtime_error(
-            "PRIME_LIMIT is too small to guarantee exhaustive support enumeration."
-        );
-    }
-
     const auto start_time = std::chrono::steady_clock::now();
     lpr::log::set_start(start_time);
     lpr::log::info(std::string("started: mode=") + lpr::cli::mode_name(mode)
                    + " threads=" + std::to_string(mode == RunMode::Parallel ? options.threads : 1)
-                   + " omega=" + std::to_string(parameters::OMEGA)
+                   + " omega=" + std::to_string(OMEGA)
+                   + " s=" + std::to_string(search.s)
                    + " commit=" + LPR_GIT_COMMIT);
 
     std::signal(SIGTERM, on_signal);

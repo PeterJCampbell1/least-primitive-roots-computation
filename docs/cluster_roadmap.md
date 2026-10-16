@@ -31,7 +31,7 @@ Needed as soon as a run can exceed the wall-time limit. OMEGA=32 takes about 6 h
   - start from a given support, rebuilding each frame's product, window values and bound by replaying the prefix;
   - stop at an end boundary.
 - **Checkpoint file:**
-  - contents: a config fingerprint (OMEGA, S, PRIME_LIMIT, search limit, sieve constant, B, commit), the committed stats including the mpz and array fields, and the list of regions (just one for now), each with an end boundary and a watermark support;
+  - contents: a config fingerprint (OMEGA, S, the prime limit, search limit, sieve constant, B, commit), the committed stats including the mpz and array fields, and the list of regions (just one for now), each with an end boundary and a watermark support;
   - written atomically (temporary file, then rename) every log interval and on SIGTERM.
 - **`--resume FILE`:** check the fingerprint, load the stats, and continue each region from its watermark.
 - **Slurm:** either `--requeue`, or a chain of jobs (`--dependency=afterany`) where each one runs `--resume` on the previous checkpoint.

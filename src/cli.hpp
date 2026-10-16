@@ -2,11 +2,14 @@
  * cli.hpp: command line parsing.
  *
  * Modes (at most one): --single (default), --parallel, --dry-run.
- * Options: --threads N, --log-interval SECONDS, --log-file PATH, -h/--help.
+ * Options: --threads N, --log-interval SECONDS, --log-file PATH,
+ *          --config PATH, --omega N, --s N, -h/--help.
  * Value options accept both "--opt value" and "--opt=value".
  **/
 
 #pragma once
+
+#include "config.hpp"
 
 #include <cstdlib>
 #include <optional>
@@ -24,6 +27,8 @@ struct Options {
     ThreadSource thread_source = ThreadSource::None;
     unsigned log_interval = 120; // Seconds between progress logs, 0 disables
     std::string log_file; // Empty means stderr
+    std::string config_file; // Empty means none
+    lpr::config::Overrides search; // --omega / --s (override the config file)
     bool help = false;
 };
 
@@ -58,6 +63,11 @@ Modes:
   --single               Single-threaded computation (default)
   --parallel             One producer thread plus consumer threads
   --dry-run              Run the support enumeration only; nothing is verified
+
+Search parameters (default omega = )" + std::to_string(parameters::DEFAULT_OMEGA) + R"(, s = omega - 3):
+  --config PATH          Read omega and s from PATH ("key = value" lines, '#' comments)
+  --omega N              Number of distinct prime factors of p - 1 (overrides --config)
+  --s N                  Corollary 4 parameter, 1 <= s <= omega - 3 (overrides --config)
 
 Options:
   --threads N            Total threads for --parallel (N >= 2). Defaults to
@@ -132,6 +142,15 @@ inline ParseResult parse(int argc, char* argv[]) {
             const auto n = v ? parse_unsigned(*v) : std::nullopt;
             if (!n) return {std::nullopt, "--log-interval needs a non-negative integer (seconds)"};
             options.log_interval = *n;
+        } else if (arg == "--config") {
+            const auto v = value();
+            if (!v || v->empty()) return {std::nullopt, "--config needs a path"};
+            options.config_file = *v;
+        } else if (arg == "--omega" || arg == "--s") {
+            const auto v = value();
+            const auto n = v ? parse_unsigned(*v) : std::nullopt;
+            if (!n) return {std::nullopt, arg + " needs a non-negative integer"};
+            (arg == "--omega" ? options.search.omega : options.search.s) = *n;
         } else if (arg == "--log-file") {
             const auto v = value();
             if (!v || v->empty()) return {std::nullopt, "--log-file needs a path"};

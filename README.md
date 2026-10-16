@@ -16,7 +16,7 @@ This version verifies the case
 ```math
 \omega(p-1)=\omega
 ```
-with $\omega$ set by `OMEGA` in `src/parameters.hpp` (currently 33). Every prime
+with $\omega$ chosen at runtime (`--omega`, or a config file; default 33). Every prime
 $p$ with $p-1$ above the global Corollary 4 bound $B$ is covered by Corollary 4
 outright, so the run covers all such primes. $B$ is computed at runtime as the
 Corollary 4 bound for the first $\omega$ primes ($B \approx 1.786\times 10^{54}$
@@ -68,6 +68,19 @@ g++ -O3 -DNDEBUG -std=c++17 -Wall -Wextra -pthread src/main.cpp src/primality.cp
 ./lpr --dry-run                # support enumeration only: nothing is verified
 ./lpr --help
 ```
+
+Search parameters (no rebuild needed):
+- `--config PATH`: read `omega` and `s` from a file of `key = value` lines (`#`
+  comments), e.g. [`config/omega33.conf`](config/omega33.conf).
+- `--omega N`, `--s N`: set them on the command line (these override `--config`).
+  `s` defaults to `omega - 3` and must satisfy `1 <= s <= omega - 3`.
+
+The values used, and where each came from, are printed at the start of every run.
+`omega` is at most 34. The primes used are generated at runtime up to
+$\lfloor B / p_{\omega-1}\# \rfloor$, the largest prime that can occur in a support
+(3396 for `omega = 33`, `s = 30`), so no prime limit needs to be set; if that value
+exceeds `MAX_PRIME_LIMIT` in `src/parameters.hpp` the program stops with an error.
+`PRIMITIVE_ROOT_SEARCH_LIMIT` remains a compile-time setting.
 
 Options:
 - `--threads N`: total threads for `--parallel` (at least 2). Defaults to

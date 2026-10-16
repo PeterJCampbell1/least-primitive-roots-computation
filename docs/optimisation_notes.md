@@ -420,3 +420,24 @@ On SIGTERM/SIGINT the monitor prints the statistics so far and the DFS position,
 ## Cluster Readiness
 
 The `Makefile` is now tracked and portable (macOS/Homebrew or Linux with `-pthread`; `GMP_PREFIX` for non-standard GMP installs; unused OpenMP flags removed; git commit compiled in). `scripts/slurm/lpr.slurm` is a generic single-node Slurm template using `--signal=TERM@300`. `docs/current_method.md` is a full write-up of the current method.
+
+---
+
+Date: **16/10/26**   
+Author: **Mittun Sudhahar**  
+Commit: TODO
+OMEGA: 33  
+
+## Runtime OMEGA and S
+
+`OMEGA` and `S` are no longer `constexpr`. They are set at runtime (`src/config.hpp`) from `--config FILE` (`omega = N`, `s = N` lines, e.g. `config/omega33.conf`), overridden by `--omega N` / `--s N`; `omega` defaults to `DEFAULT_OMEGA` (33) and `s` to `omega - 3`, validated as $3 \le \omega \le$ `MAX_OMEGA` (64) and $1 \le s \le \omega - 3$. Per-depth arrays (`DfsStack` frames, product/power trees) keep fixed sizes from `MAX_OMEGA`/`MAX_TREE_SIZE`, so there are no extra allocations. `PRIME_LIMIT` and `PRIMITIVE_ROOT_SEARCH_LIMIT` stay compile-time. A `PRIME_LIMIT` that is too small for the chosen parameters is now a clean error (exit 2, giving the required value) instead of an uncaught exception.
+
+Correctness: the runtime build matches compile-time builds exactly (search and producer summaries) at $\omega = 33$ with $s = 30$ (default) and $s = 29$ (via a config file: 43,601,360 supports, 3,605,989 certified, largest least primitive root 502). $\omega = 34$ has no supports (Corollary 4 covers everything), and $s = 27$ needs primes up to $8{,}234{,}997{,}866$.
+
+Benchmark (alternating builds, load < 3 at start; medians): dry run 1.141s compile-time vs 1.139s runtime (5 runs each), single-threaded 15.78s vs 15.87s, 8 threads 2.95s vs 2.75s (3 runs each). All differences are within run-to-run noise: as expected, since ~95% of the runtime is in GMP, making these parameters runtime values costs nothing measurable.
+
+## Dynamic Prime Limit and MAX_OMEGA = 34
+
+`PRIME_LIMIT` is gone. `main` first sieves a small range to get the first $\omega$ primes, computes $B$, and then sieves every prime up to $\lfloor B / p_{\omega-1}\# \rfloor$, the largest prime that can occur in a support with $Q \le B$ (3396, i.e. 478 primes, at $\omega = 33$, $s = 30$; 5717 at $s = 29$), instead of a fixed $10^7$ (664,579 primes). The validation checks remain: the list must start with the first $\omega$ primes and cover the computed limit, which is capped by `MAX_PRIME_LIMIT` ($4 \times 10^9$; primes are stored as `unsigned`, and the sieve now uses 64-bit indices). The DFS treats running off the end of the list as exhausting the branch, which is safe because any support with a prime beyond the limit has $Q > B$; with the tight limit this boundary is now actually reached, and results match the $10^7$ limit exactly (search and producer summaries) for $s = 30$ (single and 8 threads) and $s = 29$ (43,601,360 supports). Runtime is unchanged (15.8s single, ~3.0s with 8 threads, ~94s for $s = 29$).
+
+`MAX_OMEGA` is now 34 (from the mathematics); $\omega = 34$ runs and emits no supports ($\lfloor B / p_{33}\# \rfloor = 87 < p_{34} = 139$).

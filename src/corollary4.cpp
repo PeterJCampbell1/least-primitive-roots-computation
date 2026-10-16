@@ -1,4 +1,5 @@
 #include "corollary4.hpp"
+#include "config.hpp"
 #include "parameters.hpp"
 
 #include <gmpxx.h>
@@ -16,11 +17,10 @@ void corollary4_qd_bound(
     Corollary4Threshold& threshold
 ) {
     // Set up constants
-    using parameters::OMEGA;
-    using parameters::S;
-    constexpr unsigned C1 = S + 1;
-    static_assert(OMEGA > S, "Check configuration of OMEGA/S");
-    constexpr std::size_t SHIFT = OMEGA - S;
+    const auto& config = lpr::config::search_config();
+    const unsigned C1 = config.s + 1;
+    assert(config.omega > config.s && "Check configuration of OMEGA/S");
+    const std::size_t SHIFT = config.omega - config.s;
 
     assert(Q > SOP); // Equivalent to delta > 0
 
@@ -71,8 +71,9 @@ void corollary4_global_bound(
     const std::vector<unsigned>& primes,
     mpz_class& global_bound
 ) {
-    using parameters::OMEGA;
-    using parameters::S;
+    const auto& config = lpr::config::search_config();
+    const std::size_t OMEGA = config.omega;
+    const std::size_t S = config.s;
     assert(primes.size() >= OMEGA);
 
     // Elementary symmetric polynomials of the last S of the first OMEGA primes,

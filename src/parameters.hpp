@@ -5,14 +5,19 @@
 
 namespace parameters {
     // See paper for details on how to use parameters:
-    inline constexpr std::size_t OMEGA = 33;
-    inline constexpr std::size_t TREE_SIZE = 2*(OMEGA - 1) - 1; // For finding least primitive roots
-    inline constexpr unsigned S = OMEGA - 3; // For corollary 4 - default for now to OMEGA-3
+    // OMEGA and S are chosen at runtime (see config.hpp: --config FILE, --omega, --s).
+    // DEFAULT_OMEGA is used when neither a config file nor --omega gives one, and S
+    // defaults to OMEGA - 3. MAX_OMEGA (34, from the mathematics) bounds OMEGA and
+    // sizes the fixed-size per-depth arrays.
+    inline constexpr std::size_t DEFAULT_OMEGA = 33;
+    inline constexpr std::size_t MAX_OMEGA = 34;
+    inline constexpr std::size_t MAX_TREE_SIZE = 2*(MAX_OMEGA - 1) - 1; // Product tree over the odd primes
 
-    // WARNING: PRIME_LIMIT is part of the exhaustive-search guarantee.
-    // It must be large enough to include every prime that can occur in a
-    // K-prime support with product <= the (computed) bound. This is checked at runtime in the main function.
-    inline constexpr unsigned PRIME_LIMIT = 10'000'000;
+    // The prime list is generated at runtime up to floor(B / p_(omega-1)#), the
+    // largest prime that can occur in a support with product <= B (see main).
+    // MAX_PRIME_LIMIT caps it: primes are stored as unsigned, and the sieve needs
+    // about limit/8 bytes (plus 4 bytes per prime), i.e. ~1.3 GB at the cap.
+    inline constexpr unsigned MAX_PRIME_LIMIT = 4'000'000'000u;
 
     // Upper bound for testing 2, 3, ..., PRIMITIVE_ROOT_SEARCH_LIMIT
     // as least primitive root g(p) candidates.

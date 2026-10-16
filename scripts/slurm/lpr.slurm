@@ -31,7 +31,8 @@ set -u
 
 echo "Job ${SLURM_JOB_ID} on $(hostname) with ${SLURM_CPUS_PER_TASK} CPUs"
 
-srun ./lpr --parallel --log-interval 120 --log-file "lpr_${SLURM_JOB_ID}.log"
+# Search parameters: edit the config file (or add --omega N / --s N, which override it)
+srun ./lpr --parallel --config config/omega33.conf --log-interval 120 --log-file "lpr_${SLURM_JOB_ID}.log"
 status=$?
 
 case ${status} in
