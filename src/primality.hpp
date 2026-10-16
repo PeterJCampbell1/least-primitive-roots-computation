@@ -11,7 +11,8 @@
 #include <cstddef>
 #include <cstdint>
 
-// Requires p >= 2. True proves compositeness; false does not prove primality.
+// Trial division by the primes in lpr::trial_division::table() (set in main).
+// Requires p >= 3. True proves compositeness; false does not prove primality.
 bool is_composite_small_prime(
     const mpz_class& p
 );

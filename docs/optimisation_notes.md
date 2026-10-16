@@ -441,3 +441,29 @@ Benchmark (alternating builds, load < 3 at start; medians): dry run 1.141s compi
 `PRIME_LIMIT` is gone. `main` first sieves a small range to get the first $\omega$ primes, computes $B$, and then sieves every prime up to $\lfloor B / p_{\omega-1}\# \rfloor$, the largest prime that can occur in a support with $Q \le B$ (3396, i.e. 478 primes, at $\omega = 33$, $s = 30$; 5717 at $s = 29$), instead of a fixed $10^7$ (664,579 primes). The validation checks remain: the list must start with the first $\omega$ primes and cover the computed limit, which is capped by `MAX_PRIME_LIMIT` ($4 \times 10^9$; primes are stored as `unsigned`, and the sieve now uses 64-bit indices). The DFS treats running off the end of the list as exhausting the branch, which is safe because any support with a prime beyond the limit has $Q > B$; with the tight limit this boundary is now actually reached, and results match the $10^7$ limit exactly (search and producer summaries) for $s = 30$ (single and 8 threads) and $s = 29$ (43,601,360 supports). Runtime is unchanged (15.8s single, ~3.0s with 8 threads, ~94s for $s = 29$).
 
 `MAX_OMEGA` is now 34 (from the mathematics); $\omega = 34$ runs and emits no supports ($\lfloor B / p_{33}\# \rfloor = 87 < p_{34} = 139$).
+
+## Granlund–Montgomery Trial Division
+
+Trial division used `rem = p mod m` for three 64-bit products $m$ of the primes 103–233, then `std::gcd(rem, m) > 1`. The gcd dominated: on 64-bit values Euclid's algorithm takes about 37 dependent hardware divisions (each step needs the previous remainder, so the CPU cannot overlap them), measured at ~140 ns per chunk, i.e. ~18.6 ns per prime. That made testing more primes not worth it: a prime $r$ removes about $1/r$ of the remaining composites, saving a ~4.8 µs Fermat test, so at 18.6 ns per prime the break-even is $r \approx 260$, which is where the chunks stopped.
+
+The gcd is replaced by the Granlund–Montgomery divisibility test per prime (`src/trial_division.hpp`; T. Granlund and P. L. Montgomery, *Division by Invariant Integers using Multiplication*, PLDI 1994, pp. 61–72). For odd $r$, precompute $r^{-1} \bmod 2^{64}$ (Newton's iteration $x \leftarrow x(2 - rx)$ from $x = r$, doubling the correct bits each step) and $L = \lfloor (2^{64}-1)/r \rfloor$. Then $r \mid \mathrm{rem} \iff \mathrm{rem} \cdot r^{-1} \bmod 2^{64} \le L$, since multiplication by $r^{-1}$ is a bijection modulo $2^{64}$ sending the multiples $kr$ ($0 \le k \le L$) onto $\{0, \ldots, L\}$. Each check is one multiply and one compare, and the checks for the primes of a chunk are independent, so they pipeline; the one `mpz_tdiv_ui` per chunk is now the main cost (~1.7–2.6 ns per prime overall in a microbenchmark). The table (primes, inverses, limits, greedy 64-bit chunks) is built at runtime in `main` from `TRIAL_DIVISION_MIN_PRIME`/`TRIAL_DIVISION_MAX_PRIME` and verified at startup (`r * inverse == 1`); debug builds `assert` every check against `rem % r == 0`. `composite_caught_at` is now 64-bit and printed per prime range.
+
+Correctness: with the original range 103–233 the greedy chunks reproduce the old constants exactly, and the search summary (including the per-chunk counts 51105 / 57562 / 50764) is identical in single, 8-thread and debug runs. For every range tested, Fermat survivors, certified counts and everything downstream are identical; only the split of composites between trial division and Fermat moves (the sum stays 1,479,049).
+
+Tuning ($\omega = 33$, single-threaded, 3 alternating runs each, load < 3; medians):
+
+| Range | Time | Trial division / Fermat composites |
+|---|---|---|
+| Old code (gcd, 103–233) | 15.83 s | 159,431 / 1,319,618 |
+| 103–233 | 15.25 s (−3.7%) | 159,431 / 1,319,618 |
+| 103–613 | 14.49 s | 364,405 / 1,114,644 |
+| 103–1151 | 14.15 s | 471,985 / 1,007,064 |
+| 103–2161 | 14.04 s | 563,246 / 915,803 |
+| 3–233 | 15.11 s | 170,261 / 1,308,788 |
+| 3–613 | 14.34 s | 373,724 / 1,105,325 |
+| **3–1151 (chosen)** | **14.04 s (−11.3%)** | 480,511 / 998,538 |
+| 3–2161 | 14.00 s | 571,119 / 907,930 |
+
+Gains flatten beyond ~1151, and including the primes below 103 (usually in the support, but not always) helps slightly at no real cost. 3–1151 was chosen over 2161 because the planned 3-limb Montgomery exponentiation makes each Fermat test cheaper, which moves the optimum lower (the prototype predicts ~613). $s = 29$ ($\omega = 33$, 8 threads) dropped from ~94 s to 84.2 s with identical results.
+
+Future: replacing `mpz_tdiv_ui` per chunk with a remainder using a precomputed reciprocal (or precomputed $2^{64}, 2^{128} \bmod m$) could save ~5 ns per chunk (~1% of runtime); worth revisiting after the Montgomery change, when $p$ is already held as three 64-bit words.

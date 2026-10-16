@@ -1,6 +1,7 @@
 #pragma once
 
 #include "parameters.hpp"
+#include "trial_division.hpp"
 #include <cstdint>
 #include <iostream>
 #include <gmpxx.h>
@@ -40,8 +41,8 @@ struct LPRStats {
     std::uint64_t certified_inequality_fail_count = 0;
     std::array<int, parameters::PRIMITIVE_ROOT_SEARCH_LIMIT+2> prim_roots_count = {};
     std::array<int, parameters::PRIMITIVE_ROOT_SEARCH_LIMIT+2> surviving_legendre_count = {};
-    std::array<int, parameters::NUM_CHUNKS> composite_caught_at = {};
-    std::uint64_t used_2_3 = 0;
+    // Trial division composites by chunk (index as in lpr::trial_division::table().chunks)
+    std::array<std::uint64_t, parameters::MAX_TRIAL_DIVISION_CHUNKS> composite_caught_at = {};
     mpz_class largest_least_primitive_root = 0;
 
     // Producer (support enumeration) statistics
@@ -95,7 +96,6 @@ struct LPRStats {
         unresolved_count += other.unresolved_count;
         certified_inequality_pass_count += other.certified_inequality_pass_count;
         certified_inequality_fail_count += other.certified_inequality_fail_count;
-        used_2_3 += other.used_2_3;
         dfs_nodes_visited += other.dfs_nodes_visited;
         cor4_evaluations += other.cor4_evaluations;
         cor4_reused += other.cor4_reused;
@@ -152,12 +152,14 @@ struct LPRStats {
                   << "Largest number of repeated calls to proves grosswald: "
                   << max_d << '\n'
                   << "Proved composite by small prime trial division test: "
-                  << small_prime_composite_count << '\n'
-                  << "Primes were each caught at: ";
-        for (int x : composite_caught_at) {
-            std::cout << x << " ";
+                  << small_prime_composite_count << '\n';
+        const auto& td = lpr::trial_division::table();
+        for (std::size_t k = 0; k < td.chunks.size() && k < composite_caught_at.size(); ++k) {
+            const auto& chunk = td.chunks[k];
+            std::cout << "  by primes " << td.tests[chunk.first].prime << ".."
+                      << td.tests[chunk.first + chunk.count - 1].prime << ": "
+                      << composite_caught_at[k] << '\n';
         }
-        std::cout << "\n";
         std::cout << "Proved composite by base-2 Fermat test: "
                   << fermat_composite_count << '\n'
                   << "Surviving base-2 Fermat test: "
@@ -171,9 +173,7 @@ struct LPRStats {
                   << "No least primitive root certified within search limit: "
                   << unresolved_count << '\n'
                   << "Largest least primitive root found: "
-                  << largest_least_primitive_root << '\n'
-                  << "Number of times 2 and 3 were available and 12 or 18 was computed: " 
-                  << used_2_3 << '\n';
+                  << largest_least_primitive_root << '\n';
 
         const double certified = certified_count ? static_cast<double>(certified_count) : 1.0;
         std::cout << "\nLeast primitive root search:\n"
@@ -258,7 +258,6 @@ private:
         prim_roots_count = other.prim_roots_count;
         surviving_legendre_count = other.surviving_legendre_count;
         composite_caught_at = other.composite_caught_at;
-        used_2_3 = other.used_2_3;
         largest_least_primitive_root = other.largest_least_primitive_root;
         dfs_nodes_visited = other.dfs_nodes_visited;
         cor4_evaluations = other.cor4_evaluations;

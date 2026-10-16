@@ -1,34 +1,53 @@
 #include "primality.hpp"
 #include "config.hpp"
 #include "parameters.hpp"
-#include "stats.hpp" 
+#include "stats.hpp"
+#include "trial_division.hpp"
 
-#include <numeric>
+#include <cstdint>
 #include <algorithm>
 #include <cassert>
 
 /* Primality Filters */
 // TODO - ADD A NAMESPACE FOR THIS TO INCLUDE IT UNDER lpr
 
+/**
+ * Trial division by the primes of the trial division table (trial_division.hpp).
+ *
+ * For each chunk (consecutive primes whose product fits in 64 bits) we compute
+ * rem = p mod product with one multi-limb by single-limb division. Each prime r of
+ * the chunk divides p iff it divides rem, which the Granlund-Montgomery test
+ * decides with one multiplication and one comparison (no division). Chunks are
+ * tested smallest primes first and we return at the first divisor found.
+ *
+ * True proves p composite (a prime r < p divides p); false proves nothing.
+ **/
 bool is_composite_small_prime(
     const mpz_class& p
 ) {
     assert(p >= 3);
-    
-    auto& stats = lpr::stats::get_thread_local_stats();
+    static_assert(sizeof(unsigned long) == sizeof(std::uint64_t),
+                  "mpz_tdiv_ui must take a 64-bit divisor");
 
-    // Alternative method that first does trial gcd
-    using parameters::PRIMORIAL_CHUNKS;
-    using parameters::NUM_CHUNKS;
-    for (size_t i = 0; i < NUM_CHUNKS; ++i) {
-        unsigned long rem = mpz_tdiv_ui(p.get_mpz_t(), PRIMORIAL_CHUNKS[i]);
-        if (std::gcd(rem, PRIMORIAL_CHUNKS[i]) > 1) {
-            stats.composite_caught_at[i]++;
-            return true;
+    auto& stats = lpr::stats::get_thread_local_stats();
+    const auto& table = lpr::trial_division::table();
+
+    for (std::size_t k = 0; k < table.chunks.size(); ++k) {
+        const auto& chunk = table.chunks[k];
+        // p mod (product of the chunk's primes)
+        const std::uint64_t rem = mpz_tdiv_ui(p.get_mpz_t(), chunk.product);
+        for (std::size_t j = chunk.first; j < chunk.first + chunk.count; ++j) {
+            const auto& t = table.tests[j];
+            // Granlund-Montgomery: r | rem  <=>  rem * r^{-1} (mod 2^64) <= floor((2^64 - 1) / r)
+            const bool divisible = rem * t.inverse <= t.limit;
+            assert(divisible == (rem % t.prime == 0)); // Debug builds: exact cross-check
+            if (divisible) {
+                ++stats.composite_caught_at[k];
+                return true; // t.prime divides p and p > t.prime, so p is composite
+            }
         }
     }
     return false;
-    // return mpz_probab_prime_p(p.get_mpz_t(), 1) == 0; // Alternative idea
 }
 
 /**
@@ -364,8 +383,6 @@ std::optional<mpz_class> find_least_primitive_root(
     static thread_local ReuseTracker reuse;
     reuse.reset();
 
-    bool u2 = false;
-    bool u3 = false;
     mpz_class exponent;
     for (unsigned g = 2;
  		 g <= parameters::PRIMITIVE_ROOT_SEARCH_LIMIT;
@@ -392,13 +409,6 @@ std::optional<mpz_class> find_least_primitive_root(
             ) != -1) {
             continue;
         }
-
-        if (g == 2) {u2 = true;}
-        if (g == 3) {u3 = true;}
-        if ((g == 12 || g == 18) && u2 && u3) {
-            ++stats.used_2_3;
-        }
-
 
         ++(stats.surviving_legendre_count[g]);
         ++stats.lpr_legendre_survivors;

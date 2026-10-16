@@ -120,7 +120,7 @@ For $d = 1, \ldots, d_{\max}$, the value $d$ is kept only if all of its prime fa
 
 **Implementation:** `src/primality.cpp`.
 
-1. **Trial division by GCD:** $p \bmod m$ is computed for a few 64-bit products of small primes ($m$ in `PRIMORIAL_CHUNKS`). If $\gcd(p \bmod m, m) > 1$, then $p$ has a small prime factor, and since $p$ is larger than these primes, $p$ is composite.
+1. **Trial division:** for every prime $r$ in a fixed range (`TRIAL_DIVISION_MIN_PRIME`..`TRIAL_DIVISION_MAX_PRIME`; primes below 103 are usually in the support, where $p \equiv 1 \pmod r$), test whether $r \mid p$. The primes are grouped into chunks of consecutive primes whose product $m$ fits in 64 bits, and $\mathrm{rem} = p \bmod m$ is computed once per chunk; since $r \mid m$, $r \mid p \iff r \mid \mathrm{rem}$. Each prime is then tested with the Granlund–Montgomery check: with $r^{-1} \bmod 2^{64}$ and $\lfloor (2^{64}-1)/r \rfloor$ precomputed at startup (`src/trial_division.hpp`), $r \mid \mathrm{rem} \iff \mathrm{rem} \cdot r^{-1} \bmod 2^{64} \le \lfloor (2^{64}-1)/r \rfloor$. This holds because multiplication by $r^{-1}$ is a bijection modulo $2^{64}$ that sends the multiples $kr$ ($0 \le k \le \lfloor (2^{64}-1)/r \rfloor$) onto $\{0, \ldots, \lfloor (2^{64}-1)/r \rfloor\}$. If $r \mid p$ then, since $p > r$, $p$ is composite.
 2. **Base-2 Fermat test:** if $2^{p-1} \not\equiv 1 \pmod p$, then $p$ is composite.
 
 Both filters only ever discard composites, so no prime is lost. A survivor of both is a *Fermat survivor*; it is not proven prime by these tests.
@@ -176,7 +176,7 @@ Otherwise the program exits with code 1, and prints each offending $p$ to stderr
 | Corollary 4 evaluations (first child reused / inherited-bound prunes) | 1,457,518 (136,631 / 22,978) |
 | Supports emitted | 1,343,862 |
 | Candidates $p = Qd + 1$ with $\mathrm{rad}(d) \mid Q$, $d \le d_{\max}$ | 1,593,113 |
-| Composite by trial division / by Fermat | 159,431 / 1,319,618 |
+| Composite by trial division (primes 3–1151) / by Fermat | 480,511 / 998,538 |
 | Fermat survivors, least primitive root found | 114,064 |
 | Grosswald failures / unresolved | 0 / 0 |
 | Largest least primitive root | 454 |
@@ -185,7 +185,7 @@ Otherwise the program exits with code 1, and prints each offending $p$ to stderr
 
 Winners by $p \bmod 8$ (all $d$ even / all $d$ odd): $p \equiv 1$: 1,280 / 0; $p \equiv 3$: 0 / 50,064; $p \equiv 5$: 12,432 / 0; $p \equiv 7$: 0 / 50,288. These match $p \equiv 1 \pmod 4 \iff d$ even, since $Q$ contains exactly one factor of 2.
 
-Profile of a single-threaded run (macOS `sample`): least-primitive-root power tree about 45%, base-2 Fermat about 43%, trial division about 5%, Corollary 4 about 5%, Jacobi about 0.1%. Runtime is about 16 s single-threaded and about 2.8 s with 8 threads on an 8-core Apple laptop. $\omega = 32$ takes about 6 h on 8 threads.
+Profile of a single-threaded run (macOS `sample`): least-primitive-root power tree about 45%, base-2 Fermat about 43%, trial division about 5%, Corollary 4 about 5%, Jacobi about 0.1%. (Profile taken before the trial division change of 16/10/26, which moved about 321,000 composites from Fermat to trial division.) Runtime is about 14 s single-threaded (16 s before that change) and about 2.8 s with 8 threads on an 8-core Apple laptop. $\omega = 32$ takes about 6 h on 8 threads.
 
 ## 11. Code layout
 

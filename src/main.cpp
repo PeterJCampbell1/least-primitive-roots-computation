@@ -6,6 +6,7 @@
 #include "process_support.hpp"
 #include "cli.hpp"
 #include "config.hpp"
+#include "trial_division.hpp"
 #include "logging.hpp"
 
 #include <algorithm>
@@ -252,6 +253,29 @@ int main(int argc, char* argv[])
         }
     }
     lpr::config::set_search_config(search); // Read-only from here on
+
+    // Trial division table (read-only from here on)
+    {
+        constexpr unsigned min_prime = parameters::TRIAL_DIVISION_MIN_PRIME;
+        constexpr unsigned max_prime = parameters::TRIAL_DIVISION_MAX_PRIME;
+        if (min_prime < 3 || min_prime > max_prime) {
+            std::cerr << "Error: trial division needs 3 <= TRIAL_DIVISION_MIN_PRIME <= "
+                      << "TRIAL_DIVISION_MAX_PRIME (got " << min_prime << ", " << max_prime << ")\n";
+            return 2;
+        }
+        lpr::trial_division::Table table = lpr::trial_division::build(min_prime, max_prime);
+        if (table.chunks.size() > parameters::MAX_TRIAL_DIVISION_CHUNKS) {
+            std::cerr << "Error: trial division up to " << max_prime << " needs " << table.chunks.size()
+                      << " chunks, more than MAX_TRIAL_DIVISION_CHUNKS ("
+                      << parameters::MAX_TRIAL_DIVISION_CHUNKS << ")\n";
+            return 2;
+        }
+        if (!lpr::trial_division::verify(table)) {
+            std::cerr << "Error: trial division table failed verification\n";
+            return 2;
+        }
+        lpr::trial_division::set_table(std::move(table));
+    }
     const std::size_t OMEGA = search.omega;
 
     const RunMode mode = options.mode;
@@ -347,6 +371,10 @@ int main(int argc, char* argv[])
               << "Prime generation limit: " << prime_limit
               << " (floor(B / p_(omega-1)#) = " << required_prime_limit << ", "
               << primes.size() << " primes)\n"
+              << "Trial division: primes " << lpr::trial_division::table().min_prime << ".."
+              << lpr::trial_division::table().max_prime << " ("
+              << lpr::trial_division::table().tests.size() << " primes, "
+              << lpr::trial_division::table().chunks.size() << " chunks)\n"
               << "Primitive root search limit: "
               << parameters::PRIMITIVE_ROOT_SEARCH_LIMIT
               << "\n\n";

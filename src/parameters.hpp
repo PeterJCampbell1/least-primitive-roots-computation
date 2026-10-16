@@ -27,21 +27,15 @@ namespace parameters {
     // The search bound is no longer a parameter: it is computed at runtime as
     // the Corollary 4 bound for the first OMEGA primes (corollary4_global_bound).
 
-    inline constexpr unsigned long long PRIMORIAL_CHUNKS[] = {
-        //16294579238595022365ULL,
-        //7145393598349078859ULL,
-        6408001374760705163ULL,
-        690862709424854779ULL,
-        4312024209383942993ULL,
-        //71235931512604841ULL,
-        //192878245514479103ULL,
-        //542676746453092519ULL,
-        //1230544604996048471ULL,
-        //2618501576975440661ULL,
-        //4771180125133726009ULL,
-        //9247077179230889629ULL
-    };
-    inline constexpr size_t NUM_CHUNKS = sizeof(PRIMORIAL_CHUNKS) / sizeof(PRIMORIAL_CHUNKS[0]);
+    // Trial division before the Fermat test: every prime in [MIN, MAX], tested with
+    // Granlund-Montgomery divisibility checks (tables built at runtime, see
+    // trial_division.hpp). Small primes are usually in the support (then p == 1
+    // mod them, so they never divide p), but supports can skip one and the checks
+    // are cheap, so they are included. MIN must be odd (>= 3). Tuned at omega = 33
+    // (see optimisation notes, 16/10/26): gains flatten beyond ~1151.
+    inline constexpr unsigned TRIAL_DIVISION_MIN_PRIME = 3;
+    inline constexpr unsigned TRIAL_DIVISION_MAX_PRIME = 1151;
+    inline constexpr std::size_t MAX_TRIAL_DIVISION_CHUNKS = 128; // Sizes the statistics array
 
     /* Job queue constants: jobs per batch, and maximum queued batches before
        the producer processes batches itself (producer co-processing) */
