@@ -25,6 +25,8 @@
 
 #pragma once
 
+#include "bit_tricks.hpp"
+
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -55,18 +57,6 @@ struct Table {
     unsigned max_prime = 0;
 };
 
-// r^{-1} mod 2^64 for odd r, by Newton's iteration x <- x * (2 - r * x).
-// x = r is correct to 3 bits (r * r == 1 mod 8 for odd r). If r * x == 1 + e * 2^k,
-// then r * x * (2 - r * x) == (1 + e * 2^k)(1 - e * 2^k) == 1 - e^2 * 2^(2k), so each
-// step doubles the number of correct low bits: 3 -> 6 -> 12 -> 24 -> 48 -> 96 >= 64.
-inline std::uint64_t inverse_mod_2_64(std::uint64_t r) {
-    std::uint64_t x = r;
-    for (int i = 0; i < 5; ++i) {
-        x *= 2 - r * x; // Unsigned arithmetic wraps mod 2^64
-    }
-    return x;
-}
-
 /*
  * Builds the table for every prime in [min_prime, max_prime] (requires
  * 3 <= min_prime <= max_prime). Uses its own small sieve, independent of the
@@ -94,12 +84,13 @@ inline Table build(unsigned min_prime, unsigned max_prime) {
 
         PrimeTest test;
         test.prime = r;
-        test.inverse = inverse_mod_2_64(r);
+        test.inverse = lpr::bits::inverse_mod_2_64(r);
         test.limit = MAX_U64 / r;
         assert(static_cast<std::uint64_t>(r) * test.inverse == 1 && "bad inverse mod 2^64");
 
         // Greedy packing: start a new chunk when the product would overflow 64 bits
-        if (static_cast<unsigned __int128>(current.product) * r > MAX_U64) {
+        // (product * r > MAX  <=>  product > floor(MAX / r), for integers)
+        if (current.product > MAX_U64 / r) {
             table.chunks.push_back(current);
             current = Chunk{1, table.tests.size(), 0};
         }

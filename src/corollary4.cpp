@@ -26,28 +26,28 @@ void corollary4_qd_bound(
 
     // numerator of delta
     mpz_sub(threshold.rhs.get_mpz_t(), Q.get_mpz_t(), SOP.get_mpz_t());
-                        
+
     // Compute lhs = 2^(w-s) * ((s+1)*Q - 2*SOP)
     mpz_mul_ui(threshold.lhs.get_mpz_t(), Q.get_mpz_t(), C1); // threshold.lhs = (s+1) * Q
     mpz_submul_ui(threshold.lhs.get_mpz_t(), SOP.get_mpz_t(), 2); // threshold.lhs -= 2*SOP
     mpz_mul_2exp(threshold.lhs.get_mpz_t(), threshold.lhs.get_mpz_t(), SHIFT); // threshold.lhs *= 2^(w-s)
-                                                               
+
     // Exponentiation
     mpz_pow_ui(
             threshold.lhs.get_mpz_t(),
             threshold.lhs.get_mpz_t(),
             16
     );
-    
-    /* 
+
+    /*
      * Sieve factor is (4/9)*pi^8 + epsilon ~= 4217.13
      * We use the upper bound of 4218 for simplicity.
      */
-    
+
     constexpr unsigned SIEVE_FACTOR_MULT = 4218;
     mpz_mul_ui(
-        threshold.lhs.get_mpz_t(), 
-        threshold.lhs.get_mpz_t(), 
+        threshold.lhs.get_mpz_t(),
+        threshold.lhs.get_mpz_t(),
         SIEVE_FACTOR_MULT
     );
 

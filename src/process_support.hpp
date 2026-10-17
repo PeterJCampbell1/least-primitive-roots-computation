@@ -1,142 +1,131 @@
+/**
+ * process_support.hpp: the consumer side. For one support (job), enumerates the
+ * candidates p = Q*d + 1 not covered by Corollary 4 and runs each through
+ * trial division, the base-2 Fermat test and the least primitive root search,
+ * then checks Grosswald's inequality (g(p) + 2)^2 < p.
+ **/
+
 #pragma once
 
-#include "corollary4.hpp"
-#include "hysteresis_queue.hpp"
+#include "job_queue.hpp"
 #include "logging.hpp"
+#include "mont3.hpp"
+#include "primality.hpp"
 #include "stats.hpp"
 
 #include <gmpxx.h>
-#include <vector>
-#include <sstream>
+
 #include <cassert>
+#include <optional>
+#include <sstream>
 
 namespace lpr::consumer {
 
 /**
- * For a given support, processes to determine if any primes may violate 
- * Grosswald's inequality.
+ * Checks every prime p = Q*d + 1 with 1 <= d <= d_max whose prime factors all
+ * lie in the support (otherwise omega(p - 1) > omega). Larger d are covered by
+ * Corollary 4 (d_max is computed by the producer).
  **/
-inline void process_support(
-    const lpr::parallel::LPRJob& job
-    /*
-    const std::vector<unsigned>& support,
-    const unsigned d_max, 
-    const mpz_class& Q
-    */
-) {
-    const std::vector<unsigned>& support = job.support;
-    const unsigned d_max = job.d_max;
-    const mpz_class& Q = job.Q;
-
+inline void process_support(const lpr::parallel::LPRJob& job) {
+    const unsigned* support = job.support.data();
+    const std::size_t omega = job.omega;
+    mpz_t q_storage;
+    const mpz_srcptr Q = job.Q(q_storage); // Read-only view of the job's Q
     assert(support[0] == 2);
+
     auto& stats = lpr::stats::get_thread_local_stats();
     ++stats.total_support_count;
-    ++stats.cor4_proves_grosswald_count;
 
-    
-    // Reusable memory for heap allocated objects only
-    // mpz_class calls the automatic constructor/destructor if defined locally
-    //static thread_local mpz_class m;
+    // Thread-local scratch values, reused to avoid GMP allocations
     static thread_local mpz_class p;
     static thread_local mpz_class n;
-    static thread_local mpz_class g_plus_two;
-    static thread_local mpz_class g_plus_two_sqr;
+    static thread_local mpz_class g_plus_two_squared;
+    // Montgomery context for p, shared by the Fermat test and the power tree
+    static thread_local lpr::mont3::Context mont_context;
 
-    for (unsigned d = 1; d <= d_max; ++d) { // Propagate d = 1 down to Fermat checks
+    for (unsigned d = 1; d <= job.d_max; ++d) {
+        // Strip from d all prime factors that belong to the support; anything
+        // left over is a new prime factor, so omega(Q*d) > omega
         unsigned remaining_factor = d;
-
-        // Strip from d all prime factors that belong to the support.
-        for (unsigned q : support) {
+        for (std::size_t i = 0; i < omega; ++i) {
+            const unsigned q = support[i];
             while (remaining_factor % q == 0) {
                 remaining_factor /= q;
             }
-
             if (remaining_factor == 1) {
                 break;
             }
         }
-        
-        // If remaining_factor != 1, then d contains a prime factor
-        // not already in the support, so d * Q has more than omega distinct prime factors.
-        if (remaining_factor == 1) {
-            n = Q * d;
-            p = n + 1;
-            ++stats.cor4_proves_grosswald_count;
-
-            ++stats.candidate_count;
-
-            if (is_composite_small_prime(p)) {
-                ++stats.small_prime_composite_count;
-                continue;
-            }
-
-            // Montgomery context for p, shared by the Fermat test and the power tree
-            // (set up only after trial division, which removes many candidates cheaply).
-            // If p is too large for 3-limb Montgomery arithmetic, both fall back to GMP.
-            static thread_local lpr::mont3::Context mont_context;
-            const lpr::mont3::Context* mont = nullptr;
-            if (lpr::mont3::setup(mont_context, p.get_mpz_t())) {
-                mont = &mont_context;
-            } else {
-                ++stats.mont3_fallback_count;
-            }
-
-            if (is_composite_base2_fermat(p, n, mont)) {
-            //if (is_composite_base2_miller_rabin(p, n)) {
-                ++stats.fermat_composite_count;
-                continue;
-            }
-            ++stats.fermat_survivor_count;
-
-            const auto g = find_least_primitive_root(
-                p, d, support, mont
-            );
-            if (g) {
-                ++stats.certified_count;
-
-                ++(stats.prim_roots_count[g->get_ui()]);
-                
-                if (*g > stats.largest_least_primitive_root) {
-                    stats.largest_least_primitive_root = *g;
-                }
-
-                g_plus_two = *g + 2;
-                mpz_mul(g_plus_two_sqr.get_mpz_t(), g_plus_two.get_mpz_t(), g_plus_two.get_mpz_t());
-                if (g_plus_two_sqr < p) {
-                    ++stats.certified_inequality_pass_count;
-                } else {
-                    ++stats.certified_inequality_fail_count;
-                    std::ostringstream msg;
-                    msg << "Grosswald inequality failure: p = " << p << ", g(p) = " << *g;
-                    lpr::log::warn(msg.str());
-                }
-            } else {
-                ++stats.unresolved_count;
-                std::ostringstream msg;
-                msg << "Unresolved candidate p = " << p;
-                lpr::log::warn(msg.str());
-            }
+        if (remaining_factor != 1) {
+            continue;
         }
-    }
 
-    return;
-} // process_support
+        mpz_mul_ui(n.get_mpz_t(), Q, d); // n = p - 1 = Q*d
+        mpz_add_ui(p.get_mpz_t(), n.get_mpz_t(), 1);
+        ++stats.candidate_count;
 
-/*
- * Wrapper around process_support that automatically handles interacting
- * with the concurrent queue.
- */
-template <typename QueueType>
-void start_consumer(QueueType& queue) {
-    using parallel::LPRBatch;
-    LPRBatch batch;
-    while (queue.pop(batch)) {
-        for (auto& job : batch) {
-            process_support(job);
+        if (lpr::primality::is_composite_small_prime(p)) {
+            ++stats.small_prime_composite_count;
+            continue;
         }
-        lpr::stats::publish_thread_local_stats();
+
+        // Set up only after trial division, which removes many candidates cheaply.
+        // If p is too large for 3-limb Montgomery arithmetic, both tests use GMP.
+        const lpr::mont3::Context* mont = nullptr;
+        if (lpr::mont3::setup(mont_context, p.get_mpz_t())) {
+            mont = &mont_context;
+        } else {
+            ++stats.mont3_fallback_count;
+        }
+
+        if (lpr::primality::is_composite_base2_fermat(p, n, mont)) {
+            ++stats.fermat_composite_count;
+            continue;
+        }
+        ++stats.fermat_survivor_count;
+
+        const std::optional<unsigned> g = lpr::primality::find_least_primitive_root(p, d, support, omega, mont);
+        if (!g) {
+            ++stats.unresolved_count;
+            std::ostringstream msg;
+            msg << "Unresolved candidate p = " << p;
+            lpr::log::warn(msg.str());
+            continue;
+        }
+
+        ++stats.certified_count;
+        ++stats.winners_by_g[*g];
+        if (*g > stats.largest_least_primitive_root) {
+            stats.largest_least_primitive_root = *g;
+        }
+
+        // Grosswald's inequality: (g + 2)^2 < p
+        mpz_set_ui(g_plus_two_squared.get_mpz_t(), *g + 2);
+        mpz_mul(g_plus_two_squared.get_mpz_t(), g_plus_two_squared.get_mpz_t(), g_plus_two_squared.get_mpz_t());
+        if (g_plus_two_squared < p) {
+            ++stats.certified_inequality_pass_count;
+        } else {
+            ++stats.certified_inequality_fail_count;
+            std::ostringstream msg;
+            msg << "Grosswald inequality failure: p = " << p << ", g(p) = " << *g;
+            lpr::log::warn(msg.str());
+        }
     }
 }
 
-} // lpr::consumer
+/*
+ * Consumer loop: processes batches from the queue until it is finished and
+ * empty. Statistics are published at most once per STATS_PUBLISH_INTERVAL_MS.
+ */
+template <typename QueueType>
+void start_consumer(QueueType& queue) {
+    lpr::parallel::LPRBatch batch;
+    while (queue.pop(batch)) {
+        for (const auto& job : batch) {
+            process_support(job);
+        }
+        lpr::stats::maybe_publish_thread_local_stats();
+    }
+}
 
+} // namespace lpr::consumer

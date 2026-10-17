@@ -135,7 +135,7 @@ For each Fermat survivor, $g = 2, 3, \ldots$ up to `PRIMITIVE_ROOT_SEARCH_LIMIT`
 
 **$\ell = 2$ via the Jacobi symbol.** A primitive root is a quadratic non-residue. If $\left(\tfrac{g}{p}\right) = -1$ and $p$ is prime, Euler's criterion gives $g^{n/2} \equiv -1 \not\equiv 1$. So the program skips $g$ unless `mpz_jacobi(g, p) == -1`, which needs no exponentiation. This also correctly rejects every quadratic residue $g$, which cannot be a primitive root.
 
-**Odd $\ell$ via a product tree.** The odd primes of the support are arranged as the leaves of a balanced binary *product tree*, in which each node stores the product of the primes below it. The *power tree* starts from the root value $g^{2d} \bmod p$. A node's child takes the node's value to the power of the product held by its sibling. So leaf $\ell$ receives
+**Odd $\ell$ via a product tree.** The odd primes of the support are arranged, in increasing order, as the leaves of a *product tree*, in which each node stores the product of the primes below it. The tree is stored heap-style (the children of node $i$ at $2i+1$ and $2i+2$), so it must be a *complete* binary tree: every level full except the last, which is filled from the left. With $n$ leaves and $h = \lceil \log_2 n \rceil$, each node's left subtree therefore gets $\min(n - 2^{h-2}, 2^{h-1})$ of its leaves (`complete_tree_left_size`). Halving each range is not enough (for $n = 6$ it splits 3/3 instead of 4/2): that layout was wrong for most $\omega$ other than 32–34, and `main` now checks the layout at startup. The *power tree* starts from the root value $g^{2d} \bmod p$. A node's child takes the node's value to the power of the product held by its sibling. So leaf $\ell$ receives
 ```math
 \bigl(g^{2d}\bigr)^{Q_{\text{odd}}/\ell} = g^{dQ/\ell} = g^{n/\ell},
 ```
@@ -155,7 +155,7 @@ Otherwise the program exits with code 1, and prints each offending $p$ to stderr
 
 ## 9. Parallel architecture
 
-**Implementation:** `src/main.cpp`, `src/hysteresis_queue.hpp`, `src/generate_supports.hpp`, `src/process_support.hpp`.
+**Implementation:** `src/main.cpp`, `src/job_queue.hpp`, `src/generate_supports.hpp`, `src/process_support.hpp`.
 
 - **Single mode** (`--single`, the default): the DFS calls `process_support` on each emitted support directly.
 - **Parallel mode** (`--parallel --threads N`): one producer thread runs the DFS and groups jobs into batches of `BATCH_SIZE` (256). $N - 1$ consumer threads take batches from a bounded queue (at most `HWM` = 512 batches).
@@ -163,7 +163,8 @@ Otherwise the program exits with code 1, and prints each offending $p$ to stderr
   - After the DFS, the producer marks the queue finished and helps drain it.
   - Every emitted batch is processed exactly once, by a consumer or by the producer, so the results are identical to single mode.
   - The thread count defaults to `SLURM_CPUS_PER_TASK`, then the hardware thread count.
-- **Statistics:** each thread accumulates thread-local statistics. These are published into a mutex-guarded master copy after every batch, and merged again when the thread exits.
+- **Jobs:** each job (`LPRJob`) is fixed size, with the support and $Q$ stored inline, so producing and consuming jobs needs no heap allocation.
+- **Statistics:** each thread counts into thread-local `Counters` and merges them into a mutex-guarded master copy at most once per second (staggered across threads), and finally when the thread exits. Consumers also record how long they wait on an empty queue (`consumer_wait_ns`), which measures how far the single producer limits the run.
 - **Monitoring:** a monitor thread logs a progress line every `--log-interval` seconds (default 120) to `--log-file`, or to stderr. Each line gives the supports emitted and processed, the rate, candidates, Fermat survivors, certified, failed, unresolved, the largest $g(p)$, the queue length, co-processed batches, consumer waits, and the current DFS position.
 - **Signals:** on SIGTERM or SIGINT the monitor prints the statistics so far and exits with code 3. Runs cannot yet be resumed; the planned design is in [`parallelise_producer.md`](parallelise_producer.md).
 - **Dry run** (`--dry-run`): runs the DFS only and discards the supports. It measures the producer and checks the number of supports emitted, which must equal "K-prime supports examined" in a full run.
@@ -185,7 +186,7 @@ Otherwise the program exits with code 1, and prints each offending $p$ to stderr
 
 Winners by $p \bmod 8$ (all $d$ even / all $d$ odd): $p \equiv 1$: 1,280 / 0; $p \equiv 3$: 0 / 50,064; $p \equiv 5$: 12,432 / 0; $p \equiv 7$: 0 / 50,288. These match $p \equiv 1 \pmod 4 \iff d$ even, since $Q$ contains exactly one factor of 2.
 
-Profile of a single-threaded run (macOS `sample`): least-primitive-root power tree about 45%, base-2 Fermat about 43%, trial division about 5%, Corollary 4 about 5%, Jacobi about 0.1%. (Profile taken before the trial division change of 16/10/26, which moved about 321,000 composites from Fermat to trial division.) Runtime is about 14 s single-threaded (16 s before that change) and about 2.8 s with 8 threads on an 8-core Apple laptop. $\omega = 32$ takes about 6 h on 8 threads.
+Profile of a single-threaded run (macOS `sample`): least-primitive-root power tree about 45%, base-2 Fermat about 43%, trial division about 5%, Corollary 4 about 5%, Jacobi about 0.1%. (Profile taken before the trial division change of 16/10/26, which moved about 321,000 composites from Fermat to trial division.) Runtime on an Apple M2 laptop (4 performance + 4 efficiency cores) is about 7.6 s single-threaded and about 1.4 s with 8 threads, after the trial division (16/10/26), 3-limb Montgomery (17/10/26) and clean-up changes; with 8 threads the single producer is the bottleneck (consumers wait about 10% of the time). $\omega = 32$, $s = 29$ took 2 h 15 min on 8 threads (`k32_s29_run.txt`).
 
 ## 11. Code layout
 
@@ -193,11 +194,14 @@ Profile of a single-threaded run (macOS `sample`): least-primitive-root power tr
 - `src/cli.hpp`: command-line parsing.
 - `src/logging.hpp`: timestamped progress log and warnings.
 - `src/config.hpp`: runtime $\omega$ and $s$ (`--config`, `--omega`, `--s`; $s$ defaults to $\omega - 3$).
-- `src/parameters.hpp`: compile-time settings: `DEFAULT_OMEGA`, `MAX_OMEGA` (34), `MAX_PRIME_LIMIT`, `PRIMITIVE_ROOT_SEARCH_LIMIT`, trial-division chunks, batch and queue sizes.
+- `src/parameters.hpp`: compile-time settings: `DEFAULT_OMEGA`, `MAX_OMEGA` (34), `MAX_PRIME_LIMIT`, `PRIMITIVE_ROOT_SEARCH_LIMIT`, the trial-division range, batch and queue sizes, `MAX_Q_LIMBS`, `STATS_PUBLISH_INTERVAL_MS`.
 - `src/corollary4.{hpp,cpp}`: $\beta$ (`corollary4_qd_bound`) and $B$ (`corollary4_global_bound`).
 - `src/generate_supports.hpp`: the DFS (`DfsStack`, `dfs_iter_`) and the single, dry-run and parallel producers.
 - `src/process_support.hpp`: enumerating $d$ per support and the filter pipeline; consumer loop.
-- `src/primality.{hpp,cpp}`: trial division, Fermat, least-primitive-root search.
-- `src/hysteresis_queue.hpp`: the bounded batch queue (`try_push`/`pop`).
-- `src/stats.hpp`: thread-local and master statistics.
+- `src/primality.{hpp,cpp}` (`lpr::primality`): trial division, Fermat, least-primitive-root search (templated on a GMP or Montgomery backend), product tree layout.
+- `src/mont3.hpp`: 3-limb Montgomery arithmetic.
+- `src/trial_division.hpp`: trial division tables (Granlund–Montgomery divisibility test).
+- `src/bit_tricks.hpp`: the shared Newton inverse modulo $2^{64}$.
+- `src/job_queue.hpp`: fixed-size jobs and the bounded batch queue (`try_push`/`pop`).
+- `src/stats.hpp`: thread-local `Counters` and the shared `MasterStats`.
 

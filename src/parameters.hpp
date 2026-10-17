@@ -40,6 +40,10 @@ namespace parameters {
     /* Job queue constants: jobs per batch, and maximum queued batches before
        the producer processes batches itself (producer co-processing) */
     inline constexpr size_t BATCH_SIZE = 256;
+    // Limbs stored inline for a support's product Q in each job (Q <= B; checked in main)
+    inline constexpr size_t MAX_Q_LIMBS = 4;
+    // Each thread merges its statistics into the shared totals at most this often
+    inline constexpr unsigned STATS_PUBLISH_INTERVAL_MS = 1000;
     inline constexpr size_t HWM = 512;
 }
 

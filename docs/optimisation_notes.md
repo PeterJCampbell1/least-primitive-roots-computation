@@ -492,3 +492,82 @@ Results (alternating builds, 3 runs each, medians; load < 3 at start):
 | $\omega = 33$, $s = 29$, 8 threads | 84.9 s | 48.1–49.6 s | ~1.73x |
 
 With 8 threads the single producer is now the bottleneck: the DFS alone takes 1.18 s of the 1.49 s run, consumer waits rose from 7 to 1,508 and no batches are co-processed. One producer can now keep only about 7 threads busy (previously ~14), which makes the parallel producer (`docs/parallelise_producer.md`) more important. The trial division cut-off (3..1151) was tuned for the slower GMP Fermat test and should be re-tuned (the prototype predicts ~613).
+
+---
+
+Date: **17/10/26** (clean-up)   
+Author: **Mittun Sudhahar**  
+Commit: TODO (uncommitted, on top of `c5bdad5`)
+OMEGA: 33 (and 29–32 for checks)  
+
+A full clean-up of the codebase, done in stages, with each stage verified for correctness and speed against the previous one. The work list was `docs/code_review_fixups.md`; every item there is now marked resolved or deliberately deferred.
+
+## Verification protocol
+At every stage:
+- **Runs:** OMEGA=33, S=30 with `--single`, `--parallel --threads 2`, `--parallel --threads 8` and the debug build with 8 threads (asserts on: every Fermat result and power-tree leaf checked against GMP); OMEGA=33, S=29 with 8 threads; and the dry run.
+- **Must be identical:** supports, candidates, Fermat survivors, certified, Grosswald failed/unresolved, largest g(p), winners by p mod 8, power-tree and Jacobi counts, and the producer's DFS, Cor 4 and supports-emitted counts.
+- **Speed:** single-threaded and 8-thread runs, alternating with the previous stage's binary, 3 runs each, medians.
+
+All stages matched exactly. The final build also matches `c5bdad5` exactly.
+
+## Stages
+1. **Power tree layout (correctness).** The product tree was split in half but stored and traversed heap-style, which is only valid for a complete binary tree. It was wrong for OMEGA = 7, 11–15 and 19–31 (OMEGA = 32–34 were fine, so earlier results stand).
+   - The split is now `complete_tree_left_size(n) = min(n − 2^(h−2), 2^(h−1))`, and `main` checks the layout at startup (`power_tree_layout_is_valid`).
+   - OMEGA=33 is identical, including the exponentiation counts.
+   - The check passes for OMEGA 3–34 and rejects the old split.
+   - Debug runs at OMEGA = 29 (primes up to 3,904,921,367), 30 and 31 have no assertion failures (1.44M, 0.55M and 0.75M primes certified in 6, 1 and 1 min). OMEGA = 31 previously aborted.
+2. **`mont3.hpp` tidy (still hand-unrolled).**
+   - Correct header comment, `static_assert(N == 3)`, `static_cast`, `lo`/`hi` and `shl1` helpers.
+   - Debug asserts for the product bounds and the preconditions.
+   - The shared Newton inverse is now in `bit_tricks.hpp`.
+   - `pow2` saves a squaring, and `bits_at` reads the window value directly.
+   - `experimental/montgomery3` now tests `src/mont3.hpp` itself (0 mismatches, and the planted bug is still caught).
+   - The window thresholds were benchmarked on the real search: no set was reliably faster than 8/24/80, so they were kept.
+   - Single-threaded 8.03 → 7.92 s, 8 threads 1.63 → 1.58 s (alternating, under some load).
+3. **`primality.cpp`.**
+   - `namespace lpr::primality`, with no reserved `_names`.
+   - The search is a template over a GMP or Montgomery backend (no per-leaf branch; no slower: 7.56 → 7.55 s single-threaded, 1.475 → 1.473 s with 8 threads).
+   - The debug leaf cross-check and a leaf-order assert apply to both backends; a forced-GMP-fallback debug build gives identical results.
+   - Removed `ReuseTracker`, Miller–Rabin and dead code. The search returns `std::optional<unsigned>`.
+4. **Stats, `process_support`, queue.**
+   - `stats.hpp` is redesigned as a plain `Counters` aggregate plus a `MasterStats` (mutex + `merge`/`snapshot`). That removes the custom copies, `copy_fields_from` and the `NullMutex` template.
+   - Removed the legacy summary lines. Added a "Winners by g" histogram (it sums to the certified count).
+   - `HysteresisQueue` → `JobQueue` (`job_queue.hpp`). `process_support` is flattened.
+   - Single-threaded 7.64 → 7.59 s, 8 threads 1.51 → 1.48 s.
+5. **Producer speed-ups.**
+   - Statistics are published at most once per second per thread, staggered (previously after every batch).
+   - Jobs are fixed size with no heap allocation: an inline support array, and Q as inline limbs read through `mpz_roinit_n`.
+   - New stat `consumer_wait_ns`: at OMEGA=33 with 8 threads, consumers wait ~1.1 s in total in a ~1.4 s run (~10% of their time, matching `samply`).
+   - Dry run 1.127 → 1.086 s (−3.6%), 8 threads 1.478 → 1.412 s (−4.5%).
+6. **Trial division range re-tuned with the Montgomery Fermat test.**
+
+   | Max prime | Single-threaded | 8 threads |
+   |---|---|---|
+   | 233 | 7.93 s | 1.476 s |
+   | 401 | 7.70 s | 1.452 s |
+   | 613 | 7.69 s | 1.414 s |
+   | 811 | 7.60 s | 1.414 s |
+   | 1151 | 7.58 s | 1.452 s |
+
+   1151 and 811 are tied single-threaded (the measure of total CPU work), so the range is **kept at 3..1151**. The prototype's prediction of ~613 did not hold, because trial division also became cheaper. Survivors were identical for every range.
+7. **Remaining tidy-ups.**
+   - A portable overflow check in `trial_division.hpp` (no `__int128`); the chunks are unchanged.
+   - Cited Bagger's Corollary 4 in `generate_supports.hpp`. Removed trailing whitespace.
+   - Deleted `src/analysis.hpp`, `.fermat_lab/`, `utils/__pycache__/` and `CONVERSATION_SUMMARY.md`.
+   - Updated `CLAUDE.md`, `docs/current_method.md`, `docs/code_review_fixups.md` and `experimental/montgomery3/README.md`.
+8. **Final checks.**
+   - The last three compiler warnings are fixed: `always_inline` without `inline` on `dfs_iter_`; `-Wpedantic` on `unsigned __int128` (now declared with `__extension__`); and a false-positive `-Warray-bounds` in `bits_at` (the bounds condition is now explicit).
+   - Clang and GCC 15 both build with **no warnings** under `-Wall -Wextra -Wpedantic`, and GCC's release and debug builds give identical results.
+
+## Final benchmark (alternating, 3 runs each for single and 8 threads, 2 each for the rest; load rising during the last two)
+
+| Run | `c5bdad5` | Final | Change |
+|---|---|---|---|
+| OMEGA=33 single-threaded | 7.69 s | 7.64 s | −0.7% |
+| OMEGA=33, 8 threads | 1.504 s | 1.431 s | −4.9% |
+| OMEGA=33, S=29, 8 threads | 49.1 s | 46.2 s | −5.9% |
+| Dry run | 1.195 s | 1.140 s | −4.6% |
+
+The gains are in the multi-threaded runs, where the single producer is the bottleneck; single-threaded work is dominated by the (unchanged) arithmetic.
+
+**OMEGA=32, S=29, 8 threads (full run, final build):** every key line, and the trial-division/Fermat composite counts, are identical to `k32_s29_run.txt` (6,057,734,933 supports; 639,796,795 certified; largest g(p) 678; 0 failed; 0 unresolved). Elapsed 7,902 s against 8,094 s (−2.4%). With the faster producer, consumer waits halved (1,903,644 against 3,676,158) and co-processed batches doubled (197,281 against 89,788). The new `consumer_wait_ns` shows the consumers waited 1,017 s in total, i.e. **~1.8% of consumer time**, so on this 8-thread machine the single producer limits OMEGA=32 only slightly. The ~10% at OMEGA=33 is mostly the short run's start-up and tail.

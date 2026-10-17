@@ -98,7 +98,7 @@ std::string hostname() {
 
 // One line of key=value progress fields from a statistics snapshot
 std::string progress_line(
-    const lpr::stats::MasterStats& s,
+    const lpr::stats::Counters& s,
     double supports_per_second,
     const std::optional<std::size_t>& queue_size
 ) {
@@ -116,6 +116,7 @@ std::string progress_line(
         << " queue=" << (queue_size ? std::to_string(*queue_size) : std::string("-"))
         << " coprocessed=" << s.batches_coprocessed
         << " consumer_waits=" << s.consumer_waits
+        << " consumer_wait_s=" << std::setprecision(1) << s.consumer_wait_ns / 1e9
         << " position=" << lpr::producer::dfs_position_string();
     return out.str();
 }
@@ -179,7 +180,7 @@ private:
 
             const auto now = clock::now();
             if (log_interval_ > 0 && now - last_log >= std::chrono::seconds(log_interval_)) {
-                const lpr::stats::MasterStats snapshot(lpr::stats::get_master_stats());
+                const lpr::stats::Counters snapshot = lpr::stats::get_master_stats().snapshot();
                 const double seconds = std::chrono::duration<double>(now - last_log).count();
                 const double rate = (snapshot.total_support_count - last_processed) / seconds;
                 lpr::log::info(progress_line(snapshot, rate, queue_size_()));
@@ -191,7 +192,7 @@ private:
 
     [[noreturn]] void handle_interrupt() {
         const int sig = g_signal;
-        const lpr::stats::MasterStats snapshot(lpr::stats::get_master_stats());
+        const lpr::stats::Counters snapshot = lpr::stats::get_master_stats().snapshot();
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
 
         const std::string notice = "INTERRUPTED by signal " + std::to_string(sig)
@@ -254,6 +255,14 @@ int main(int argc, char* argv[])
     }
     lpr::config::set_search_config(search); // Read-only from here on
 
+    // The power tree used by the least primitive root search must have a valid
+    // heap layout for omega - 1 leaves (it does for every omega with the
+    // complete-tree split; this guards against regressions)
+    if (!lpr::primality::power_tree_layout_is_valid(search.omega - 1)) {
+        std::cerr << "Error: invalid power tree layout for omega = " << search.omega << '\n';
+        return 2;
+    }
+
     // Trial division table (read-only from here on)
     {
         constexpr unsigned min_prime = parameters::TRIAL_DIVISION_MIN_PRIME;
@@ -312,6 +321,12 @@ int main(int argc, char* argv[])
     }
     const mpz_class required_prime_limit = bound / smallest_product;
 
+    // Every emitted support has Q <= B, and jobs store Q in MAX_Q_LIMBS limbs
+    if (mpz_size(bound.get_mpz_t()) > parameters::MAX_Q_LIMBS) {
+        std::cerr << "Error: the search bound B needs " << mpz_size(bound.get_mpz_t())
+                  << " limbs, more than MAX_Q_LIMBS (" << parameters::MAX_Q_LIMBS << ")\n";
+        return 2;
+    }
     if (required_prime_limit > parameters::MAX_PRIME_LIMIT) {
         std::cerr << "Error: the prime limit floor(B / p_(omega-1)#) = " << required_prime_limit
                   << " for omega = " << OMEGA << ", s = " << search.s
@@ -391,7 +406,7 @@ int main(int argc, char* argv[])
     std::signal(SIGTERM, on_signal);
     std::signal(SIGINT, on_signal);
 
-    lpr::parallel::HysteresisQueue<> queue; // Only used in parallel mode
+    lpr::parallel::JobQueue<> queue; // Only used in parallel mode
     {
         Monitor monitor(options.log_interval, start_time, [&]() -> std::optional<std::size_t> {
             if (mode != RunMode::Parallel) return std::nullopt;
@@ -425,14 +440,15 @@ int main(int argc, char* argv[])
         monitor.stop();
     }
 
-    // Stats for other threads automatically merged (see stats.hpp)
     const std::chrono::duration<double> elapsed =
         std::chrono::steady_clock::now() - start_time;
 
-    lpr::stats::flush_thread_local_stats();
-    auto& master_stats = lpr::stats::get_master_stats();
+    // Worker threads publish their counters when they exit (see stats.hpp);
+    // this thread's own counters (single and dry-run modes) are published here
+    lpr::stats::publish_thread_local_stats();
+    const lpr::stats::Counters master_stats = lpr::stats::get_master_stats().snapshot();
     lpr::log::info("finished after " + std::to_string(elapsed.count()) + " s");
-    lpr::log::info(progress_line(lpr::stats::MasterStats(master_stats), 0.0, std::nullopt));
+    lpr::log::info(progress_line(master_stats, 0.0, std::nullopt));
 
     if (mode == RunMode::DryRun) {
         master_stats.print_producer();

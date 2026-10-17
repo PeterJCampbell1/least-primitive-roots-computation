@@ -19,7 +19,12 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cassert>
+#include <chrono>
+#include <cstdint>
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
@@ -33,17 +38,40 @@
 
 namespace lpr::parallel {
 
-/* A single support to be processed with associated data. */
+/*
+ * A support to be processed: its primes, its product Q and d_max. Fixed size,
+ * with no heap allocation, so emitting, queueing and freeing jobs costs no
+ * malloc/free (a std::vector support and an mpz_class Q each allocated before).
+ */
 struct LPRJob {
-    std::vector<unsigned> support;
-    mpz_class Q;
-    unsigned d_max; // Maximum value of d allowed by corollary 4 in p = Q*d + 1
+    std::array<unsigned, parameters::MAX_OMEGA> support; // support[0..omega), increasing, support[0] == 2
+    std::uint32_t omega;
+    std::uint32_t d_max; // Maximum value of d allowed by corollary 4 in p = Q*d + 1
+    std::array<mp_limb_t, parameters::MAX_Q_LIMBS> q_limbs; // Q, little-endian limbs
+    std::uint32_t q_size; // Limbs of Q in use (normalised: the top one is non-zero)
+
+    // Read-only GMP view of Q (no allocation; `storage` must outlive the result)
+    mpz_srcptr Q(mpz_t storage) const {
+        return mpz_roinit_n(storage, q_limbs.data(), static_cast<mp_size_t>(q_size));
+    }
 };
+
+inline LPRJob make_job(const std::vector<unsigned>& support, const mpz_class& Q, unsigned d_max) {
+    LPRJob job;
+    assert(support.size() <= job.support.size());
+    assert(mpz_sgn(Q.get_mpz_t()) > 0 && mpz_size(Q.get_mpz_t()) <= job.q_limbs.size());
+    job.omega = static_cast<std::uint32_t>(support.size());
+    std::copy(support.begin(), support.end(), job.support.begin());
+    job.d_max = d_max;
+    job.q_size = static_cast<std::uint32_t>(mpz_size(Q.get_mpz_t()));
+    std::copy_n(mpz_limbs_read(Q.get_mpz_t()), job.q_size, job.q_limbs.begin());
+    return job;
+}
 using LPRBatch = std::vector<LPRJob>;
 
-/* The concurrent queue structure (name kept from its earlier hysteresis design) */
+/* The concurrent queue of support batches */
 template <std::size_t HWM = parameters::HWM>
-class HysteresisQueue {
+class JobQueue {
 private:
     std::queue<LPRBatch> queue_;
     std::mutex mutex_;
@@ -52,11 +80,11 @@ private:
     std::atomic<std::size_t> size_{0}; // Approximate size, for progress logging
 
 public:
-    HysteresisQueue() = default;
+    JobQueue() = default;
 
     /* No Copying Queue's */
-    HysteresisQueue(const HysteresisQueue&) = delete;
-    HysteresisQueue& operator=(const HysteresisQueue&) = delete;
+    JobQueue(const JobQueue&) = delete;
+    JobQueue& operator=(const JobQueue&) = delete;
 
     /*
      * Producer offers a batch without blocking.
@@ -86,10 +114,16 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
 
         if (queue_.empty() && !finished_) {
-            ++lpr::stats::get_thread_local_stats().consumer_waits;
+            // The producer is behind: count the wait and how long it takes
+            auto& stats = lpr::stats::get_thread_local_stats();
+            ++stats.consumer_waits;
+            const auto wait_start = std::chrono::steady_clock::now();
             while (queue_.empty() && !finished_) {
                 cv_consumer_.wait(lock);
             }
+            stats.consumer_wait_ns += static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start).count());
         }
 
         if (queue_.empty()) {

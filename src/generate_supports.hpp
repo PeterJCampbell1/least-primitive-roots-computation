@@ -13,14 +13,14 @@
  *
  * Entry points (lpr::producer): generate_supports (single-threaded, processes
  * jobs inline), generate_supports_parallel (batches jobs into a
- * HysteresisQueue) and generate_supports_dry_run (only counts jobs).
+ * JobQueue) and generate_supports_dry_run (only counts jobs).
  **/
 
 #pragma once
 
 #include "config.hpp"
 #include "corollary4.hpp"
-#include "hysteresis_queue.hpp"
+#include "job_queue.hpp"
 #include "parameters.hpp"
 #include "process_support.hpp"
 #include "stats.hpp"
@@ -94,13 +94,14 @@ private:
     std::size_t depth_ = 1; // Depth 0 (the prime 2) is fixed
 };
 
-/** 
- * Iterative implementation of DFS 
+/**
+ * Iterative implementation of DFS
  *
  * Maintains that support contains an increasing list of primes.
  * Supports are iterated through in lexicographic order.
  *
- * Prunes branches based on Corollary 4 (TODO - CITE PAPER)
+ * Prunes branches based on Corollary 4 of G. K. Bagger, "A Note on Least
+ * Primitive Roots" (see docs/current_method.md, sections 2 and 4).
  * In particular, prunes via the minimum suffix extensions of each prefix
  * alongside the fact that if one support dominates another, and
  * satisfies corollary 4, then so does the other.
@@ -120,7 +121,7 @@ private:
  * Note: We know that support must always contain 2 (as Q*d + 1 must be odd).
  **/
 template <typename Callable>
-__attribute__((always_inline)) void dfs_iter_(
+__attribute__((always_inline)) inline void dfs_iter_(
     const std::vector<unsigned>& primes,
     const mpz_class& global_bound,
     Callable process_job
@@ -136,9 +137,9 @@ __attribute__((always_inline)) void dfs_iter_(
     DfsStack stack(global_bound);
     std::vector<unsigned> support(OMEGA);
     support[0] = primes[0]; // primes[0] == 2
-    
+
     // Number of primes to ignore
-    const std::size_t DELTA_START_DEPTH = config.delta_start_depth(); 
+    const std::size_t DELTA_START_DEPTH = config.delta_start_depth();
     assert(DELTA_START_DEPTH > 0 && "We cannot have OMEGA == S as 2 must be excluded");
     assert(DELTA_START_DEPTH < OMEGA && "Need S >= 1 so leaves always have a Cor 4 bound");
 
@@ -148,7 +149,7 @@ __attribute__((always_inline)) void dfs_iter_(
 
     // Reserve space to avoid reallocations later
     mpz_realloc2(min_complete_product.get_mpz_t(), 1024);
-    
+
     mpz_class d_max_mpz;
     while (true) {
         const std::size_t depth = stack.depth();
@@ -179,7 +180,7 @@ __attribute__((always_inline)) void dfs_iter_(
                 next.delta_sop.get_mpz_t(),
                 cur.delta_sop.get_mpz_t(),
                 primes[i]
-            ); // delta_SOP_j = delta_Q_{j-1} + p_j * delta_SOP_{j-1} 
+            ); // delta_SOP_j = delta_Q_{j-1} + p_j * delta_SOP_{j-1}
         } else { // Ignore first few primes.
             next.delta_Q = 1;
             next.delta_sop = 0;
@@ -202,11 +203,11 @@ __attribute__((always_inline)) void dfs_iter_(
             }
             for (std::size_t j = 1; j <= remaining_after_choice; ++j) {
                 mpz_mul_ui(
-                    min_complete_product.get_mpz_t(), 
+                    min_complete_product.get_mpz_t(),
                     min_complete_product.get_mpz_t(),
                     primes[i+j]
                 ); // min_prod *= primes[i+j];
-                   
+
                 if (depth >= DELTA_START_DEPTH) {
                     // Calculate delta_sop first, as this uses the previous delta_Q
                     // Then after update delta_Q
@@ -223,7 +224,7 @@ __attribute__((always_inline)) void dfs_iter_(
             if (depth >= DELTA_START_DEPTH) {
                 ++stats.cor4_evaluations;
                 corollary4_qd_bound(
-                    min_complete_delta_Q, 
+                    min_complete_delta_Q,
                     min_complete_delta_sop,
                     next.cor4_bound
                 );
@@ -253,10 +254,10 @@ __attribute__((always_inline)) void dfs_iter_(
             if (d_max > stats.d_max_max) {
                 stats.d_max_max = d_max;
             }
-            process_job({support, next.product, d_max}); // Works for both single/multi-threaded calls
+            process_job(parallel::make_job(support, next.product, d_max)); // Works for both single/multi-threaded calls
             stack.advance(); // Move to sibling leaf node at same depth
         } else {
-            stack.push(i + 1); // Move to next depth and use later primes 
+            stack.push(i + 1); // Move to next depth and use later primes
         }
     } // while (true)
 }
@@ -276,9 +277,9 @@ inline void set_dfs_first_primes(const std::vector<unsigned>& primes) {
     }
 }
 
-inline void update_dfs_position(const std::vector<unsigned>& support) {
-    for (std::size_t i = 0; i < dfs_position.size() && i < support.size(); ++i) {
-        dfs_position[i].store(support[i], std::memory_order_relaxed);
+inline void update_dfs_position(const parallel::LPRJob& job) {
+    for (std::size_t i = 0; i < dfs_position.size() && i < job.omega; ++i) {
+        dfs_position[i].store(job.support[i], std::memory_order_relaxed);
     }
 }
 
@@ -311,7 +312,8 @@ inline std::string dfs_position_string() {
 
 /*
  * Single-threaded: processes each support as soon as it is emitted.
- * Statistics are published every BATCH_SIZE supports for progress logging.
+ * Every BATCH_SIZE supports the progress position is updated and statistics
+ * are published (at most once per STATS_PUBLISH_INTERVAL_MS).
  */
 inline void generate_supports(
     const std::vector<unsigned>& primes,
@@ -323,8 +325,8 @@ inline void generate_supports(
         consumer::process_support(job);
         if (++since_publish == parameters::BATCH_SIZE) {
             since_publish = 0;
-            update_dfs_position(job.support);
-            stats::publish_thread_local_stats();
+            update_dfs_position(job);
+            stats::maybe_publish_thread_local_stats();
         }
     });
     stats::publish_thread_local_stats();
@@ -343,8 +345,8 @@ inline void generate_supports_dry_run(
     detail::dfs_iter_(primes, global_bound, [&](const parallel::LPRJob& job) {
         if (++since_publish == parameters::BATCH_SIZE) {
             since_publish = 0;
-            update_dfs_position(job.support);
-            stats::publish_thread_local_stats();
+            update_dfs_position(job);
+            stats::maybe_publish_thread_local_stats();
         }
     });
     stats::publish_thread_local_stats();
@@ -372,7 +374,7 @@ void generate_supports_parallel(
     current_batch.reserve(BATCH_SIZE);
 
     auto submit_batch = [&]() {
-        update_dfs_position(current_batch.back().support);
+        update_dfs_position(current_batch.back());
         if (queue.try_push(current_batch)) {
             ++stats.batches_pushed;
         } else { // Consumers are behind: process this batch here
@@ -383,12 +385,12 @@ void generate_supports_parallel(
         }
         current_batch = LPRBatch(); // Reset batch buffer
         current_batch.reserve(BATCH_SIZE);
-        stats::publish_thread_local_stats();
+        stats::maybe_publish_thread_local_stats();
     };
 
     // Lambda passed into dfs_iter_ to emit candidate supports
-    auto emit_job = [&](LPRJob job) {
-        current_batch.push_back(std::move(job));
+    auto emit_job = [&](const LPRJob& job) {
+        current_batch.push_back(job);
         if (current_batch.size() == BATCH_SIZE) {
             submit_batch();
         }

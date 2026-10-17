@@ -1,60 +1,61 @@
-#ifndef LPR_PRIMALITY_HPP
-#define LPR_PRIMALITY_HPP
+/**
+ * primality.hpp: the per-candidate tests applied to p = Q*d + 1.
+ *
+ *   is_composite_small_prime   trial division (trial_division.hpp tables)
+ *   is_composite_base2_fermat  base-2 Fermat test
+ *   find_least_primitive_root  least primitive root search (power tree)
+ *
+ * The two power-based tests take an optional Montgomery context for p
+ * (lpr::mont3::setup succeeded): with it they use 3-limb Montgomery
+ * arithmetic, without it (nullptr) GMP.
+ **/
 
-#include "stats.hpp"
-#include "parameters.hpp"
-#include "mont3.hpp"
+#pragma once
 
 #include <gmpxx.h>
-#include <optional>
-#include <vector>
-#include <array>
+
 #include <cstddef>
-#include <cstdint>
+#include <optional>
+
+namespace lpr::mont3 {
+struct Context;
+}
+
+namespace lpr::primality {
 
 // Trial division by the primes in lpr::trial_division::table() (set in main).
-// Requires p >= 3. True proves compositeness; false does not prove primality.
-bool is_composite_small_prime(
-    const mpz_class& p
-);
+// Requires p >= 3. True proves p composite; false proves nothing.
+bool is_composite_small_prime(const mpz_class& p);
 
-// Requires p >= 3 and n = p - 1. True proves compositeness; false does not prove
-// primality. With a Montgomery context for p (lpr::mont3::setup succeeded) the
-// power is computed with 3-limb Montgomery arithmetic, otherwise with GMP.
+// Base-2 Fermat test. Requires p >= 3 and n = p - 1, and `mont` (if given) must
+// be the Montgomery context of this p. True proves p composite; false does not
+// prove p prime.
 bool is_composite_base2_fermat(
     const mpz_class& p,
     const mpz_class& n,
     const lpr::mont3::Context* mont = nullptr
 );
 
-// Requires p >= 2. True proves compositeness; false does not prove primality.
-bool is_composite_base2_miller_rabin(
+// Least primitive root of p = Q*d + 1, assuming p is prime. Requires p odd,
+// p > 2, and prime_divisors[0..omega) = the support of p - 1 (all omega distinct
+// primes, increasing, starting with 2). `mont` (if given) must be the Montgomery context
+// of this p. Searches 2 <= g <= PRIMITIVE_ROOT_SEARCH_LIMIT; no result means
+// unresolved within the limit (to be checked by hand), not a counterexample.
+std::optional<unsigned> find_least_primitive_root(
     const mpz_class& p,
-    const mpz_class& n
-);
-
-// Requires p >= 2, n = p - 1, and all distinct prime divisors of n.
-// Searches 2 <= g <= search_limit and returns the least primitive root if found.
-// No result means unresolved within the limit, not composite or a counterexample.
-// With a Montgomery context for p the power tree uses 3-limb Montgomery
-// arithmetic, otherwise GMP.
-std::optional<mpz_class> find_least_primitive_root(
-    const mpz_class& p,
-    const unsigned& d,
-    const std::vector<unsigned>& prime_divisors,
+    unsigned d,
+    const unsigned* prime_divisors,
+    std::size_t omega,
     const lpr::mont3::Context* mont = nullptr
 );
 
-template <unsigned N> 
-constexpr std::array<bool, N + 1> make_table() {
-    std::array<bool, N + 1> t{};
-    for (std::uint64_t a = 2; a * a <= N; ++a)
-        for (std::uint64_t v = a * a; v <= N; v *= a)
-            t[static_cast<std::size_t>(v)] = true;
-    return t;
-}
+// Number of leaves in the left subtree of a complete binary tree with n >= 2
+// leaves: the split used by the product tree (see primality.cpp).
+std::size_t complete_tree_left_size(std::size_t n);
 
-inline constexpr auto IS_PERFECT_POWER_TABLE = make_table<parameters::PRIMITIVE_ROOT_SEARCH_LIMIT>();
+// True if the power tree over `leaves` odd primes has a valid heap layout: every
+// node index is inside the tree, the traversal's leaf test matches the real
+// leaves, and the leaves are visited in increasing order. Checked once in main.
+bool power_tree_layout_is_valid(std::size_t leaves);
 
-
-#endif
+} // namespace lpr::primality
