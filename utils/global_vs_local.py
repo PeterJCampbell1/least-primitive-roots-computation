@@ -1,12 +1,13 @@
-TARGET_DEPTH = 24
+TARGET_DEPTH = 10
 import sympy
 import time
 
-OMEGA = 31
-S = 28
+OMEGA = 14
+S = OMEGA - 2
+print(f"OMEGA is {OMEGA}, S is {S}")
 VERBOSE_LOCAL = False
 VERBOSE_GLOBAL = False
-RUN_GLOBAL = False
+RUN_GLOBAL = True
 STORE_PREFIXES = False
 
 w = lambda x: (2**(OMEGA-S)) * (2 + (S-1)/(1-x))

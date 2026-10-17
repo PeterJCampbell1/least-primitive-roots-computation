@@ -1,0 +1,89 @@
+Running multi-threaded computation
+Using: 8 threads
+
+Run:
+mode: parallel
+threads: 8 (from --threads)
+progress log: every 120 s to log.log
+host: MacBook-Air-7.local
+started: 2026-10-16 22:04:30 AEST
+build: commit ceb3d08-dirty, compiler Apple LLVM 16.0.0 (clang-1600.0.26.4), GMP 6.3.0
+
+Configuration:
+omega: 32 (--omega)
+s: 29 (--s)
+Search bound B (Cor 4 global bound on p - 1): 5.079533e+53
+B (exact): 507953329854860736134704416822537377343275472007754781
+Prime generation limit: 126530 (floor(B / p_(omega-1)#) = 126530, 11866 primes)
+Trial division: primes 3..1151 (189 primes, 27 chunks)
+Primitive root search limit: 1000
+
+Search summary:
+---------------
+K-prime supports examined: 6057734933
+Candidates not covered by Corollary 4: 8986188918
+Number of times proves grosswald was called: 15043923851
+Largest number of repeated calls to proves grosswald: 0
+Proved composite by small prime trial division test: 2843824608
+  by primes 3..53: 8622250
+  by primes 59..101: 194657139
+  by primes 103..149: 360414479
+  by primes 151..191: 316616779
+  by primes 193..233: 269710547
+  by primes 239..271: 199932065
+  by primes 277..313: 172838915
+  by primes 317..359: 147966956
+  by primes 367..401: 130104336
+  by primes 409..443: 115361880
+  by primes 449..487: 104553027
+  by primes 491..541: 94014414
+  by primes 547..577: 72424674
+  by primes 587..613: 67433685
+  by primes 617..647: 63355914
+  by primes 653..683: 59542475
+  by primes 691..733: 55290309
+  by primes 739..769: 51940706
+  by primes 773..821: 48577572
+  by primes 823..857: 46025696
+  by primes 859..887: 43773220
+  by primes 907..941: 41185375
+  by primes 947..983: 39137196
+  by primes 991..1021: 37280018
+  by primes 1031..1061: 35805406
+  by primes 1063..1097: 34309968
+  by primes 1103..1151: 32949607
+Proved composite by base-2 Fermat test: 5502567515
+Surviving base-2 Fermat test: 639796795
+Least primitive root certified: 639796795
+Grosswald inequality verified: 639796795
+Grosswald inequality failed: 0
+No least primitive root certified within search limit: 0
+Largest least primitive root found: 678
+
+Least primitive root search:
+Jacobi filter calls: 8596886480 (13.4369 per prime)
+Legendre survivors tested: 2801004348 (4.37796 per prime, the last being g(p))
+Root powm (g^(2d)) calls: 2801004348
+Power tree powm calls: 59872933560 (93.5812 per prime)
+Tested g with nodes derivable from earlier g: 168042274
+Upper bound on power tree powm calls avoidable by reuse: 908024187
+Candidates using GMP instead of Montgomery arithmetic (p >= 2^190): 0
+Winners by p mod 8 (d even / d odd):
+  p = 1 mod 8: 28686398 / 0
+  p = 3 mod 8: 0 / 249952305
+  p = 5 mod 8: 111222840 / 0
+  p = 7 mod 8: 0 / 249935252
+
+Producer summary:
+-----------------
+DFS nodes visited: 6494306726
+Corollary 4 evaluations: 6250479930
+Corollary 4 results reused by first child: 218285889
+Pruned by inherited Corollary 4 bound: 25540900
+Supports emitted: 6057734933
+Sum of d_max over emitted supports: 8986503973
+Largest d_max: 965
+Batches pushed to queue: 23573240
+Batches co-processed by producer: 89788
+Consumer waits on empty queue: 3676158
+Elapsed time: 8094.01 s

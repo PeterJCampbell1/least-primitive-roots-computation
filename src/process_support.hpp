@@ -67,40 +67,54 @@ inline void process_support(
 
             if (is_composite_small_prime(p)) {
                 ++stats.small_prime_composite_count;
-            } else if (is_composite_base2_fermat(p, n)) {
-            //} else if (is_composite_base2_miller_rabin(p, n)) {
-                ++stats.fermat_composite_count;
+                continue;
+            }
+
+            // Montgomery context for p, shared by the Fermat test and the power tree
+            // (set up only after trial division, which removes many candidates cheaply).
+            // If p is too large for 3-limb Montgomery arithmetic, both fall back to GMP.
+            static thread_local lpr::mont3::Context mont_context;
+            const lpr::mont3::Context* mont = nullptr;
+            if (lpr::mont3::setup(mont_context, p.get_mpz_t())) {
+                mont = &mont_context;
             } else {
-                ++stats.fermat_survivor_count;
+                ++stats.mont3_fallback_count;
+            }
 
-                const auto g = find_least_primitive_root(
-                    p, d, support
-                );
-                if (g) {
-                    ++stats.certified_count;
+            if (is_composite_base2_fermat(p, n, mont)) {
+            //if (is_composite_base2_miller_rabin(p, n)) {
+                ++stats.fermat_composite_count;
+                continue;
+            }
+            ++stats.fermat_survivor_count;
 
-                    ++(stats.prim_roots_count[g->get_ui()]);
-                    
-                    if (*g > stats.largest_least_primitive_root) {
-                        stats.largest_least_primitive_root = *g;
-                    }
+            const auto g = find_least_primitive_root(
+                p, d, support, mont
+            );
+            if (g) {
+                ++stats.certified_count;
 
-                    g_plus_two = *g + 2;
-                    mpz_mul(g_plus_two_sqr.get_mpz_t(), g_plus_two.get_mpz_t(), g_plus_two.get_mpz_t());
-                    if (g_plus_two_sqr < p) {
-                        ++stats.certified_inequality_pass_count;
-                    } else {
-                        ++stats.certified_inequality_fail_count;
-                        std::ostringstream msg;
-                        msg << "Grosswald inequality failure: p = " << p << ", g(p) = " << *g;
-                        lpr::log::warn(msg.str());
-                    }
+                ++(stats.prim_roots_count[g->get_ui()]);
+                
+                if (*g > stats.largest_least_primitive_root) {
+                    stats.largest_least_primitive_root = *g;
+                }
+
+                g_plus_two = *g + 2;
+                mpz_mul(g_plus_two_sqr.get_mpz_t(), g_plus_two.get_mpz_t(), g_plus_two.get_mpz_t());
+                if (g_plus_two_sqr < p) {
+                    ++stats.certified_inequality_pass_count;
                 } else {
-                    ++stats.unresolved_count;
+                    ++stats.certified_inequality_fail_count;
                     std::ostringstream msg;
-                    msg << "Unresolved candidate p = " << p;
+                    msg << "Grosswald inequality failure: p = " << p << ", g(p) = " << *g;
                     lpr::log::warn(msg.str());
                 }
+            } else {
+                ++stats.unresolved_count;
+                std::ostringstream msg;
+                msg << "Unresolved candidate p = " << p;
+                lpr::log::warn(msg.str());
             }
         }
     }

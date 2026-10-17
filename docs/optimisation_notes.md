@@ -467,3 +467,28 @@ Tuning ($\omega = 33$, single-threaded, 3 alternating runs each, load < 3; media
 Gains flatten beyond ~1151, and including the primes below 103 (usually in the support, but not always) helps slightly at no real cost. 3–1151 was chosen over 2161 because the planned 3-limb Montgomery exponentiation makes each Fermat test cheaper, which moves the optimum lower (the prototype predicts ~613). $s = 29$ ($\omega = 33$, 8 threads) dropped from ~94 s to 84.2 s with identical results.
 
 Future: replacing `mpz_tdiv_ui` per chunk with a remainder using a precomputed reciprocal (or precomputed $2^{64}, 2^{128} \bmod m$) could save ~5 ns per chunk (~1% of runtime); worth revisiting after the Montgomery change, when $p$ is already held as three 64-bit words.
+
+---
+
+Date: **17/10/26**   
+Author: **Mittun Sudhahar**  
+Commit: TODO
+OMEGA: 33  
+
+## 3-limb Montgomery Arithmetic for the Fermat Test and Power Tree
+
+About 88% of runtime was `mpz_powm` (base-2 Fermat test ~43%, least primitive root power tree ~45%). Every $p$ here is below $2^{181}$, i.e. three 64-bit limbs, where GMP's general-size overhead dominates. `src/mont3.hpp` implements fixed-size Montgomery arithmetic ($R = 2^{192}$): an inlined CIOS Montgomery product, lazy reduction (values in $[0, 2p)$, valid because $4p < R$, i.e. $p < 2^{190}$), division-free setup ($R \bmod p$ by doubling, $R^2 \bmod p$ by five Montgomery squarings; ~130 ns), doubling for the base-2 Fermat test, and sliding-window exponentiation for the tree. A dedicated squaring was not faster than `mul(x, x)` on Apple M-series (the carry chains, not the multiplications, are the bottleneck), so `sqr` is `mul(a, a)`.
+
+`process_support` sets up one Montgomery context per candidate after trial division and passes it to `is_composite_base2_fermat` and `find_least_primitive_root`; the tree traversal is now a template over the value type (`mpz_class` or `mont3::Num`). If `setup` refuses a modulus ($p \ge 2^{190}$) both fall back to GMP (counted as `mont3_fallback_count`; 0 at $\omega = 33$ and $\omega = 32$, where $B \approx 2^{178}$–$2^{181}$).
+
+Correctness: standalone tests in `experimental/montgomery3` (`make test`) compare every operation with GMP on random moduli of 2–190 bits, edge moduli, 200,000 realistic Fermat tests and 20,007 complete power trees (0 mismatches; a planted bug was caught). In `lpr`, the search and producer summaries are identical to the GMP build in single, 2- and 8-thread runs and at $s = 29$; the debug build cross-checks every Fermat result and every power tree leaf against GMP (no assertion failures); and a test build with the fallback forced for every candidate also gives identical results (1,112,602 fallbacks, as expected).
+
+Results (alternating builds, 3 runs each, medians; load < 3 at start):
+
+| Run | GMP | Montgomery | Speedup |
+|---|---|---|---|
+| $\omega = 33$, single-threaded | 14.00 s | 7.67 s | 1.83x |
+| $\omega = 33$, 8 threads | 2.52 s | 1.51 s | 1.67x |
+| $\omega = 33$, $s = 29$, 8 threads | 84.9 s | 48.1–49.6 s | ~1.73x |
+
+With 8 threads the single producer is now the bottleneck: the DFS alone takes 1.18 s of the 1.49 s run, consumer waits rose from 7 to 1,508 and no batches are co-processed. One producer can now keep only about 7 threads busy (previously ~14), which makes the parallel producer (`docs/parallelise_producer.md`) more important. The trial division cut-off (3..1151) was tuned for the slower GMP Fermat test and should be re-tuned (the prototype predicts ~613).

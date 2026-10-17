@@ -63,11 +63,23 @@ bool is_composite_small_prime(
  */
 bool is_composite_base2_fermat(
     const mpz_class& p,
-    const mpz_class& n
+    const mpz_class& n,
+    const lpr::mont3::Context* mont
 ) {
     assert(p >= 3 && n == p - 1);
     static const mpz_class base = 2;
     static thread_local mpz_class residue;
+
+    if (mont) {
+        // 2^n in Montgomery form, compared with the Montgomery form of 1
+        const bool composite = lpr::mont3::fermat_composite(n.get_mpz_t(), *mont);
+#ifndef NDEBUG
+        // Debug builds: exact cross-check against GMP
+        mpz_powm(residue.get_mpz_t(), base.get_mpz_t(), n.get_mpz_t(), p.get_mpz_t());
+        assert(composite == (residue != 1) && "mont3 Fermat test disagrees with GMP");
+#endif
+        return composite;
+    }
 
     mpz_powm(
         residue.get_mpz_t(), 
@@ -198,12 +210,18 @@ void _build_product_tree(
     }
 }
 
+/*
+ * Advances the lazy power tree to the next leaf, computing nodes on the way down.
+ * Works for both GMP (Value = mpz_class) and Montgomery (Value = lpr::mont3::Num)
+ * node values: pow(dst, base, exponent) sets dst = base^exponent mod p.
+ */
+template <typename Value, typename Pow>
 void _generate_next_residue(
-    std::array<mpz_class, parameters::MAX_TREE_SIZE>& power_tree,
+    std::array<Value, parameters::MAX_TREE_SIZE>& power_tree,
     const std::array<mpz_class, parameters::MAX_TREE_SIZE>& product_tree,
-    const mpz_class& p,
     size_t& leaf_idx,
-    std::uint64_t& powm_count
+    std::uint64_t& powm_count,
+    Pow pow
 ) {
     const std::size_t TREE_SIZE = lpr::config::search_config().tree_size(); 
 
@@ -212,12 +230,7 @@ void _generate_next_residue(
         while (2*leaf_idx + 1 < TREE_SIZE) {
             // Take to the power of right child
             ++powm_count;
-            mpz_powm(
-                power_tree[2*leaf_idx+1].get_mpz_t(),
-                power_tree[leaf_idx].get_mpz_t(),
-                product_tree[2*leaf_idx+2].get_mpz_t(), 
-                p.get_mpz_t()
-            );
+            pow(power_tree[2*leaf_idx+1], power_tree[leaf_idx], product_tree[2*leaf_idx+2]);
             leaf_idx = 2*leaf_idx + 1;
         }
         return;
@@ -240,23 +253,13 @@ void _generate_next_residue(
     // Go to the right child
     leaf_idx++; 
     ++powm_count;
-    mpz_powm(
-        power_tree[leaf_idx].get_mpz_t(),
-        power_tree[parent].get_mpz_t(),
-        product_tree[leaf_idx-1].get_mpz_t(), 
-        p.get_mpz_t()
-    );
+    pow(power_tree[leaf_idx], power_tree[parent], product_tree[leaf_idx-1]);
 
     // Go left until reaching a leaf
     while (2*leaf_idx + 1 < TREE_SIZE) {
         // Take to the power of right child
         ++powm_count;
-        mpz_powm(
-            power_tree[2*leaf_idx+1].get_mpz_t(),
-            power_tree[leaf_idx].get_mpz_t(),
-            product_tree[2*leaf_idx+2].get_mpz_t(), 
-            p.get_mpz_t()
-        );
+        pow(power_tree[2*leaf_idx+1], power_tree[leaf_idx], product_tree[2*leaf_idx+2]);
         leaf_idx = 2*leaf_idx + 1;
     }
 }
@@ -314,7 +317,8 @@ struct ReuseTracker {
 std::optional<mpz_class> find_least_primitive_root(
     const mpz_class& p,
     const unsigned& d,
-    const std::vector<unsigned>& prime_divisors
+    const std::vector<unsigned>& prime_divisors,
+    const lpr::mont3::Context* mont
 ) {
     assert(p > 2);
     assert(mpz_odd_p(p.get_mpz_t()));
@@ -375,6 +379,20 @@ std::optional<mpz_class> find_least_primitive_root(
     // Fixed maximum size; only the first search_config().tree_size() nodes are used
     static thread_local std::array<mpz_class, parameters::MAX_TREE_SIZE> product_tree = {};
     static thread_local std::array<mpz_class, parameters::MAX_TREE_SIZE> power_tree = {};
+    // Montgomery-form node values (used when mont != nullptr)
+    static thread_local std::array<lpr::mont3::Num, parameters::MAX_TREE_SIZE> power_tree_mont = {};
+
+    // dst = base^exponent mod p, for each representation
+    const auto pow_gmp = [&p](mpz_class& dst, const mpz_class& base, const mpz_class& exponent) {
+        mpz_powm(dst.get_mpz_t(), base.get_mpz_t(), exponent.get_mpz_t(), p.get_mpz_t());
+    };
+    const auto pow_mont = [mont](lpr::mont3::Num& dst, const lpr::mont3::Num& base, const mpz_class& exponent) {
+        dst = lpr::mont3::powm(base, mpz_limbs_read(exponent.get_mpz_t()),
+                               mpz_size(exponent.get_mpz_t()), *mont);
+    };
+#ifndef NDEBUG
+    const mpz_class n_debug = p - 1; // For the debug cross-check of each leaf
+#endif
 
     // Done recursively for simplicity, can be made iterative (full complete binary tree)
     _build_product_tree(product_tree, prime_divisors, 0, 1, OMEGA);
@@ -419,12 +437,17 @@ std::optional<mpz_class> find_least_primitive_root(
         // 3. Compute A = g^{2d} (mod p)
         //exponent = 2 * d; // TODO - This can be mpz_powm_ui
         ++stats.lpr_root_powm_count;
-        mpz_powm_ui(
-            power_tree[0].get_mpz_t(),
-            base.get_mpz_t(),
-            2*d,
-            p.get_mpz_t()
-        );
+        if (mont) {
+            const mp_limb_t two_d = 2 * static_cast<mp_limb_t>(d);
+            power_tree_mont[0] = lpr::mont3::powm(lpr::mont3::to_mont(g, *mont), &two_d, 1, *mont);
+        } else {
+            mpz_powm_ui(
+                power_tree[0].get_mpz_t(),
+                base.get_mpz_t(),
+                2*d,
+                p.get_mpz_t()
+            );
+        }
 
         size_t leaf_idx = 0; // Leaf in the power tree
         std::uint64_t tree_powm = 0;
@@ -438,10 +461,27 @@ std::optional<mpz_class> find_least_primitive_root(
             }
 
             // 4. Lazily compute power tree with early exit
-            _generate_next_residue(power_tree, product_tree, p, leaf_idx, tree_powm); 
+            bool leaf_is_one;
+            if (mont) {
+                _generate_next_residue(power_tree_mont, product_tree, leaf_idx, tree_powm, pow_mont);
+                // The leaf is 1 iff its canonical Montgomery form equals that of 1
+                leaf_is_one = lpr::mont3::equal(
+                    lpr::mont3::canonical(power_tree_mont[leaf_idx], *mont), mont->one);
+#ifndef NDEBUG
+                // Debug builds: the leaf for prime q must equal g^(n/q) mod p, computed
+                // directly with GMP (independent of the tree)
+                mpz_class expect, leaf;
+                mpz_powm(expect.get_mpz_t(), base.get_mpz_t(), mpz_class(n_debug / q).get_mpz_t(), p.get_mpz_t());
+                lpr::mont3::to_mpz(leaf.get_mpz_t(), lpr::mont3::from_mont(power_tree_mont[leaf_idx], *mont));
+                assert(leaf == expect && "mont3 power tree leaf disagrees with GMP");
+#endif
+            } else {
+                _generate_next_residue(power_tree, product_tree, leaf_idx, tree_powm, pow_gmp);
+                leaf_is_one = (power_tree[leaf_idx] == 1);
+            }
             reuse.cum_powm[leaves++] = tree_powm;
 
-            if (power_tree[leaf_idx] == 1) {
+            if (leaf_is_one) {
                 primitive_root_if_prime = false;
                 break;
             }

@@ -65,6 +65,7 @@ struct LPRStats {
     std::uint64_t lpr_reuse_candidates = 0; // Tested g with some nodes derivable from earlier g (same p)
     std::uint64_t lpr_reuse_tree_powm = 0; // Upper bound on tree mpz_powm calls avoidable by reuse
     std::array<std::uint64_t, 16> winners_by_class = {}; // Index (p mod 8)*2 + (d mod 2)
+    std::uint64_t mont3_fallback_count = 0; // Candidates too large for mont3 (GMP used instead)
 
     LPRStats() = default;
 
@@ -114,6 +115,7 @@ struct LPRStats {
         for (size_t i = 0; i < winners_by_class.size(); ++i) {
             winners_by_class[i] += other.winners_by_class[i];
         }
+        mont3_fallback_count += other.mont3_fallback_count;
         if (other.d_max_max > d_max_max) {
             d_max_max = other.d_max_max;
         }
@@ -187,6 +189,8 @@ struct LPRStats {
                   << "Tested g with nodes derivable from earlier g: " << lpr_reuse_candidates << '\n'
                   << "Upper bound on power tree powm calls avoidable by reuse: "
                   << lpr_reuse_tree_powm << '\n'
+                  << "Candidates using GMP instead of Montgomery arithmetic (p >= 2^190): "
+                  << mont3_fallback_count << '\n'
                   << "Winners by p mod 8 (d even / d odd):\n";
         for (unsigned r = 1; r < 8; r += 2) {
             std::cout << "  p = " << r << " mod 8: "
@@ -276,6 +280,7 @@ private:
         lpr_reuse_candidates = other.lpr_reuse_candidates;
         lpr_reuse_tree_powm = other.lpr_reuse_tree_powm;
         winners_by_class = other.winners_by_class;
+        mont3_fallback_count = other.mont3_fallback_count;
     }
 };
 
