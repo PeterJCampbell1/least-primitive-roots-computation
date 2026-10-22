@@ -258,7 +258,7 @@ int main(int argc, char* argv[])
     // The power tree used by the least primitive root search must have a valid
     // heap layout for omega - 1 leaves (it does for every omega with the
     // complete-tree split; this guards against regressions)
-    if (!lpr::primality::power_tree_layout_is_valid(search.omega - 1)) {
+    if (!lpr::primality::testing::power_tree_layout_is_valid(search.omega - 1)) {
         std::cerr << "Error: invalid power tree layout for omega = " << search.omega << '\n';
         return 2;
     }

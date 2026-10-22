@@ -51,11 +51,15 @@ std::optional<unsigned> find_least_primitive_root(
 
 // Number of leaves in the left subtree of a complete binary tree with n >= 2
 // leaves: the split used by the product tree (see primality.cpp).
-std::size_t complete_tree_left_size(std::size_t n);
+//std::size_t complete_tree_left_size(std::size_t n);
+
+namespace testing {
 
 // True if the power tree over `leaves` odd primes has a valid heap layout: every
 // node index is inside the tree, the traversal's leaf test matches the real
 // leaves, and the leaves are visited in increasing order. Checked once in main.
 bool power_tree_layout_is_valid(std::size_t leaves);
+
+} // namespace testing
 
 } // namespace lpr::primality

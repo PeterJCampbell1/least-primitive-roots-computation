@@ -40,6 +40,7 @@ On the M2, GCC 15.2 was about 4–7% faster than Apple clang 16 on consumer work
   - OMEGA=33, S=29 with the job's thread count.
 - **Check:** search summaries must be identical across compilers (and to the laptop's). Compare CPU time (`/usr/bin/time`, user) and wall time, alternating builds, 3 runs each.
 - **Optionally:** `-march=native` (or `-march=znver3`/`znver4` for Bunya's Milan/Genoa nodes) with each compiler. It may matter more on x86 (MULX/ADX) than it did on the M2 (no gain). Build on, and run on, the same node type.
+- **PGO:** also try profile-guided builds (`experimental/pgo/pgo_build.sh clang|gcc`). On the M2, clang + PGO was ~10% faster than plain clang (including on an input it was not trained on) and the fastest build overall, while GCC + PGO was ~8% *slower* than plain GCC (`docs/optimisation_notes.md`, 22/10/26). Verify the PGO binary's summary like any build.
 - **Re-run** whenever the GMP build, compiler version or node type changes. The run header records the compiler and GMP version.
 
 ### 3. Size jobs to the single producer

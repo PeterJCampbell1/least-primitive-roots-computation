@@ -813,3 +813,43 @@ So the technique is free to use.
 
 The prototype measurements (above) suggest a further ~1.5% from raising `TRIAL_DIVISION_MAX_PRIME` to ~2000–3000. That is left for when the limit is re-tuned together with batched Fermat.
 
+
+---
+
+Date: **22/10/26**   
+Author: **Mittun Sudhahar**  
+Commit: TODO (experiment only; script in `experimental/pgo/`; measured on `2aca1ee` plus `experimental/trial_division/td_folding.diff`, the last verified source, since `be30f67`'s `primality.cpp` is mid-review)
+OMEGA: 33  
+
+Compiler experiments: profile-guided optimisation (PGO), and whether to compile with the Souper superoptimiser.
+
+## PGO (measured; promising with clang)
+**Method:** an instrumented build (`-fprofile-instr-generate` with clang, `-fprofile-generate` with GCC), one training run (`--single`, OMEGA=33, S=30, ~7 s), then a build that uses the profile (`-fprofile-instr-use` / `-fprofile-use`), all with `-O3 -flto=auto`. `experimental/pgo/pgo_build.sh` does this for either compiler.
+
+**Correctness:** the full search summary (75–87 lines) and the producer counts were identical to the normal build for every PGO binary, in `--single`, 8 threads, and S=29 with 8 threads, all exiting 0.
+
+**Speed** (M2, alternating, CPU time; load average 5–12 from another process during the runs):
+
+| Build | OMEGA=33 S=30 single (the training input) | S=29, 8 threads (not the training input) |
+|---|---|---|
+| Apple clang 16 | 7.27–7.42 s | 306–308 s CPU, 43.1 s wall |
+| **Apple clang 16 + PGO** | **6.54–6.63 s (−10%)** | **277–279 s CPU (−9.5%), 41.0 s wall** |
+| GCC 15.2 | 6.91–6.92 s | 285–287 s CPU, 42.0–42.2 s wall |
+| GCC 15.2 + PGO | 7.47–7.56 s (**+8%, slower**) | 308–309 s CPU (+8%), 43.4–43.8 s wall |
+
+- **Clang:** PGO is ~10% faster, and the gain holds on an input it wasn't trained on (S=29, multi-threaded), so it isn't overfitting the training run. Clang + PGO is the fastest build measured, ~5% ahead of plain GCC.
+- **GCC:** PGO made it *slower*. Not investigated. Candidates: `-fprofile-use` enables `-funroll-loops`, `-fpeel-loops` and `-ftracer`, which could hurt the tight Montgomery loops; or the profile could mislead branch layout in `dbl`/the window loop. To try: `-fprofile-use -fno-unroll-loops`, `-fprofile-partial-training`, and a multi-threaded training run.
+- **Where the gain comes from:** not examined. Likely branch layout and inlining decisions in the hot path (`pow2`'s per-bit branch, `powm`'s windows, trial division's early exit). `perf`/`sample` on the PGO binary would show it.
+
+**For the cluster** (`docs/cluster_roadmap.md`, item 2b): measure plain and PGO builds of both compilers on the node type, on small cases; the M2 ranking may not carry over to x86-64. Keep the training run representative (OMEGA=33 `--single` is cheap; check against the target OMEGA). Treat the profile as part of the build: rebuild it whenever the compiler or source changes, and verify the PGO binary's summary as for any build.
+
+## Souper (decided against for now)
+Souper is an LLVM superoptimiser: it uses an SMT solver to find cheaper equivalents of short integer instruction sequences. Not adopted:
+- **No large gain expected:** the hot code is latency-bound chains of 64 × 64-bit multiplies and carries that compilers already emit near-optimally (`mul`/`umulh`/`adds`/`adcs`, `mulx`/`adc`). The gains found so far are algorithmic (interleaving, folding, precomputation), which a peephole superoptimiser cannot do.
+- **Cost and trust:** it needs a source build tied to a specific LLVM version plus an SMT solver, and it is research software. A miscompilation in the release build, which has no GMP cross-checks, would silently invalidate a proof by computation.
+- **Low-risk use if ever wanted:** run it once as an advisor on the LLVM IR of `mont3::mul`, `pow2` and `remainder_3`, and apply anything worthwhile by hand.
+
+## Further experiments
+- PGO on the cluster with GCC and clang (with `-fuse-ld=lld`), with and without `-march=znver3`/`znver4`.
+- Why GCC PGO is slower (flags above).
+- PGO together with batched Fermat (18/10/26) once that is adopted, since it changes the hot loops.

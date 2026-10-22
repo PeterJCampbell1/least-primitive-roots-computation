@@ -368,7 +368,7 @@ bool power_tree_layout_is_valid(
  * decides with one multiplication and one comparison (no division). Chunks are
  * tested smallest primes first and we return at the first divisor found.
  **/
-bool is_composite_small_prime(i
+bool is_composite_small_prime(
     const mpz_class& p
 ) {
     assert(p >= 3);
