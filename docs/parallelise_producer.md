@@ -1,6 +1,6 @@
 # Design: parallel producer and checkpoint/restart (not implemented)
 
-Status: design notes for later (October 2026). At present there is one producer thread, with co-processing (`--parallel`), and no checkpointing: SIGTERM only prints the statistics so far. This file records the agreed design so it can be picked up later. The staged roadmap for getting onto a cluster, including this work, is in [`cluster_roadmap.md`](cluster_roadmap.md).
+Status: **superseded for parallelism (22/10/26)** by [`work_stealing_plan.md`](work_stealing_plan.md): every thread runs the DFS on its own region and processes its own supports, which removes the producer bottleneck measured on Rangpur and the need for a completion buffer. The checkpoint fingerprint and file format below still apply. Original status: design notes for later (October 2026). At present there is one producer thread, with co-processing (`--parallel`), and no checkpointing: SIGTERM only prints the statistics so far. This file records the agreed design so it can be picked up later. The staged roadmap for getting onto a cluster, including this work, is in [`cluster_roadmap.md`](cluster_roadmap.md).
 
 ## Why
 

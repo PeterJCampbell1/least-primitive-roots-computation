@@ -853,3 +853,97 @@ Souper is an LLVM superoptimiser: it uses an SMT solver to find cheaper equivale
 - PGO on the cluster with GCC and clang (with `-fuse-ld=lld`), with and without `-march=znver3`/`znver4`.
 - Why GCC PGO is slower (flags above).
 - PGO together with batched Fermat (18/10/26) once that is adopted, since it changes the hot loops.
+
+---
+
+Date: **22/10/26** (cluster test)   
+Author: **Mittun Sudhahar**  
+Commit: `fa144f0` (Rangpur), `9002404` (M2; `src/` identical)  
+OMEGA: 32, S = 29  
+
+First production-size runs on UQ's Rangpur cluster, and the matching M2 run, measuring how well one producer feeds the consumers.
+
+## Setup
+- **Rangpur:** `--parallel --threads 16` (1 producer + 15 consumers) on the `largecpu` partition, via `scripts/submit.sh`, built on the node by `scripts/slurm/build_lpr.sh` (g++). The `largecpu` nodes seen so far are `r730` machines: 2 × Intel Xeon E5-2680 v3 (Haswell, 2.5 GHz, 12 cores each, no SMT, no ADX). Progress logged every 120 s.
+- **M2:** `--parallel --threads 8` (1 producer + 7 consumers), progress every 300 s.
+- **Starvation measure:** the increase in `consumer_wait_s` over an interval, divided by (consumers × interval length), i.e. the share of consumer time spent waiting on an empty queue.
+
+## Earlier failure on Rangpur: "Illegal instruction"
+The first `largecpu` job exited with status 132 (SIGILL) right after starting. The node had a system GMP that the build picked up (`GMP: system`), and the node's CPU (Haswell) lacks ADX, which GMP's assembly for newer Intel CPUs uses; the GMP appears to have been built on a newer machine. Fixes in `build_lpr.sh`:
+- the toolchain test now exercises GMP's multiplication and `powm` kernels, so a GMP that crashes on the node is skipped;
+- the GMP built into `~/opt` is a fat binary (`--enable-fat`), safe on every node type sharing `$HOME`;
+- the job prints the node's CPU model, SMT state and relevant feature flags (`bmi2`, `adx`, `avx2`, `avx512*`).
+
+The run below used the fixed scripts.
+
+## Rangpur, 16 threads: the producer is the bottleneck
+Per 120 s interval (15 consumers, so 1,800 consumer-seconds per interval):
+
+| Interval | Waiting | Share of consumer time | `queue` at end | `coprocessed` increase |
+|---|---|---|---|---|
+| 0–2 min | 232 s | 12.9% | 463 | +884 |
+| 2–4 min | 290 s | 16.1% | 21 | +342 |
+| 4–6 min | 502 s | 27.9% | 114 | +200 |
+| 6–8 min | 347 s | 19.3% | 235 | +137 |
+| 8–10 min | 494 s | 27.5% | 0 | +63 |
+| 10–12 min | 544 s | 30.2% | 53 | 0 |
+| 12–14 min | 701 s | 38.9% | 0 | 0 |
+| 14–16 min | 339 s | 18.8% | 6 | +261 |
+| 16–18 min | 506 s | 28.1% | 6 | +34 |
+| 18–20 min | 581 s | 32.3% | 0 | 0 |
+| 20–22 min | 629 s | 34.9% | 287 | +34 |
+| 22–24 min | 572 s | 31.8% | 0 | 0 |
+| 24–26 min | 680 s | 37.8% | 0 | 0 |
+| 26–28 min | 756 s | 42.0% | 0 | 0 |
+| **0–28 min** | **7,173 s** | **28.5%** | | **1,955 in total** |
+
+- **Throughput** was flat at 637–647k supports/s throughout: the producer's own top speed on one Haswell core.
+- **Waiting rose** from about 13% to 42% of consumer time; on average only about 15 × (1 − 0.285) ≈ 11 of the 15 consumers were doing useful work.
+- **The queue was almost always empty,** and co-processing (which happens only when the queue is full) stopped after the first few minutes.
+- **Consequence:** with one producer, this node type gains nothing beyond about 12 threads. Going faster needs the producer parallelised.
+
+## M2, 8 threads: mostly consumer-limited, increasingly producer-limited
+The full run (`--parallel --threads 8`, commit `9002404`, 16:50–19:01) completed with exit code 0. Its results are **identical** to `outputs/k32_s29_run.txt`:
+- 6,057,734,933 supports;
+- 8,986,188,918 candidates;
+- 639,796,795 certified;
+- largest g(p) = 678;
+- 0 failed, 0 unresolved;
+- the same `d_max` sum and maximum.
+
+**Totals:**
+
+| Measure | This run | 17/10 run |
+|---|---|---|
+| Elapsed | **7,832.6 s** | 7,902 s |
+| Consumer waiting | 3,340,862 waits, 1,908.7 s = **3.5%** of 7 × 7,832.6 consumer-seconds | 1.8% |
+| Co-processed batches | 138,727 (pushed: 23,524,301) | |
+
+Waiting nearly doubled because the consumers are faster now (folding trial division), so the producer is the limit more often.
+
+**Share of consumer time spent waiting, per 5-minute interval:**
+
+| Minutes | Waiting |
+|---|---|
+| 0–10 | 0.20, 0.66 |
+| 10–20 | 0.86, 1.11 |
+| 20–30 | 1.83, 1.12 |
+| 30–40 | 1.93, 3.18 |
+| 40–50 | 1.13, 2.83 |
+| 50–60 | 4.09, 2.66 |
+| 60–70 | 3.57, 3.95 |
+| 70–80 | 3.01, 3.30 |
+| 80–90 | 4.39, 2.80 |
+| 90–100 | 4.08, 4.40 |
+| 100–110 | 5.28, 8.67 |
+| 110–120 | 5.44, 5.03 |
+| 120–130 | 7.07, 7.32 |
+
+Throughput was 635–865k supports/s (vs Rangpur's flat ~640k/s with twice the threads). Co-processing fell from 22,590 batches in the first interval to under 200 near the end.
+
+**Why it worsens over the run:** later supports are cheaper to process, while the DFS cost per emitted support stays about the same. Rangpur's progress lines show it directly: 2.25 candidates and 0.161 Fermat survivors per support in the first 2 minutes, against 1.57 and 0.112 after 2 hours, i.e. about 30% less consumer work per support. Later supports contain larger primes, so their Corollary 4 bound is smaller and Q is larger; `d_max` falls, and fewer d (built only from the support's primes) remain.
+
+**Rangpur at the same point** (7,323 s, 4.68 billion supports, 77%): throughput still 626–644k/s; consumers waiting 36–50% per interval (37.9% overall); co-processing stuck at 2,265 batches. The run was expected to finish about 36 minutes later. The M2 finished first with half the threads.
+
+## Conclusion
+The single producer limits every machine with slower cores or more threads than about 12. The next step is a parallel producer; see `docs/work_stealing_plan.md` for the plan (every thread runs the DFS on its own region, processes its own supports, and steals work when idle).
