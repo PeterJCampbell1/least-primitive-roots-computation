@@ -39,12 +39,23 @@ if [ "${LPR_BUILD:-0}" = 1 ]; then
     bash ./build_lpr.sh || { echo "Build failed on $(hostname)"; exit 2; }
 fi
 
-# Search parameters: edit the config file (or add --omega N / --s N, which override it)
-srun ./lpr --parallel --config config/omega33.conf --log-interval 120 --log-file "lpr_${SLURM_JOB_ID}.log"
+# Search parameters. LPR_ARGS (set by scripts/submit.sh --lpr-args) replaces the default
+# "--config config/omega33.conf", e.g. "--omega 32 --s 29" or "--config config/x.conf --s 29".
+# The mode is --parallel unless LPR_ARGS gives one (--single, --parallel or --dry-run;
+# lpr accepts only one).
+lpr_args=${LPR_ARGS:---config config/omega33.conf}
+case " $lpr_args " in
+    *" --single "*|*" --parallel "*|*" --dry-run "*) lpr_mode="" ;;
+    *) lpr_mode="--parallel" ;;
+esac
+srun ./lpr ${lpr_mode} ${lpr_args} --log-interval 120 --log-file "lpr_${SLURM_JOB_ID}.log"
 status=$?
 
 case ${status} in
-    0) echo "lpr finished: verification complete" ;;
+    0) case " ${lpr_args} " in
+           *" --dry-run "*) echo "lpr finished: dry run (producer only), nothing verified" ;;
+           *) echo "lpr finished: verification complete" ;;
+       esac ;;
     1) echo "lpr finished: Grosswald failure or unresolved candidate (see lpr_${SLURM_JOB_ID}.err)" ;;
     2) echo "lpr did not start: usage error" ;;
     3) echo "lpr was interrupted: partial run, nothing verified" ;;

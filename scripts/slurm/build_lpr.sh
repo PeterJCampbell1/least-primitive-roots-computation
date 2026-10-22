@@ -11,7 +11,11 @@
 #    wrapper) into $LPR_GMP_HOME from $LPR_GMP_TARBALL, downloading the tarball
 #    first if it is missing and the node has internet access. Concurrent jobs
 #    share one build (flock). Then retry step 1.
-# 3. make release with the chosen settings, compiling in the commit ($LPR_COMMIT).
+# 3. make release with the chosen settings, compiling in the commit ($LPR_COMMIT),
+#    plus any extra flags ($LPR_CXXFLAGS). With LPR_PGO=1 the build is profile-guided:
+#    an instrumented build, one training run ($LPR_PGO_TRAIN), then the final build
+#    using the profile (clang needs llvm-profdata). See docs/optimisation_notes.md,
+#    22/10/26: on the M2, clang + PGO was ~10% faster, GCC + PGO ~8% slower.
 #
 # A compiler is never installed: building GCC takes hours and itself needs GMP,
 # MPFR and MPC. Set LPR_CXX to force a compiler (e.g. LPR_CXX=g++).
@@ -23,6 +27,10 @@
 #   LPR_GMP_TARBALL  GMP source tarball (default $HOME/gmp-<version>.tar.xz)
 #   GMP_PREFIX       an existing GMP installation to try (include/ and lib/ below it)
 #   LPR_COMMIT       commit to compile into the run header
+#   LPR_CXXFLAGS     extra compiler flags, e.g. "-march=znver3" (also used in the test compile)
+#   LPR_PGO          1 for a profile-guided build
+#   LPR_PGO_TRAIN    lpr arguments for the PGO training run (default "--single", OMEGA=33)
+#   LPR_PROFDATA     llvm-profdata to use for clang PGO (default: from PATH, or xcrun on macOS)
 
 set -euo pipefail
 
@@ -83,7 +91,7 @@ find_toolchain() {
             IFS='|' read -r name cxx lto ld <<< "$cand"
             inc=""; lib=""
             [ -n "$prefix" ] && inc="-I$prefix/include" && lib="-L$prefix/lib -Wl,-rpath,$prefix/lib"
-            if "$cxx" -std=c++17 -O1 $lto $inc .build_test.cpp $ld $lib -lgmpxx -lgmp -pthread \
+            if "$cxx" -std=c++17 -O1 $lto ${LPR_CXXFLAGS:-} $inc .build_test.cpp $ld $lib -lgmpxx -lgmp -pthread \
                    -o .build_test > .build_test.log 2>&1 && ./.build_test > /dev/null 2>&1; then
                 chosen="$name|$cxx|$lto|$ld|$prefix"
                 return 0
@@ -145,10 +153,44 @@ fi
 rm -f .build_test .build_test.cpp .build_test.log
 
 IFS='|' read -r name cxx lto ld prefix <<< "$chosen"
-log "using: $name; GMP: ${prefix:-system}"
+log "using: $name; GMP: ${prefix:-system}${LPR_CXXFLAGS:+; extra flags: $LPR_CXXFLAGS}"
 # GMP_PREFIX and LDFLAGS go through the environment so the Makefile appends its own flags
-# to them; CXX and LTOFLAGS are make arguments, replacing the Makefile's defaults.
+# to them; CXX, LTOFLAGS and EXTRA_CXXFLAGS are make arguments.
 export GMP_PREFIX="$prefix"
 export LDFLAGS="${ld}${prefix:+ -Wl,-rpath,$prefix/lib}"
-make release CXX="$cxx" LTOFLAGS="$lto" ${LPR_COMMIT:+GIT_COMMIT=$LPR_COMMIT}
-log "built ./lpr"
+commit_tag=""                # "-pgo" for PGO builds, so the run header shows it
+[ "${LPR_PGO:-0}" = 1 ] && commit_tag="-pgo"
+build() {   # build ./lpr with extra flags $1 (on top of LPR_CXXFLAGS)
+    rm -f lpr
+    make release CXX="$cxx" LTOFLAGS="$lto" EXTRA_CXXFLAGS="${LPR_CXXFLAGS:-} $1" \
+        ${LPR_COMMIT:+GIT_COMMIT=$LPR_COMMIT$commit_tag}
+}
+
+if [ "${LPR_PGO:-0}" != 1 ]; then
+    build ""
+    log "built ./lpr"
+    exit 0
+fi
+
+# Profile-guided build: instrument, train, rebuild with the profile
+train=${LPR_PGO_TRAIN:---single}
+pgo_dir="$PWD/pgo_profile"
+rm -rf "$pgo_dir" && mkdir -p "$pgo_dir"
+if "$cxx" --version 2>/dev/null | grep -qi clang; then
+    profdata=${LPR_PROFDATA:-$(command -v llvm-profdata || xcrun --find llvm-profdata 2>/dev/null || true)}
+    [ -n "$profdata" ] || { log "PGO with clang needs llvm-profdata, which is not on PATH"; exit 1; }
+    build "-fprofile-instr-generate"
+    log "PGO training run: ./lpr $train"
+    LLVM_PROFILE_FILE="$pgo_dir/train.profraw" ./lpr $train --log-interval 0 > "$pgo_dir/train.out" 2>&1 \
+        || { log "PGO training run failed:"; tail -20 "$pgo_dir/train.out"; exit 1; }
+    "$profdata" merge -output="$pgo_dir/train.profdata" "$pgo_dir/train.profraw"
+    build "-fprofile-instr-use=$pgo_dir/train.profdata"
+else
+    # GCC names the profile files after the output, so both builds produce ./lpr
+    build "-fprofile-generate -fprofile-dir=$pgo_dir"
+    log "PGO training run: ./lpr $train"
+    ./lpr $train --log-interval 0 > "$pgo_dir/train.out" 2>&1 \
+        || { log "PGO training run failed:"; tail -20 "$pgo_dir/train.out"; exit 1; }
+    build "-fprofile-use -fprofile-dir=$pgo_dir"
+fi
+log "built ./lpr (PGO, trained with: $train; training output in $pgo_dir/train.out)"

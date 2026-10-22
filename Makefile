@@ -32,6 +32,11 @@ ifneq ($(strip $(GMP_PREFIX)),)
     LDFLAGS  += -L$(GMP_PREFIX)/lib
 endif
 
+# Extra compiler flags, appended to the defaults instead of replacing them (a plain
+# `make CXXFLAGS=...` would drop -std=c++17 and the GMP paths), e.g.
+#   make EXTRA_CXXFLAGS=-march=znver3
+CXXFLAGS += $(EXTRA_CXXFLAGS)
+
 RELEASEFLAGS := -O3 -DNDEBUG
 DEBUGFLAGS   := -O3 -g -fno-inline -fno-optimize-sibling-calls
 

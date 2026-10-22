@@ -22,20 +22,32 @@
 #   -b, --branch NAME   branch to pull and run (default: the repository's current branch)
 #   -c, --commit REF    run this commit instead of the branch tip (any git revision)
 #   -n, --name LABEL    label appended to the run directory name
+#   -a, --lpr-args "A"  lpr arguments for this run, replacing the job file's default
+#                       "--config config/omega33.conf", e.g. "--omega 32 --s 29" or
+#                       "--config config/omega33.conf --single". The job adds --parallel
+#                       unless the arguments give a mode (--single, --parallel, --dry-run).
 #       --no-pull       do not run git pull first
 #       --cxx NAME      compiler for the job's build (default: try clang++, then g++)
+#       --cxxflags "F"  extra compiler flags for the build, e.g. "-march=znver3"
+#       --pgo           profile-guided build (instrumented build, training run, rebuild)
+#       --pgo-train "A" lpr arguments for the PGO training run (default "--single")
 #       --gmp-tarball F GMP source tarball for a build on the compute node (default
 #                       $HOME/gmp-6.3.0.tar.xz; downloaded by the job if missing and the
 #                       node has internet access)
 #       --dry-run       do everything except sbatch, and print the sbatch command
+#       --allow-in-job  run even inside a Slurm job (normally refused, see below)
 #   -h, --help          show this help
+# Run it on the login node. Inside a job (e.g. an srun --pty session) it stops: the
+# job's environment and per-job directories would leak into the submitted job.
 # Everything after "--" is passed to sbatch and overrides the #SBATCH lines in lpr.slurm,
 # e.g.  scripts/submit.sh -n s29 -- --cpus-per-task=32 --time=04:00:00
 #
 # Environment:
 #   LPR_REPO       repository (default: the one containing this script)
-#   LPR_RUN_ROOT   where run directories are created (default: $SCRATCH/lpr_runs if
-#                  SCRATCH is set, else $HOME/lpr_runs). Set it to your scratch space.
+#   LPR_RUN_ROOT   where run directories are created (default: $HOME/lpr_runs). It must
+#                  be on storage every compute node can see and that outlives jobs, e.g. a
+#                  shared scratch filesystem. Not $SCRATCH inside a job: Slurm clusters often
+#                  set that to a per-job directory that other nodes cannot see.
 #   LPR_JOB        job script (default: $LPR_REPO/scripts/slurm/lpr.slurm). Fill in its
 #                  <...> placeholders, or override them with sbatch options after "--".
 
@@ -44,9 +56,10 @@ set -euo pipefail
 usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
 
 repo=${LPR_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
-run_root=${LPR_RUN_ROOT:-${SCRATCH:-$HOME}/lpr_runs}
+run_root=${LPR_RUN_ROOT:-$HOME/lpr_runs}
 job_script=${LPR_JOB:-$repo/scripts/slurm/lpr.slurm}
-branch="" commit="" name="" pull=1 dry_run=0 cxx="" gmp_tarball=""
+branch="" commit="" name="" pull=1 dry_run=0 allow_in_job=0
+lpr_args="" cxxflags="" pgo=0 pgo_train="" cxx="" gmp_tarball=""
 sbatch_args=()
 
 while [ $# -gt 0 ]; do
@@ -54,15 +67,38 @@ while [ $# -gt 0 ]; do
         -b|--branch) branch=${2:?--branch needs a name}; shift 2 ;;
         -c|--commit) commit=${2:?--commit needs a revision}; shift 2 ;;
         -n|--name)   name=${2:?--name needs a label}; shift 2 ;;
+        -a|--lpr-args) lpr_args=${2:?--lpr-args needs arguments}; shift 2 ;;
+        --cxxflags)  cxxflags=${2:?--cxxflags needs flags}; shift 2 ;;
+        --pgo)       pgo=1; shift ;;
+        --pgo-train) pgo_train=${2:?--pgo-train needs arguments}; shift 2 ;;
         --no-pull)   pull=0; shift ;;
         --cxx)       cxx=${2:?--cxx needs a compiler}; shift 2 ;;
         --gmp-tarball) gmp_tarball=${2:?--gmp-tarball needs a file}; shift 2 ;;
         --dry-run)   dry_run=1; shift ;;
+        --allow-in-job) allow_in_job=1; shift ;;
         -h|--help)   usage; exit 0 ;;
         --)          shift; sbatch_args=("$@"); break ;;
         *)           echo "submit.sh: unknown option '$1' (see --help)" >&2; exit 2 ;;
     esac
 done
+
+# Refuse to run inside a Slurm job: per-job paths (such as $SCRATCH there) and the job's
+# SLURM_* environment would be passed to the new job, which may run on another node
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+    if [ "$allow_in_job" = 0 ]; then
+        echo "submit.sh: this shell is inside Slurm job $SLURM_JOB_ID (on $(hostname))." >&2
+        echo "  Run submit.sh on the login node instead (exit the srun session first)," >&2
+        echo "  or pass --allow-in-job if you are sure LPR_RUN_ROOT ($run_root) is shared." >&2
+        exit 2
+    fi
+    echo "submit.sh: warning: running inside Slurm job $SLURM_JOB_ID (--allow-in-job)" >&2
+fi
+case "$run_root/" in
+    *"/${SLURM_JOB_ID:-no-job-id}/"*)
+        echo "submit.sh: LPR_RUN_ROOT ($run_root) is inside this job's own directory," >&2
+        echo "  which other nodes cannot see and which is removed when the job ends." >&2
+        exit 2 ;;
+esac
 
 git -C "$repo" rev-parse --git-dir > /dev/null
 [ -f "$job_script" ] || { echo "submit.sh: job script '$job_script' not found" >&2; exit 2; }
@@ -101,12 +137,17 @@ cp "$repo/scripts/slurm/build_lpr.sh" "$run_dir/build_lpr.sh"
     echo "submitted: $(date '+%Y-%m-%d %H:%M:%S %Z') by ${USER:-unknown} on $(hostname)"
     echo "job file:  $job_script"
     echo "sbatch:    ${sbatch_args[*]:-}"
-    echo "build:     compiler ${cxx:-auto}, GMP tarball ${gmp_tarball:-default}"
+    echo "lpr args:  ${lpr_args:-(job file default)}"
+    echo "build:     compiler ${cxx:-auto}, extra flags ${cxxflags:-none}, PGO $( [ "$pgo" = 1 ] && echo "on (training: ${pgo_train:---single})" || echo off ), GMP tarball ${gmp_tarball:-default}"
 } > "$run_dir/RUN_INFO"
 
 # 4. Submit, building lpr on the compute node inside the run directory.
 # Build settings reach the job through --export=ALL.
 if [ -n "$cxx" ]; then export LPR_CXX="$cxx"; fi
+if [ -n "$lpr_args" ]; then export LPR_ARGS="$lpr_args"; fi
+if [ -n "$cxxflags" ]; then export LPR_CXXFLAGS="$cxxflags"; fi
+if [ "$pgo" = 1 ]; then export LPR_PGO=1; fi
+if [ -n "$pgo_train" ]; then export LPR_PGO_TRAIN="$pgo_train"; fi
 if [ -n "$gmp_tarball" ]; then export LPR_GMP_TARBALL="$gmp_tarball"; fi
 # (sbatch options must come before the job script; "${a[@]+...}" keeps bash 3.2 happy with set -u)
 cmd=(sbatch --parsable --chdir="$run_dir" --export=ALL,LPR_BUILD=1,LPR_COMMIT="$short"
