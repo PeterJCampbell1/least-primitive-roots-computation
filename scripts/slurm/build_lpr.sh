@@ -6,9 +6,12 @@
 #    gmpxx test program, trying in order:
 #      clang++ + LTO with lld;  g++ + -flto=auto (GCC >= 10);  g++ + -flto (older GCC);
 #      clang++ without LTO;  g++ without LTO.
-#    GMP is looked for in the system paths, in $GMP_PREFIX, then in $LPR_GMP_HOME.
+#    GMP is looked for in the system paths, in $GMP_PREFIX, then in $LPR_GMP_HOME. The test
+#    exercises GMP's multiplication and powm kernels, so a GMP that crashes on this node's
+#    CPU (built for a newer one) is skipped.
 # 2. If no combination can link GMP, build GMP (static libraries, with the C++
-#    wrapper) into $LPR_GMP_HOME from $LPR_GMP_TARBALL, downloading the tarball
+#    wrapper; a fat binary on x86-64, so it runs on every node type sharing $HOME)
+#    into $LPR_GMP_HOME from $LPR_GMP_TARBALL, downloading the tarball
 #    first if it is missing and the node has internet access. Concurrent jobs
 #    share one build (flock). Then retry step 1.
 # 3. make release with the chosen settings, compiling in the commit ($LPR_COMMIT),
@@ -42,20 +45,39 @@ jobs=${SLURM_CPUS_PER_TASK:-4}
 
 log() { echo "[build_lpr] $*"; }
 
-# A small program needing C++17, gmpxx and threads, as lpr does
+# Test program: C++17, gmpxx and threads as lpr uses them, and GMP's arithmetic kernels
+# (multiplication at several sizes, squaring, division, modular exponentiation). A GMP
+# built for a newer CPU than this node's dies here with "Illegal instruction" (e.g. ADX
+# code on a Haswell node), so that GMP is skipped instead of crashing lpr later.
 cat > .build_test.cpp <<'EOF'
 #include <gmpxx.h>
 #include <iostream>
 #include <optional>
 #include <thread>
 int main() {
-    mpz_class a = 1;
-    a <<= 200;
-    std::optional<mpz_class> b = a + 1;
+    int failures = 0;
+    // Fermat test of the Mersenne prime 2^127 - 1 (as in lpr: powm modulo a few limbs)
+    const mpz_class p = (mpz_class(1) << 127) - 1;
+    mpz_class r;
+    mpz_powm(r.get_mpz_t(), mpz_class(3).get_mpz_t(), mpz_class(p - 1).get_mpz_t(), p.get_mpz_t());
+    failures += (r != 1);
+    // A 190-bit modulus and exponent (lpr's candidate sizes)
+    const mpz_class m = (mpz_class(1) << 189) + 1235, e = (mpz_class(1) << 188) + 77;
+    mpz_powm(r.get_mpz_t(), mpz_class(5).get_mpz_t(), e.get_mpz_t(), m.get_mpz_t());
+    failures += (r >= m);
+    // Products from basecase to Toom/FFT sizes, checked by exact division
+    for (unsigned bits : {64u, 192u, 2000u, 20000u, 200000u}) {
+        const mpz_class a = (mpz_class(1) << bits) / 3 + 12345;
+        const mpz_class b = (mpz_class(1) << (bits / 2 + 7)) / 7 + 1;
+        const mpz_class c = a * b, sq = a * a;
+        failures += (c / b != a) || (c % b != 0) || (sq / a != a);
+    }
+    std::optional<mpz_class> o = p + 1;
     std::thread t([] {});
     t.join();
-    std::cout << mpz_sizeinbase(b->get_mpz_t(), 2) << '\n';
-    return mpz_sizeinbase(b->get_mpz_t(), 2) == 201 ? 0 : 1;
+    failures += (mpz_sizeinbase(o->get_mpz_t(), 2) != 128);
+    std::cout << (failures ? "GMP self-check FAILED" : "GMP self-check passed") << '\n';
+    return failures == 0 ? 0 : 1;
 }
 EOF
 
@@ -129,13 +151,17 @@ build_gmp() {
     cc=$(command -v gcc || command -v clang || true)
     cxx=$(command -v g++ || command -v clang++ || true)
     [ -n "$cc" ] && [ -n "$cxx" ] || { log "no C and C++ compiler to build GMP with"; exit 1; }
+    # A "fat" build contains code for every x86-64 CPU family and picks one at run time,
+    # so the shared ~/opt installation is safe on all node types (supported on x86 only)
+    local fat=""
+    case "$(uname -m)" in x86_64|i?86) fat="--enable-fat" ;; esac
     work="$PWD/.gmp_build"
     rm -rf "$work" && mkdir -p "$work"
-    log "building GMP $gmp_version into $gmp_home (static, with C++ wrapper) using $cc / $cxx"
+    log "building GMP $gmp_version into $gmp_home (static, C++ wrapper${fat:+, fat binary}) using $cc / $cxx"
     tar -xf "$tarball" -C "$work"
     (
         cd "$work/gmp-$gmp_version"
-        ./configure --prefix="$gmp_home" --enable-cxx --disable-shared CC="$cc" CXX="$cxx" > configure.log 2>&1 \
+        ./configure --prefix="$gmp_home" --enable-cxx --disable-shared $fat CC="$cc" CXX="$cxx" > configure.log 2>&1 \
             || { tail -20 configure.log; exit 1; }
         make -j"$jobs" > make.log 2>&1 || { tail -20 make.log; exit 1; }
         make check -j"$jobs" > check.log 2>&1 || { log "GMP self-tests FAILED:"; tail -30 check.log; exit 1; }

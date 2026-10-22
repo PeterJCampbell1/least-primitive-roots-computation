@@ -58,6 +58,8 @@ A copy is about 0.4 MB, mostly the docs.
    ```
    The first job that needs GMP builds it into `~/opt/gmp-6.3.0`, which takes about 10–15 minutes including GMP's self-tests. Later jobs reuse it. Allow for that in the first job's `--time`.
 
+   Before using any GMP, the build runs a self-check of its multiplication and `powm` code on the node. A GMP that doesn't work there is skipped: for example, a system GMP built for a newer CPU, which dies with "Illegal instruction" (seen on Rangpur's Haswell `r730` nodes). The GMP built in `~/opt` is a "fat" binary on x86-64, so it runs correctly on every node type sharing your home directory.
+
 ## Submitting runs
 
 Always submit from the **login node**. `submit.sh` refuses to run inside a job (e.g. an `srun --pty` session), because that job's per-job directories and environment would leak into the new one.

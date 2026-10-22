@@ -30,6 +30,10 @@ set -u
 # module load gmp
 
 echo "Job ${SLURM_JOB_ID} on $(hostname) with ${SLURM_CPUS_PER_TASK} CPUs"
+# Node hardware, for comparing timings across node types
+lscpu 2>/dev/null | grep -E "^Model name|^CPU\(s\)|^Thread\(s\) per core|^Core\(s\) per socket|^Socket\(s\)" || true
+echo "SMT active: $(cat /sys/devices/system/cpu/smt/active 2>/dev/null || echo unknown)"
+echo "CPU features: $(grep -o -w -E 'bmi2|adx|avx2|avx512f|avx512ifma' /proc/cpuinfo 2>/dev/null | sort -u | tr '\n' ' ')"
 
 # Optional build on the compute node (scripts/submit.sh sets LPR_BUILD=1 and runs
 # the job in a fresh per-run copy of the source, which has no .git), after the
