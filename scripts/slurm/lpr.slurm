@@ -33,9 +33,10 @@ echo "Job ${SLURM_JOB_ID} on $(hostname) with ${SLURM_CPUS_PER_TASK} CPUs"
 
 # Optional build on the compute node (scripts/submit.sh sets LPR_BUILD=1 and runs
 # the job in a fresh per-run copy of the source, which has no .git), after the
-# module loads above. LPR_COMMIT is compiled in, so the run header shows the commit.
+# module loads above. build_lpr.sh picks a working compiler, builds GMP into
+# $HOME/opt if no usable GMP is found, and compiles LPR_COMMIT into the run header.
 if [ "${LPR_BUILD:-0}" = 1 ]; then
-    make release ${LPR_COMMIT:+GIT_COMMIT=$LPR_COMMIT} || { echo "Build failed on $(hostname)"; exit 2; }
+    bash ./build_lpr.sh || { echo "Build failed on $(hostname)"; exit 2; }
 fi
 
 # Search parameters: edit the config file (or add --omega N / --s N, which override it)
