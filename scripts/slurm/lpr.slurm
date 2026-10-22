@@ -31,6 +31,13 @@ set -u
 
 echo "Job ${SLURM_JOB_ID} on $(hostname) with ${SLURM_CPUS_PER_TASK} CPUs"
 
+# Optional build on the compute node (scripts/submit.sh sets LPR_BUILD=1 and runs
+# the job in a fresh per-run copy of the source, which has no .git), after the
+# module loads above. LPR_COMMIT is compiled in, so the run header shows the commit.
+if [ "${LPR_BUILD:-0}" = 1 ]; then
+    make release ${LPR_COMMIT:+GIT_COMMIT=$LPR_COMMIT} || { echo "Build failed on $(hostname)"; exit 2; }
+fi
+
 # Search parameters: edit the config file (or add --omega N / --s N, which override it)
 srun ./lpr --parallel --config config/omega33.conf --log-interval 120 --log-file "lpr_${SLURM_JOB_ID}.log"
 status=$?
