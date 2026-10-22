@@ -571,3 +571,245 @@ All stages matched exactly. The final build also matches `c5bdad5` exactly.
 The gains are in the multi-threaded runs, where the single producer is the bottleneck; single-threaded work is dominated by the (unchanged) arithmetic.
 
 **OMEGA=32, S=29, 8 threads (full run, final build):** every key line, and the trial-division/Fermat composite counts, are identical to `k32_s29_run.txt` (6,057,734,933 supports; 639,796,795 certified; largest g(p) 678; 0 failed; 0 unresolved). Elapsed 7,902 s against 8,094 s (−2.4%). With the faster producer, consumer waits halved (1,903,644 against 3,676,158) and co-processed batches doubled (197,281 against 89,788). The new `consumer_wait_ns` shows the consumers waited 1,017 s in total, i.e. **~1.8% of consumer time**, so on this 8-thread machine the single producer limits OMEGA=32 only slightly. The ~10% at OMEGA=33 is mostly the short run's start-up and tail.
+
+---
+
+Date: **18/10/26**   
+Author: **Mittun Sudhahar**  
+Commit: TODO (experiments only; nothing in `src/` changed; scripts in `experimental/consumer_ilp/`)
+OMEGA: 33  
+
+Experiments on further speed-ups, mainly for the consumers (the producer is to be parallelised). All measurements were taken on the M2, alternating with the current build, under a load of about 2–3.
+
+## Where consumer time goes
+Single-threaded profile at OMEGA=33, S=30:
+
+| Stage | Share of runtime | Count | Cost each |
+|---|---|---|---|
+| Base-2 Fermat | 37% | 1,112,602 tests | ~179 Montgomery squarings |
+| Least primitive root search | 42% | 114,064 primes | ~2,240 Montgomery multiplications per prime |
+| Trial division | 5% | | |
+| `mont3::setup` | 2% | | |
+
+Montgomery `mul`/`powm`/`pow2` make up ~79% of all work. The search figures come from a Python model of the search, run on 3,000 of the real primes (`experimental/consumer_ilp/sim.py`); its counts of tests per prime and failure positions match the program's own counters.
+- **The winner's full tree:** ~1,230 multiplications.
+- **The ~3.5 failed g per prime:** ~1,010 multiplications, ~290 each. Failures happen at q = 3 (44%), 5 (17%), 7 (9%), and so on.
+
+A failure is expensive because the first leaf, g^(n/q), always needs exponents totalling about log2 n − log2 q ≈ 178 bits along its path, whatever the shape of the tree.
+
+## Interleaving independent exponentiations (measured, promising)
+- **Why:** a Montgomery product is a chain of dependent carries, and each squaring in an exponentiation needs the previous result. One exponentiation therefore runs at the *latency* of the chain, leaving the core's multipliers idle much of the time. Two independent exponentiations written in the same loop body (lockstep) let the out-of-order core overlap the two chains.
+- **Microbenchmark** (`experimental/consumer_ilp/ilp.cpp`, 20,000 realistic candidates, best of 7):
+
+  | Variant | Time |
+  |---|---|
+  | One squaring chain | 10.8 ns per squaring |
+  | Two chains | 7.6 ns per squaring |
+  | Four chains | 7.3 ns per squaring |
+  | `pow2` Fermat (current) | 1.95 µs |
+  | Branch-free doubling, one chain | 2.17 µs (slower) |
+  | `sqr_unrolled`, one chain | 2.10 µs (slower) |
+  | 2-way lockstep, `mul` as squaring | 1.70 µs |
+  | 4-way lockstep, `mul` as squaring | 1.56–1.60 µs |
+  | **2-way lockstep, `sqr_unrolled`** | **1.36–1.40 µs** |
+  | 4-way lockstep, `sqr_unrolled` | 1.36 µs |
+
+- **Squaring:** interleaved, the multipliers become the limit. The dedicated squaring (6 limb products instead of 9), which was not worth it on a single chain, now pays off.
+- **Batched Fermat prototype** (`experimental/consumer_ilp/batched_fermat_prototype.diff`):
+  - `process_batch(jobs, count)` works in three phases: (1) enumerate the candidates of every job in the batch, trial-divide them, and keep each survivor's p, n and Montgomery context; (2) run the Fermat tests two at a time (`fermat_composite2`: lockstep `sqr_unrolled`, branch-free conditional doubling, the shorter exponent padded at the top by starting from `one`); (3) run the search and the Grosswald check on each Fermat survivor.
+  - Single-threaded mode buffers `BATCH_SIZE` jobs; consumers and producer co-processing pass their batch straight through.
+  - Search summaries were identical in every run:
+
+  | Mode (3 alternating runs) | Current | Batched Fermat |
+  |---|---|---|
+  | Single-threaded | 8.59–8.68 s | 7.34–7.38 s (−15%) |
+  | 2 threads | 4.43–4.49 s | 3.75–3.77 s (−16%) |
+  | 8 threads | 1.57–1.68 s | 1.39–1.43 s (−14%) |
+
+- **Still to do before adopting:** a debug (`lpr_g`) GMP cross-check for the paired path, a test of `fermat_composite2` in `experimental/montgomery3`, and a re-measurement on the cluster's x86 CPUs (multiply latency and throughput differ from the M2).
+
+## Pairing Legendre survivors in the power tree (modelled, not implemented)
+- **Idea:** for a fixed p, the exponents of the power tree (root g^(2d), then products of the sibling subtrees) do not depend on g. Two Legendre survivors g_a < g_b can therefore be run through the same lazy traversal with a `powm2`, i.e. one sliding-window pass over the exponent with two base tables and two accumulators. The control flow is identical for both lanes.
+- **When a lane exits:** when g_a or g_b hits a leaf equal to 1, the other lane continues alone. If g_a is the winner, g_b's lane is dropped. Correctness is unaffected: g_b's result is used only if every smaller survivor failed.
+- **Model** (`experimental/consumer_ilp/sim2.py`, 2,000 real primes, lazy cost per leaf from the real layout; a paired step costs 1.40× a single step):
+  - The tree is **13% faster** (16% at 1.25×), i.e. about 5% of total runtime.
+  - The gain is limited because, when g_a is the winner (about half the time), its full tree runs at the paired step's speed while g_b is still alive.
+
+## SIMD on the cluster (idea)
+The batch structure above is what an AVX-512 IFMA Fermat test needs: 8 candidates per vector, with 4 × 52-bit limbs per number (208 bits > 2^181). This could be several times faster than scalar Fermat on Ice Lake, Sapphire Rapids or Zen 4. Check the cluster's CPUs first.
+
+## Ruled out (measured or modelled)
+- **Huffman-shaped power tree** (weights log q): 12% more multiplications. Its many small exponents have high window overhead, and the first leaf's cost does not depend on the tree's shape.
+- **Skipping composite g via multiplicativity** (all prime factors already known to be q-th residues): 0.077 skippable tests per prime, saving ~18 of ~2,430 multiplications per prime (< 1%). This agrees with the 1.6% bound from node reuse (15/10/26).
+- **More trial division:** each chunk near 1151 removes 0.5% of the Fermat calls, which is about its own cost. A batch remainder tree up to 2^16 would remove ~36% of them, but would cost about as much as the tests it saves. (Superseded in part by 19/10/26: precomputing GMP's per-chunk constants makes trial division 2.5× cheaper and moves the best limit to ~2000–4000.)
+- **Branch-free conditional doubling on a single chain:** 11% slower; the branchy version is faster there.
+- **Doing Fermat through the g = 2 tree path** (reusing 2^(n/3)): saves at most ~2%.
+- **A cubic-reciprocity prefilter for q = 3:** at most ~4%, at research-level complexity.
+
+## Producer: a log-free floating-point Corollary 4 filter (prototype, not adopted)
+An earlier attempt (`utils/interval_check.cpp`) used `fesetround` around `std::log2`, which is not rigorous:
+- libm need not be correctly rounded or honour the rounding mode;
+- the compiler may move code across `fesetround` without `-frounding-math`.
+
+The Python log dry run decided near-ties with no fallback, which explains its inaccurate support counts.
+
+The new prototype uses no `log`, only IEEE +, −, ×, ÷ (correctly rounded by the standard), built with `-ffp-contract=off`.
+- **What it computes:** since SOP/Q = r = Σ 1/p over the window, T := lhs/rhs = 4218 · 2^(16(ω−s)) · ((s+1) − 2r)^16 / (1 − r)^16, and the exact prune test P > floor(T) − 1 is equivalent to P + 1 > T.
+- **Error bound:** P̂ (a double product) and T̂ have a-priori relative errors e1 = γ_ω and e2 ≈ 16·(rel. error of the ratio) + 16u. These come from the standard γ_n = nu/(1 − nu) analysis. For every node, r ≤ r_max (that of the first ω primes), which bounds the error of 1 − r. At ω=33: e2 = 3.0e-13 (S=30) and 1.4e-13 (S=29); the margin is M = 2(e1 + e2) + 16u.
+- **Decisions:** a node is pruned if P̂ > T̂(1+M) and kept if P̂(1+M) + 2 < T̂(1−M); anything else goes to the exact `corollary4_qd_bound`. Each node stores T̂_min = min of T̂ along its path. At a leaf, d_max = floor((T_min − 1)/Q) is used only when floor(ŷ(1−M)) = floor(ŷ(1+M)); otherwise it is computed exactly.
+- **Results:**
+  - S=30: dry run 1.11 s → 0.02 s. Every decision was also checked against the exact computation: 0 mismatches, 0 fallbacks.
+  - S=29: dry run 35.7 s → 0.75 s, with 0 fallbacks and identical producer counts. The full exact cross-check was not finished.
+- **Still needed:** a written proof of the error bound before this could be used.
+
+---
+
+Date: **19/10/26**   
+Author: **Mittun Sudhahar**  
+Commit: TODO (scripts in `experimental/trial_division/`; the folding remainder is in `src/`, uncommitted, see the end of this entry)
+OMEGA: 33  
+
+Experiments on trial division. Questions:
+1. Can libdivide replace the hand-written Granlund–Montgomery test without a penalty?
+2. Does GMP keep the reciprocal for each primorial chunk, and what would precomputing it save?
+3. Do Lemire's direct-remainder and divisibility methods (Lemire, Kaser and Kurz, "Faster Remainder by Direct Computation", arXiv:1902.01961) speed things up enough to divide by more primes?
+
+All measurements were on the M2, on the 1,593,113 real candidates that reach trial division at OMEGA=33, S=30 (`experimental/trial_division/td.cpp`). Every variant found exactly the same divisor for every candidate as the current code.
+
+## Where the time goes
+Trial division is ~5–7% of runtime (~350 ns per candidate × 1.59M candidates ≈ 0.56 s of ~8 s single-threaded). With primes 3..1151 there are 189 primes in 27 chunks, and ~70% of candidates survive every chunk. So the cost is about 27 chunk remainders plus 189 per-prime tests per candidate, and the **chunk remainders dominate**:
+- one remainder (`mpz_tdiv_ui` of a 3-limb p by a 64-bit chunk product) costs 10.9 ns;
+- one per-prime test costs about one multiply and compare.
+
+## GMP recomputes the reciprocal on every call (adopt, after a portability decision)
+`mpz_tdiv_ui` calls `mpn_mod_1`. For a single-limb divisor this computes the divisor's normalisation, its reciprocal (`invert_limb`) and, for the folding variants, B^k mod b (`mpn_mod_1_1p_cps` etc.) on **every call**, then discards them. Nothing is cached, although the same 27 chunk products are used for every candidate. GMP exports routines that take the constants precomputed (`__gmpn_mod_1_1p_cps`/`__gmpn_mod_1_1p`, `__gmpn_mod_1s_2p`, `__gmpn_preinv_mod_1`), but they are declared only in the internal `gmp-impl.h`.
+
+| Chunk remainder | Per remainder |
+|---|---|
+| `mpz_tdiv_ui` (current) | 10.9 ns |
+| `mpn_mod_1` | 8.8 ns (so ~2 ns of `mpz_tdiv_ui` is mpz overhead) |
+| GMP `mod_1_1p`, constants precomputed per chunk | **2.8 ns** |
+| GMP `mod_1s_2p`, precomputed | 2.9 ns |
+| Inline Möller–Granlund 2-by-1 (`udiv_rnnd_preinv`), normalised divisor and reciprocal precomputed | 3.6 ns |
+
+So ~6 ns of the 8.8 ns is recomputing the constants. Full trial division drops from 344–354 ns to **142 ns per candidate** with GMP's routine (2.5×), or 171–176 ns with the inline version (2×).
+
+**End to end** (`td_precomputed_mod_1_1p.diff`, single-threaded, alternating, 3 rounds, load 2–3):
+
+| `TRIAL_DIVISION_MAX_PRIME` | Change vs current | Trial-division composites | Fermat composites |
+|---|---|---|---|
+| 1151 (current method) | 0 | 480,511 | 998,538 |
+| 1151, precomputed | −2 to −3% | 480,511 | 998,538 |
+| 1601 | −3 to −5% | 529,619 | 949,430 |
+| 2003 | −3 to −5% | 560,175 | 918,874 |
+| 2503 | −3 to −5% | 589,189 | 889,860 |
+| 3001 | −4 to −5% (best) | 611,966 | 867,083 |
+| 4001 | −4 to −5% | 645,012 | 834,037 |
+| 6007 | about −3% | 688,775 | |
+| 10007 | about 0% | 739,343 | |
+
+Fermat survivors (114,064), certified primes and everything after them were identical in every run, and the trial-division and Fermat composites always sum to 1,479,049. The gain levels off because the chance that a prime r divides p falls like 1/r, while each extra chunk (4–5 primes of 12–13 bits) costs ~3 ns more per candidate.
+
+Limits above 4001 need `MAX_TRIAL_DIVISION_CHUNKS` raised from 128 (4001 gives 97 chunks).
+
+## Portable folding remainder (prototype, recommended)
+**Why my first inline version was slower than GMP's.** It does schoolbook division: shift p's three limbs, then three *dependent* Möller–Granlund 2-by-1 steps. That chain is about six multiplies deep. GMP's `mod_1_1p` (generic C, disassembled from the Homebrew arm64 build) instead folds the high limbs using precomputed B mod b and B² mod b, then does a single 2-by-1 step, about three multiplies deep. Copying GMP's source into this MIT-licensed repository would make the copied code LGPL v3+/GPL v2+, so we implemented the folding from our own derivation instead.
+
+**Folding** (`experimental/trial_division/td.cpp`, `fold_mod3`; prototype `td_folding.diff`, `trial_division::remainder_3`). Let x = n₂B² + n₁B + n₀ with B = 2⁶⁴, and let d ≥ 2 be a chunk product. Precompute once per chunk:
+- c₁ = B mod d and c₂ = B² mod d;
+- s = clz(d) and d_n = d·2^s;
+- the Möller–Granlund reciprocal v = ⌊(B² − 1)/d_n⌋ − B, by one 128-bit division at startup (no GMP internals).
+
+Then:
+1. **Fold the top limb:** T = (n₁:n₀) + n₂·c₂ ≡ x (mod d). Since n₂c₂ ≤ (B−1)(d−1), we have T < B² + (B−1)(d−1). On a carry out of B², use B² ≡ c₂ (mod d): T′ = T − B² ≤ (B−1)(d−1) − 1, and T′ + c₂ < B·d ≤ B², so adding c₂ back cannot carry again. This is done branch-free.
+2. **Fold the high limb:** U = T_hi·c₁ + T_lo ≡ T. Then U ≤ (B−1)(d−1) + (B−1) = (B−1)d < B·d, so U_hi < d.
+3. **One 2-by-1 step:** U·2^s < B·d_n, so its high limb is below d_n, which is what the step requires. Apply one step (Möller and Granlund 2011, Alg. 4) by d_n and shift the remainder right by s.
+
+This holds for any d ≥ 2 and any 3-limb x; p of more limbs falls back to `mpz_tdiv_ui`. The critical path is about four multiplies deep.
+
+**Results:**
+- **Correctness:**
+  - `make test` checks it against GMP on 2,385 divisors (edge cases including d = 2, 2⁶³ ± 1 and 2⁶⁴ − 1; every chunk product for limits 1151, 4001 and 10007; random d) with 5.5M inputs (all-ones and other edge limbs, random): 0 mismatches.
+  - The debug build of the prototype asserts every remainder against `mpz_tdiv_ui`. A full OMEGA=33 run with 8 threads had no assertion failures and identical results.
+- **Speed:** 2.46 ns per remainder, against 2.93 ns for GMP's precomputed `mod_1_1p` and 10.9 ns for `mpz_tdiv_ui`. Full trial division takes 137.5 ns per candidate (GMP's: 142 ns; current: 343 ns).
+- **End to end** (single-threaded, alternating, 3 rounds; load started at 6, so differences under ~2% are noise):
+
+  | Version | Single-threaded | Change |
+  |---|---|---|
+  | Current | 8.68–8.87 s | 0 |
+  | Folding at 1151 | 8.40–8.45 s | −3.5% |
+  | Folding at 2003 | 8.23–8.37 s | about −5% |
+  | Folding at 3001 | 8.21–8.36 s | about −5% |
+
+  With 8 threads, at 3001: 1.61–1.62 s → 1.53–1.55 s. All key lines were identical in every run.
+
+**Before adopting:** the batched Fermat test (18/10/26) makes Fermat ~1.4× cheaper, which moves the best limit back down, so re-tune the limit after both changes are in. This version uses no GMP internals, so it does not depend on which GMP the cluster provides. The run header already prints the runtime GMP version (`main.cpp`).
+
+## Sources for the folding reduction
+The congruence behind folding is elementary: if x = Σ xᵢBⁱ, then x ≡ Σ xᵢ·(Bⁱ mod d) (mod d). It is the same idea as the divisibility tests for 9 and 11 (10 ≡ ±1). The engineering, i.e. precomputing Bᵏ mod d once and folding a wide value into a narrower one with the same remainder, has these published sources:
+- **W. Hasenplaugh, G. Gaubatz and V. Gopal, "Fast Modular Reduction", Proc. 18th IEEE Symposium on Computer Arithmetic (ARITH-18), Montpellier, 2007, pp. 225–229, doi:10.1109/ARITH.2007.18.** This is the primary source for "folding": a 2m-word N is replaced by N′ = N_H·(2^f mod M) + N_L with 2^f mod M precomputed, and N′ ≡ N (mod M). They fold twice, then finish with Barrett reduction. Our `remainder_3` has the same structure, with a Möller–Granlund 2-by-1 step instead of Barrett.
+- **R. P. Brent and P. Zimmermann, *Modern Computer Arithmetic*, Cambridge University Press, 2010** (free author PDF, version 0.5.9, from Brent's ANU page).
+  - §1.4.6: Svoboda's algorithm, which reduces with a precomputed multiple of the divisor when the remainder is wanted for many divisions by the same divisor.
+  - §2.4.2: generalises this to repeated "folding", with Table 2.2 comparing 1-, 2- and 3-folding.
+  - §2.9 (Notes and references): attributes the folding optimisation to Hasenplaugh, Gaubatz and Gopal [118].
+
+  Read directly (pp. 23 and 62–63 and the Chapter 2 notes of the 0.5.9 PDF).
+- **GMP's implementation:** `mpn/generic/mod_1_1.c` (Granlund and Möller) and `mod_1_4.c` (Granlund), both "Based on a suggestion by Peter L. Montgomery" (header comments, read in the official 6.3.0 release). They give no paper reference.
+- **The final 2-by-1 step:** N. Möller and T. Granlund, "Improved division by invariant integers", *IEEE Trans. Computers* 60(2), 2011, pp. 165–175, Alg. 4 and Theorem 2. This paper covers 2-by-1 and 3-by-2 division and n-by-1 division by repeated 2-by-1 steps, **not** folding. Its reference [4] (Granlund and Möller, "Division of integers large and small", 2009, "to appear") could not be found in print.
+
+**Patent (checked 19/10/26, not legal advice).** The folding technique was patented by Intel:
+- US 8,229,109 B2, "Modular reduction using folding" (Hasenplaugh, Gaubatz, Gopal; filed 2006-06-27, granted 2012-07-24). Its claims describe precomputing 2^f mod M and folding twice before a final reduction.
+- Google Patents lists it as **lapsed for non-payment of maintenance fees** (effective 2020-07-24).
+- Every family member is listed as expired, withdrawn or ceased: CN101097511B, EP2033357A2 (withdrawn), WO2008002828 (ceased), KR101062558B1, JP5116770B2, JP5378579B2 and TWI350094B. There is no Australian family member.
+
+So the technique is free to use.
+
+## Failed ideas
+- **libdivide instead of Granlund–Montgomery: slower.**
+
+  | Per-prime test (same inline remainder) | Full trial division |
+  |---|---|
+  | Granlund–Montgomery | 171–176 ns per candidate |
+  | `x % r` | 205–210 ns |
+  | libdivide, branchy | 247–252 ns |
+  | libdivide, branch-free | 274–306 ns |
+
+  With `mpz_tdiv_ui`, libdivide branch-free gives 454 ns against 344–354 ns. libdivide has no divisibility test: it computes the quotient (a high multiply, a shift and, branchy, a branch on the algorithm type), so divisibility needs a further `q * r == x`, i.e. two dependent multiplies. Granlund–Montgomery needs one multiply and one compare, the minimum for an odd divisor.
+- **Lemire's direct remainder / divisibility test: slower.**
+  - The paper's 25–50% gains are for **32-bit** operands on 64-bit hardware: with n < 2^32 and c = ⌈2^64/d⌉, d | n ⟺ n·c mod 2^64 ≤ c − 1 is one 64-bit multiply. For *even* divisors it beats the modular-inverse (Granlund–Montgomery) test, which then needs an extra rotate. Our divisors are odd, so Granlund–Montgomery is already one multiply and one compare.
+  - Our remainders are **64-bit** chunk remainders. Lemire's test then needs a 128-bit c and a 64 × 128-bit product: 267–280 ns per candidate against 171–176 ns (with `mpz_tdiv_ui`: 476–500 ns against 344–354 ns).
+  - Packing into 32-bit sub-chunks so that Lemire's 32-bit test applies costs a hardware divide per sub-chunk: 217 ns.
+  - The direct remainder (fastmod) is no help either: only divisibility is needed, and the expensive step is the multi-limb chunk remainder, which Lemire's method does not address.
+- **No chunks at all: slower.** p mod r computed directly for each prime, by folding p's six 32-bit words with precomputed 2^(32i) mod r and then applying Granlund–Montgomery to the < 2^47 sum: 251 ns. Six multiplies per prime outweigh one 3-ns remainder per 5–7 primes.
+- **Much higher trial-division limits:** no further gain past ~4001, as above (10007 is back to the current speed). This agrees with 18/10/26: a batch remainder tree up to 2^16 would also cost about as much as the Fermat tests it removes.
+
+## Adopted: folding remainder in `src/` (uncommitted, 19/10/26)
+**Changes:**
+- `src/trial_division.hpp`: `Chunk` gains c₁, c₂, d_n, v and the shift, set by `set_remainder_constants` in `build`; `remainder_3` is the folding remainder.
+- `verify` (run at startup, also in release builds) now also recomputes every chunk's constants and checks `remainder_3` on 343 edge-case inputs per chunk against Horner's rule in 128-bit arithmetic.
+- `src/primality.cpp`: `is_composite_small_prime` uses `remainder_3` for p of up to 3 limbs and `mpz_tdiv_ui` otherwise. Debug builds assert every remainder against `mpz_tdiv_ui`.
+- `TRIAL_DIVISION_MAX_PRIME` is unchanged (1151), so the per-chunk statistics are directly comparable.
+
+**Correctness:**
+- **`remainder_3` against GMP** (a standalone test including `src/trial_division.hpp`): 12,014,200 remainders over 5,588 divisors, 0 mismatches. The divisors were edge cases (2, 3, 2³² ± …, 2⁶³ ± 1, 2⁶⁴ − 1, …), every chunk product for limits 3–10007, and 5,000 random d. The inputs were edge limbs, random limbs, and values qd, qd + 1 and qd + d − 1.
+- **`verify`** passes on all 9 tables. Mutation check: 15 of 15 deliberately corrupted constants (c₁, c₂, v, d_n, shift) were caught.
+- **Full runs against a reference build of `2aca1ee`** (`git archive`): the **entire** search summary was identical, including every per-chunk trial-division line, the Jacobi and power-tree counts and both winner histograms, as were the producer's DFS and Cor 4 counts and the exit codes. Modes:
+  - `--single`;
+  - `--parallel --threads 2` and `--threads 8`;
+  - the debug build with 8 threads (every remainder asserted);
+  - `--dry-run`;
+  - S=29 with 8 threads;
+  - `--config config/omega33.conf`.
+- **Debug runs at OMEGA = 32, 31 and 30** (8 threads, 60 s each, stopped by SIGTERM): 28.0M candidates, 0 assertion failures, 0 Grosswald failures.
+- **Builds:** clang (release and debug) and GCC 15 (`-Wall -Wextra -Wpedantic`), with no warnings.
+
+**Speed** (alternating with the reference build; another process had pushed the load average to ~36 when the timings started):
+
+| Run | `2aca1ee` | Folding | Change |
+|---|---|---|---|
+| Single-threaded | 7.56–7.66 s | 7.29–7.38 s | −3.5% |
+| 8 threads | 1.38–1.40 s (CPU 10.2 s) | 1.33 s (CPU 9.65 s) | −4.5% (CPU −5%) |
+| S=29, 8 threads | 44.8–45.4 s (CPU 324–327 s) | 43.3–44.1 s (CPU 307–313 s) | −3% (CPU −5%) |
+
+The prototype measurements (above) suggest a further ~1.5% from raising `TRIAL_DIVISION_MAX_PRIME` to ~2000–3000. That is left for when the limit is re-tuned together with batched Fermat.
+

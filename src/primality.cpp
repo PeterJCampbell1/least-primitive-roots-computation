@@ -16,8 +16,10 @@ namespace {
 
 /* ---------- perfect powers ---------- */
 
-// If g = a^m (m >= 2) is a primitive root then so is a < g, since ord(a^m) divides
-// ord(a). So a perfect power is never the least primitive root and is skipped.
+/**
+ * If g = a^m (m >= 2) is a primitive root then so is a < g, since ord(a^m) divides
+ * ord(a). So a perfect power is never the least primitive root and can be skipped.
+ **/
 constexpr std::array<bool, parameters::PRIMITIVE_ROOT_SEARCH_LIMIT + 1> make_perfect_power_table() {
     std::array<bool, parameters::PRIMITIVE_ROOT_SEARCH_LIMIT + 1> table{};
     for (std::uint64_t a = 2; a * a <= parameters::PRIMITIVE_ROOT_SEARCH_LIMIT; ++a) {
@@ -34,59 +36,89 @@ constexpr auto IS_PERFECT_POWER = make_perfect_power_table();
 
 using ProductTree = std::array<mpz_class, parameters::MAX_TREE_SIZE>;
 
-/*
- * Builds the product tree over the odd primes prime_divisors[left, right):
- * leaves hold single primes, internal nodes the product of their children.
- * Nodes are stored heap-style (children of i at 2i+1 and 2i+2) and split with
- * complete_tree_left_size, so the tree is complete and its leaves are visited
- * in increasing order of their primes by advance_to_next_leaf.
+/* TODO - EDIT
+ * Number of leaves in the left subtree of a complete binary tree with n >= 2 leaves.
  *
- * Example: prime divisors [2, 3, 5, 7, 11, 13] (2 is excluded):
+ * The power tree is stored heap-style (children of node i at 2i+1 and 2i+2) and
+ * advance_to_next_leaf identifies leaves by "2i+1 >= TREE_SIZE". Both are valid
+ * only for a COMPLETE binary tree: every level full except the last, which is
+ * filled from the left, so that the n leaves occupy exactly the last n slots.
+ * Splitting each range in half (balanced) is not enough: e.g. n = 6 would split
+ * 3/3 and leave a gap in the bottom level, whereas the complete tree splits 4/2.
  *
- *            (3,5,7,11,13)
- *        (3,5,7)       (11,13)
- *     (3,5)    7      11     13
+ * With h = ceil(log2 n), the bottom level holds b = 2(n - 2^(h-1)) leaves, filled
+ * from the left. If b >= 2^(h-1) (half the bottom level), the left subtree is
+ * full: 2^(h-1) leaves. Otherwise all b bottom leaves are in the left subtree:
+ * of its 2^(h-2) nodes on level h-1, b/2 are parents of two bottom leaves and
+ * the rest are leaves, giving 2^(h-2) + b/2 = n - 2^(h-2) leaves.
+ * Hence left = min(n - 2^(h-2), 2^(h-1)).
+ * For n a power of two this is n/2; for 31 leaves (omega = 32) it is 16.
+ */
+std::size_t complete_tree_left_size(std::size_t n) {
+    assert(n >= 2);
+    if (n == 2) {
+        return 1;
+    }
+
+    // Note: __builtin_clzll counts the number of leading bits of it's input.
+    // This implements ceil(log2 n) exactly (we use this as C++17 doesn't have std::bit_width - TODO move to C++20)
+    const unsigned h = 64 - static_cast<unsigned>(__builtin_clzll(n - 1)); // ceil(log2 n)
+    return std::min<std::size_t>(n - (std::size_t{1} << (h - 2)), std::size_t{1} << (h - 1));
+}
+
+
+/**
+ * Builds the binary product tree over the odd primes support[left, right) via a
+ * post-order traversal.
+ *
+ * Leaves hold individual primes.
+ * Internal nodes store the product of their children.
+ *
+ * The product tree is implemented as a complete tree, and hence an array-based
+ * representation is used (given node at index i, node.left is at index 2i+1 and
+ * node.right is at index 2i+2). The helper function complete_tree_left_size helps
+ * ensure the tree is complete.
+ *
+ * Primes are stored in increasing order along an in-order traversal. 
+ *
+ * Example: support = [2, 3, 5, 7, 11, 13] (2 is excluded from the product tree):
+ *
+ *            (3*5*7*11*13)
+ *        (3*5*7)       (11*13)
+ *     (3*5)    7      11     13
  *    3     5
  *
- * stored as [(3,5,7,11,13), (3,5,7), (11,13), (3,5), 7, 11, 13, 3, 5].
+ * stored as [3*5*7*11*13, 3*5*7, 11*13, 3*5, 7, 11, 13, 3, 5].
+ *
+ * The product tree is constructed via a post-order traversal.
  */
 void build_product_tree(
     ProductTree& product_tree,
-    const unsigned* prime_divisors,
+    const unsigned* support,
     std::size_t node,
     std::size_t left,
     std::size_t right // Exclusive
 ) {
-    if (right - left == 1) { // Leaf: a single prime
-        product_tree[node] = prime_divisors[left];
+    /* Leaf node */
+    if (right - left == 1) {
+        product_tree[node] = support[left];
         return;
     }
+
+    /* Internal node */
     const std::size_t left_child = 2*node + 1;
     const std::size_t right_child = 2*node + 2;
     const std::size_t mid = left + complete_tree_left_size(right - left);
-    build_product_tree(product_tree, prime_divisors, left_child, left, mid);
-    build_product_tree(product_tree, prime_divisors, right_child, mid, right);
-    mpz_mul(product_tree[node].get_mpz_t(), product_tree[left_child].get_mpz_t(),
-            product_tree[right_child].get_mpz_t());
-}
 
-// Mirrors build_product_tree on indices only (see power_tree_layout_is_valid)
-bool check_tree_layout(std::size_t node, std::size_t left, std::size_t right,
-                       std::size_t tree_size, std::size_t& next_leaf) {
-    if (node >= tree_size) {
-        return false; // Index outside the tree
-    }
-    const bool traversal_sees_leaf = (2*node + 1 >= tree_size);
-    if (right - left == 1) {
-        // A real leaf: the traversal must see a leaf, and leaves come in increasing order
-        return traversal_sees_leaf && left == next_leaf++;
-    }
-    if (traversal_sees_leaf) {
-        return false; // Internal node mistaken for a leaf
-    }
-    const std::size_t mid = left + complete_tree_left_size(right - left);
-    return check_tree_layout(2*node + 1, left, mid, tree_size, next_leaf)
-        && check_tree_layout(2*node + 2, mid, right, tree_size, next_leaf);
+    build_product_tree(product_tree, support, left_child, left, mid);
+    build_product_tree(product_tree, support, right_child, mid, right);
+
+    // node = node.left * node.right
+    mpz_mul(
+        product_tree[node].get_mpz_t(), 
+        product_tree[left_child].get_mpz_t(),
+        product_tree[right_child].get_mpz_t()
+    );
 }
 
 /* ---------- power tree ---------- */
@@ -283,7 +315,46 @@ bool context_matches(const lpr::mont3::Context& context, const mpz_class& p) {
 }
 #endif
 
-} // namespace
+} // anonymous namespace
+
+/* ---------- testing infrastructure ---------- */
+
+namespace testing {
+
+// Mirrors build_product_tree on indices only (see power_tree_layout_is_valid)
+bool check_tree_layout(std::size_t node, std::size_t left, std::size_t right,
+                       std::size_t tree_size, std::size_t& next_leaf) {
+    if (node >= tree_size) {
+        return false; // Index outside the tree
+    }
+    const bool traversal_sees_leaf = (2*node + 1 >= tree_size);
+    if (right - left == 1) {
+        // A real leaf: the traversal must see a leaf, and leaves come in increasing order
+        return traversal_sees_leaf && left == next_leaf++;
+    }
+    if (traversal_sees_leaf) {
+        return false; // Internal node mistaken for a leaf
+    }
+    const std::size_t mid = left + complete_tree_left_size(right - left);
+    return check_tree_layout(2*node + 1, left, mid, tree_size, next_leaf)
+        && check_tree_layout(2*node + 2, mid, right, tree_size, next_leaf);
+}
+
+bool power_tree_layout_is_valid(
+    std::size_t leaves
+) {
+    if (leaves < 2) {
+        return false;
+    }
+    const std::size_t tree_size = 2*leaves - 1;
+    if (tree_size > parameters::MAX_TREE_SIZE) {
+        return false;
+    }
+    std::size_t next_leaf = 0;
+    return check_tree_layout(0, 0, leaves, tree_size, next_leaf) && next_leaf == leaves;
+}
+
+} // namespace lpr::primality::testing
 
 /* ---------- public interface ---------- */
 
@@ -291,12 +362,15 @@ bool context_matches(const lpr::mont3::Context& context, const mpz_class& p) {
  * Trial division by the primes of the trial division table (trial_division.hpp).
  *
  * For each chunk (consecutive primes whose product fits in 64 bits) we compute
- * rem = p mod product with one multi-limb by single-limb division. Each prime r of
+ * rem = p mod product with trial_division::remainder_3 (folding with constants
+ * precomputed per chunk; mpz_tdiv_ui for p of more than 3 limbs). Each prime r of
  * the chunk divides p iff it divides rem, which the Granlund-Montgomery test
  * decides with one multiplication and one comparison (no division). Chunks are
  * tested smallest primes first and we return at the first divisor found.
  **/
-bool is_composite_small_prime(const mpz_class& p) {
+bool is_composite_small_prime(i
+    const mpz_class& p
+) {
     assert(p >= 3);
     static_assert(sizeof(unsigned long) == sizeof(std::uint64_t),
                   "mpz_tdiv_ui must take a 64-bit divisor");
@@ -304,10 +378,16 @@ bool is_composite_small_prime(const mpz_class& p) {
     auto& stats = lpr::stats::get_thread_local_stats();
     const auto& table = lpr::trial_division::table();
 
+    // p's limbs: remainder_3 handles up to 3 (p < 2^192), larger p use mpz_tdiv_ui
+    const std::size_t size = mpz_size(p.get_mpz_t());
+    const mp_limb_t* limbs = mpz_limbs_read(p.get_mpz_t());
+    const std::uint64_t n0 = size > 0 ? limbs[0] : 0, n1 = size > 1 ? limbs[1] : 0, n2 = size > 2 ? limbs[2] : 0;
     for (std::size_t k = 0; k < table.chunks.size(); ++k) {
         const auto& chunk = table.chunks[k];
         // p mod (product of the chunk's primes)
-        const std::uint64_t rem = mpz_tdiv_ui(p.get_mpz_t(), chunk.product);
+        const std::uint64_t rem = size <= 3 ? lpr::trial_division::remainder_3(n0, n1, n2, chunk)
+                                            : mpz_tdiv_ui(p.get_mpz_t(), chunk.product);
+        assert(rem == mpz_tdiv_ui(p.get_mpz_t(), chunk.product)); // Debug builds: exact cross-check
         for (std::size_t j = chunk.first; j < chunk.first + chunk.count; ++j) {
             const auto& t = table.tests[j];
             // Granlund-Montgomery: r | rem  <=>  rem * r^{-1} (mod 2^64) <= floor((2^64 - 1) / r)
@@ -374,43 +454,5 @@ std::optional<unsigned> find_least_primitive_root(
     return search(p, d, prime_divisors, omega, product_tree, backend);
 }
 
-/*
- * Number of leaves in the left subtree of a complete binary tree with n >= 2 leaves.
- *
- * The power tree is stored heap-style (children of node i at 2i+1 and 2i+2) and
- * advance_to_next_leaf identifies leaves by "2i+1 >= TREE_SIZE". Both are valid
- * only for a COMPLETE binary tree: every level full except the last, which is
- * filled from the left, so that the n leaves occupy exactly the last n slots.
- * Splitting each range in half (balanced) is not enough: e.g. n = 6 would split
- * 3/3 and leave a gap in the bottom level, whereas the complete tree splits 4/2.
- *
- * With h = ceil(log2 n), the bottom level holds b = 2(n - 2^(h-1)) leaves, filled
- * from the left. If b >= 2^(h-1) (half the bottom level), the left subtree is
- * full: 2^(h-1) leaves. Otherwise all b bottom leaves are in the left subtree:
- * of its 2^(h-2) nodes on level h-1, b/2 are parents of two bottom leaves and
- * the rest are leaves, giving 2^(h-2) + b/2 = n - 2^(h-2) leaves.
- * Hence left = min(n - 2^(h-2), 2^(h-1)).
- * For n a power of two this is n/2; for 31 leaves (omega = 32) it is 16.
- */
-std::size_t complete_tree_left_size(std::size_t n) {
-    assert(n >= 2);
-    if (n == 2) {
-        return 1;
-    }
-    const unsigned h = 64 - static_cast<unsigned>(__builtin_clzll(n - 1)); // ceil(log2 n)
-    return std::min<std::size_t>(n - (std::size_t{1} << (h - 2)), std::size_t{1} << (h - 1));
-}
-
-bool power_tree_layout_is_valid(std::size_t leaves) {
-    if (leaves < 2) {
-        return false;
-    }
-    const std::size_t tree_size = 2*leaves - 1;
-    if (tree_size > parameters::MAX_TREE_SIZE) {
-        return false;
-    }
-    std::size_t next_leaf = 0;
-    return check_tree_layout(0, 0, leaves, tree_size, next_leaf) && next_leaf == leaves;
-}
-
 } // namespace lpr::primality
+

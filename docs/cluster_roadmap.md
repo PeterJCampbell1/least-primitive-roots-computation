@@ -17,8 +17,8 @@ Everything needed to run on a cluster **without** a parallel producer. Items are
 - $s = 29$: 43,601,360 supports, 3,605,989 certified, largest root 502.
 
 ### 1. Linux build fixes (small)
-- **`always_inline` without `inline`.** `dfs_iter_` (`src/generate_supports.hpp`) is declared `__attribute__((always_inline))` without `inline`, and GCC warns *"'always_inline' function might not be inlinable unless also declared 'inline' [-Wattributes]"*. Add `inline`.
-- **LTO with GCC.** GCC prints *"lto-wrapper: warning: using serial compilation of 2 LTRANS jobs"* with plain `-flto`. Use `-flto=auto` when the compiler is GCC.
+- **`always_inline` without `inline`.** `dfs_iter_` (`src/generate_supports.hpp`) is declared `__attribute__((always_inline))` without `inline`, and GCC warns *"'always_inline' function might not be inlinable unless also declared 'inline' [-Wattributes]"*. Add `inline`. **Done (17/10/26 clean-up).**
+- **LTO with GCC.** GCC prints *"lto-wrapper: warning: using serial compilation of 2 LTRANS jobs"* with plain `-flto`. **Done (20/10/26):** the Makefile uses `-flto=auto`, which GCC runs as parallel LTO jobs (no warning). Clang treats it as `-flto=full`, the same as plain `-flto`: Apple clang produced a byte-identical binary.
 - **Thread count from the CPU affinity mask.** On a cluster node `std::thread::hardware_concurrency()` reports **every** core on the node, not the job's allocation. If `SLURM_CPUS_PER_TASK` is unset (e.g. `srun` without `--cpus-per-task`), `--parallel` would start far too many threads. On Linux, count the CPUs allowed by `sched_getaffinity`, which respects Slurm's cpuset/cgroup limits. Fall back to `hardware_concurrency()` elsewhere (macOS), and report the source in the run header ("CPU affinity mask").
 
 ### 2. GMP on the cluster (the largest performance lever)
@@ -27,6 +27,20 @@ Everything needed to run on a cluster **without** a parallel producer. Items are
 - Then `make GMP_PREFIX=$HOME/opt/gmp`, and at runtime either set `LD_LIBRARY_PATH=$HOME/opt/gmp/lib` in the Slurm script or link GMP statically.
 - Benchmark the module GMP against the self-built one on the same node with `--single` at $\omega = 33$.
 - Add a `scripts/build_gmp.sh` helper and README notes.
+
+### 2b. Compare compilers on small cases before long runs
+On the M2, GCC 15.2 was about 4–7% faster than Apple clang 16 on consumer work: single-threaded CPU time 6.84–6.93 s against 7.10–7.27 s, and 8.9 s against 9.6 s with 8 threads. Both gave identical results. Clang was ~15% slower without LTO, while GCC was not. Apple clang on ARM says little about upstream clang on the cluster's x86-64 CPUs, so **measure on the cluster with small cases** before committing a long run to one toolchain:
+- **Builds:** on one compute node, build with the default GCC module and with an LLVM/Clang module:
+  - GCC: `make`;
+  - Clang: `make CXX=clang++ LDFLAGS+=-fuse-ld=lld`. LTO with clang needs a linker that understands LLVM bitcode; without lld, LTO fails or is silently lost.
+  - Use a GMP built with the same toolchain family. Clang on Linux uses GCC's libstdc++ by default, which matches a GCC-built `libgmpxx`; do not add `-stdlib=libc++`.
+- **Small test cases** (seconds to minutes):
+  - `--single` and `--parallel --threads 8` at OMEGA=33, S=30;
+  - `--dry-run`;
+  - OMEGA=33, S=29 with the job's thread count.
+- **Check:** search summaries must be identical across compilers (and to the laptop's). Compare CPU time (`/usr/bin/time`, user) and wall time, alternating builds, 3 runs each.
+- **Optionally:** `-march=native` (or `-march=znver3`/`znver4` for Bunya's Milan/Genoa nodes) with each compiler. It may matter more on x86 (MULX/ADX) than it did on the M2 (no gain). Build on, and run on, the same node type.
+- **Re-run** whenever the GMP build, compiler version or node type changes. The run header records the compiler and GMP version.
 
 ### 3. Size jobs to the single producer
 - At $\omega = 33$ the producer alone (`--dry-run`) takes 1.14 s, against about 14.7 s of consumer CPU time, so one producer can keep only about **14 threads** busy. Co-processing does not raise this: once the producer is busy producing, nothing else generates supports.
@@ -81,6 +95,7 @@ $\omega = 32$ takes about 6 h on 8 threads, and even at the 14-thread ceiling th
 1. Commit the current work: `git add` the `Makefile`, `src/cli.hpp`, `src/logging.hpp`, `scripts/`, the new docs and `CLAUDE.md`.
 2. On the cluster:
    - load a compiler and GMP (`module load gcc gmp`), or build GMP locally and use `make GMP_PREFIX=...`;
+   - compare compilers (and GMP builds) on the small cases of item 2b before choosing the toolchain for long runs;
    - fill in the `#SBATCH` placeholders;
    - run OMEGA=33 and check the summary matches the laptop run (1,343,862 supports, 114,064 certified, largest root 454).
 3. **Measure scaling, to decide whether the parallel producer is needed:**

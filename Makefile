@@ -14,7 +14,9 @@ GIT_COMMIT := $(shell git describe --always --dirty 2>/dev/null || echo unknown)
 
 CXXFLAGS   := -std=c++17 -Wall -Wextra -DLPR_GIT_COMMIT='"$(GIT_COMMIT)"'
 LDLIBS     := -lgmpxx -lgmp
-LTOFLAGS   := -flto
+# GCC: parallel LTO link jobs (silences "using serial compilation of N LTRANS jobs").
+# Clang treats -flto=auto as full LTO (-flto=full), the same as plain -flto.
+LTOFLAGS   := -flto=auto
 
 ifeq ($(UNAME_S),Darwin)
     # Homebrew GMP (Apple Silicon default /opt/homebrew)
