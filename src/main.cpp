@@ -3,6 +3,7 @@
 #include "parameters.hpp"
 #include "corollary4.hpp"
 #include "generate_supports.hpp"
+#include "work_stealing.hpp"
 #include "process_support.hpp"
 #include "cli.hpp"
 #include "config.hpp"
@@ -96,11 +97,12 @@ std::string hostname() {
     return name;
 }
 
-// One line of key=value progress fields from a statistics snapshot
+// One line of key=value progress fields from a statistics snapshot. `mode_fields`
+// are the mode's live fields (queue length, or workers holding a region).
 std::string progress_line(
     const lpr::stats::Counters& s,
     double supports_per_second,
-    const std::optional<std::size_t>& queue_size
+    const std::string& mode_fields
 ) {
     std::ostringstream out;
     out << "progress:"
@@ -113,10 +115,12 @@ std::string progress_line(
         << " failed=" << s.certified_inequality_fail_count
         << " unresolved=" << s.unresolved_count
         << " largest_g=" << s.largest_least_primitive_root
-        << " queue=" << (queue_size ? std::to_string(*queue_size) : std::string("-"))
+        << ' ' << mode_fields
         << " coprocessed=" << s.batches_coprocessed
         << " consumer_waits=" << s.consumer_waits
         << " consumer_wait_s=" << std::setprecision(1) << s.consumer_wait_ns / 1e9
+        << " regions_split=" << s.regions_split
+        << " idle_s=" << std::setprecision(1) << s.worker_idle_ns / 1e9
         << " position=" << lpr::producer::dfs_position_string();
     return out.str();
 }
@@ -131,8 +135,8 @@ public:
     Monitor(
         unsigned log_interval,
         std::chrono::steady_clock::time_point start,
-        std::function<std::optional<std::size_t>()> queue_size
-    ) : log_interval_(log_interval), start_(start), queue_size_(std::move(queue_size)) {
+        std::function<std::string()> mode_fields
+    ) : log_interval_(log_interval), start_(start), mode_fields_(std::move(mode_fields)) {
         thread_ = std::thread([this]() { run(); });
     }
 
@@ -155,7 +159,7 @@ public:
 private:
     unsigned log_interval_;
     std::chrono::steady_clock::time_point start_;
-    std::function<std::optional<std::size_t>()> queue_size_;
+    std::function<std::string()> mode_fields_;
     std::mutex mutex_;
     std::condition_variable cv_;
     bool stop_ = false;
@@ -183,7 +187,7 @@ private:
                 const lpr::stats::Counters snapshot = lpr::stats::get_master_stats().snapshot();
                 const double seconds = std::chrono::duration<double>(now - last_log).count();
                 const double rate = (snapshot.total_support_count - last_processed) / seconds;
-                lpr::log::info(progress_line(snapshot, rate, queue_size_()));
+                lpr::log::info(progress_line(snapshot, rate, mode_fields_()));
                 last_processed = snapshot.total_support_count;
                 last_log = now;
             }
@@ -198,7 +202,7 @@ private:
         const std::string notice = "INTERRUPTED by signal " + std::to_string(sig)
             + " after " + std::to_string(elapsed) + " s: partial run, nothing has been verified";
         lpr::log::info(notice);
-        lpr::log::info(progress_line(snapshot, 0.0, queue_size_()));
+        lpr::log::info(progress_line(snapshot, 0.0, mode_fields_()));
 
         std::cout << '\n' << notice << '\n'
                   << "DFS position: " << lpr::producer::dfs_position_string() << "\n\n";
@@ -286,6 +290,12 @@ int main(int argc, char* argv[])
         lpr::trial_division::set_table(std::move(table));
     }
     const std::size_t OMEGA = search.omega;
+    if (options.steal_max_prefix > OMEGA) {
+        std::cerr << "Error: --steal-max-prefix must be between 1 and omega = " << OMEGA
+                  << " (got " << options.steal_max_prefix << ")\n";
+        return 2;
+    }
+    const std::size_t steal_max_prefix = options.steal_max_prefix > 0 ? options.steal_max_prefix : OMEGA;
 
     const RunMode mode = options.mode;
     switch (mode) {
@@ -293,7 +303,11 @@ int main(int argc, char* argv[])
         std::cout << "Running single-threaded computation" << '\n' << '\n';
         break;
     case RunMode::Parallel:
-        std::cout << "Running multi-threaded computation" << '\n'
+        std::cout << "Running multi-threaded computation (work stealing)" << '\n'
+                  << "Using: " << options.threads << " threads" << '\n' << '\n';
+        break;
+    case RunMode::ParallelQueue:
+        std::cout << "Running multi-threaded computation (1 producer + consumers)" << '\n'
                   << "Using: " << options.threads << " threads" << '\n' << '\n';
         break;
     case RunMode::DryRun:
@@ -360,9 +374,22 @@ int main(int argc, char* argv[])
     const std::string log_target = options.log_file.empty() ? "stderr" : options.log_file;
     std::cout << "Run:\n"
               << "mode: " << lpr::cli::mode_name(mode) << '\n';
-    if (mode == RunMode::Parallel) {
+    const bool threaded = mode == RunMode::Parallel || mode == RunMode::ParallelQueue
+                          || (mode == RunMode::DryRun && options.threads > 1);
+    if (threaded) {
         std::cout << "threads: " << options.threads
                   << " (from " << lpr::cli::thread_source_name(options.thread_source) << ")\n";
+    }
+    if (options.split_test_interval > 0) {
+        std::cout << "split test: every " << options.split_test_interval << " DFS steps, "
+                  << (options.split_test_fifo ? "fifo" : "lifo") << " work list\n";
+    }
+    if (options.steal_stress) {
+        std::cout << "steal stress: idle workers never back off\n";
+    }
+    if (mode == RunMode::Parallel || (mode == RunMode::DryRun && options.threads > 1)) {
+        std::cout << "split regions while prefix < " << steal_max_prefix << " primes"
+                  << (options.steal_max_prefix > 0 ? " (--steal-max-prefix)" : " (default: omega)") << '\n';
     }
     std::cout << "progress log: ";
     if (options.log_interval == 0) {
@@ -398,7 +425,7 @@ int main(int argc, char* argv[])
     const auto start_time = std::chrono::steady_clock::now();
     lpr::log::set_start(start_time);
     lpr::log::info(std::string("started: mode=") + lpr::cli::mode_name(mode)
-                   + " threads=" + std::to_string(mode == RunMode::Parallel ? options.threads : 1)
+                   + " threads=" + std::to_string(threaded ? options.threads : 1)
                    + " omega=" + std::to_string(OMEGA)
                    + " s=" + std::to_string(search.s)
                    + " commit=" + LPR_GIT_COMMIT);
@@ -406,15 +433,29 @@ int main(int argc, char* argv[])
     std::signal(SIGTERM, on_signal);
     std::signal(SIGINT, on_signal);
 
-    lpr::parallel::JobQueue<> queue; // Only used in parallel mode
+    lpr::parallel::JobQueue<> queue; // Only used in queue mode
+    const bool work_stealing = mode == RunMode::Parallel || (mode == RunMode::DryRun && options.threads > 1);
+    lpr::stealing::Scheduler scheduler(primes, bound, work_stealing ? options.threads : 1, options.steal_stress,
+                                       steal_max_prefix);
     {
-        Monitor monitor(options.log_interval, start_time, [&]() -> std::optional<std::size_t> {
-            if (mode != RunMode::Parallel) return std::nullopt;
-            return queue.size();
+        Monitor monitor(options.log_interval, start_time, [&]() -> std::string {
+            if (mode == RunMode::ParallelQueue) return "queue=" + std::to_string(queue.size());
+            if (work_stealing) return "queue=- active_workers=" + std::to_string(scheduler.active_workers());
+            return "queue=-";
         });
 
-        if (mode == RunMode::DryRun) {
+        if (work_stealing && mode == RunMode::DryRun) {
+            scheduler.run<false>();
+        } else if (work_stealing) {
+            scheduler.run<true>();
+        } else if (mode == RunMode::DryRun && options.split_test_interval > 0) {
+            lpr::producer::generate_supports_split_test<false>(
+                primes, bound, options.split_test_interval, options.split_test_fifo);
+        } else if (mode == RunMode::DryRun) {
             lpr::producer::generate_supports_dry_run(primes, bound);
+        } else if (mode == RunMode::Single && options.split_test_interval > 0) {
+            lpr::producer::generate_supports_split_test<true>(
+                primes, bound, options.split_test_interval, options.split_test_fifo);
         } else if (mode == RunMode::Single) {
             lpr::producer::generate_supports(primes, bound);
         } else {
@@ -448,7 +489,7 @@ int main(int argc, char* argv[])
     lpr::stats::publish_thread_local_stats();
     const lpr::stats::Counters master_stats = lpr::stats::get_master_stats().snapshot();
     lpr::log::info("finished after " + std::to_string(elapsed.count()) + " s");
-    lpr::log::info(progress_line(master_stats, 0.0, std::nullopt));
+    lpr::log::info(progress_line(master_stats, 0.0, "queue=-"));
 
     if (mode == RunMode::DryRun) {
         master_stats.print_producer();

@@ -70,7 +70,7 @@ Always submit from the **login node**. `submit.sh` refuses to run inside a job (
 
 ### Choosing the search: `-a` / `--lpr-args`
 
-These arguments replace the job file's default (`--config config/omega33.conf`). The job adds `--parallel` unless you give a mode yourself. `lpr` accepts only one of `--single`, `--parallel` and `--dry-run`.
+These arguments replace the job file's default (`--config config/omega33.conf`). The job adds `--parallel` (work stealing) unless you give a mode yourself. `lpr` accepts only one of `--single`, `--parallel`, `--parallel-queue` (the previous producer/consumer design) and `--dry-run`.
 
 ```bash
 submit.sh -n w33-s29   -a "--config config/omega33.conf --s 29"        # OMEGA=33, S=29, parallel
@@ -89,7 +89,7 @@ Everything after `--` is passed to `sbatch` and overrides the job file's `#SBATC
 submit.sh -n big -- --cpus-per-task=16 --time=02:00:00 --mem=8G --partition=<p>
 ```
 
-`lpr` takes its thread count from `--cpus-per-task`. With the current single producer, more than about 12–16 threads mostly adds idle consumers at OMEGA=33.
+`lpr` takes its thread count from `--cpus-per-task`. With `--parallel` (work stealing) every thread searches and processes its own part of the tree, so there is no single-producer limit. With `--parallel-queue` (the old design), more than about 12–16 threads mostly adds idle consumers at OMEGA=33.
 
 ### Compiler, flags and PGO
 

@@ -25,7 +25,8 @@
 #   -a, --lpr-args "A"  lpr arguments for this run, replacing the job file's default
 #                       "--config config/omega33.conf", e.g. "--omega 32 --s 29" or
 #                       "--config config/omega33.conf --single". The job adds --parallel
-#                       unless the arguments give a mode (--single, --parallel, --dry-run).
+#                       (work stealing) unless the arguments give a mode (--single,
+#                       --parallel, --parallel-queue, --dry-run).
 #       --no-pull       do not run git pull first
 #       --cxx NAME      compiler for the job's build (default: try clang++, then g++)
 #       --cxxflags "F"  extra compiler flags for the build, e.g. "-march=znver3"

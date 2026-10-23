@@ -45,5 +45,9 @@ namespace parameters {
     // Each thread merges its statistics into the shared totals at most this often
     inline constexpr unsigned STATS_PUBLISH_INTERVAL_MS = 1000;
     inline constexpr size_t HWM = 512;
+
+    // Work stealing (work_stealing.hpp): an idle worker whose steal requests keep
+    // failing yields a few times, then sleeps 1 us, doubling up to this cap
+    inline constexpr unsigned STEAL_MAX_BACKOFF_US = 1000;
 }
 

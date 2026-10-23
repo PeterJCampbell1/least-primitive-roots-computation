@@ -1,9 +1,12 @@
 /**
  * cli.hpp: command line parsing.
  *
- * Modes (at most one): --single (default), --parallel, --dry-run.
+ * Modes (at most one): --single (default), --parallel (work stealing),
+ *          --parallel-queue (1 producer + consumers), --dry-run.
  * Options: --threads N, --log-interval SECONDS, --log-file PATH,
  *          --config PATH, --omega N, --s N, -h/--help.
+ * Testing/tuning: --split-test N, --split-test-order lifo|fifo, --steal-stress,
+ *          --steal-max-prefix K.
  * Value options accept both "--opt value" and "--opt=value".
  **/
 
@@ -18,17 +21,21 @@
 
 namespace lpr::cli {
 
-enum class RunMode { Single, Parallel, DryRun };
+enum class RunMode { Single, Parallel, ParallelQueue, DryRun };
 enum class ThreadSource { None, CommandLine, Slurm, Hardware };
 
 struct Options {
     RunMode mode = RunMode::Single;
-    unsigned threads = 1; // Total threads (1 producer + threads - 1 consumers) in parallel mode
+    unsigned threads = 1; // Workers (--parallel, threaded --dry-run) or 1 producer + threads - 1 consumers (--parallel-queue)
     ThreadSource thread_source = ThreadSource::None;
     unsigned log_interval = 120; // Seconds between progress logs, 0 disables
     std::string log_file; // Empty means stderr
     std::string config_file; // Empty means none
     lpr::config::Overrides search; // --omega / --s (override the config file)
+    unsigned split_test_interval = 0; // --split-test N: split every N DFS steps (0 = off)
+    bool split_test_fifo = false; // --split-test-order fifo (default lifo)
+    bool steal_stress = false; // --steal-stress: idle workers never back off
+    unsigned steal_max_prefix = 0; // --steal-max-prefix K: split only regions whose prefix has < K primes (0 = omega)
     bool help = false;
 };
 
@@ -41,6 +48,7 @@ inline const char* mode_name(RunMode mode) {
     switch (mode) {
     case RunMode::Single: return "single";
     case RunMode::Parallel: return "parallel";
+    case RunMode::ParallelQueue: return "parallel-queue";
     case RunMode::DryRun: return "dry-run";
     }
     return "unknown";
@@ -57,11 +65,15 @@ inline const char* thread_source_name(ThreadSource source) {
 }
 
 inline std::string usage(const char* program) {
-    return std::string("Usage: ") + program + R"( [--single | --parallel | --dry-run] [options]
+    return std::string("Usage: ") + program + R"( [--single | --parallel | --parallel-queue | --dry-run] [options]
 
 Modes:
   --single               Single-threaded computation (default)
-  --parallel             One producer thread plus consumer threads
+  --parallel             Work stealing: every thread searches its own region of the
+                         tree and processes its supports; idle threads take work
+                         from busy ones (see docs/work_stealing.md)
+  --parallel-queue       The previous design: one producer thread plus consumer
+                         threads connected by a queue (kept for comparison)
   --dry-run              Run the support enumeration only; nothing is verified
 
 Search parameters (default omega = )" + std::to_string(parameters::DEFAULT_OMEGA) + R"(, s = omega - 3):
@@ -70,12 +82,26 @@ Search parameters (default omega = )" + std::to_string(parameters::DEFAULT_OMEGA
   --s N                  Corollary 4 parameter, 1 <= s <= omega - 3 (overrides --config)
 
 Options:
-  --threads N            Total threads for --parallel (N >= 2). Defaults to
-                         SLURM_CPUS_PER_TASK, then the hardware thread count
+  --threads N            Threads for --parallel (N >= 1) or --parallel-queue (N >= 2).
+                         Defaults to SLURM_CPUS_PER_TASK, then the hardware thread
+                         count. With --dry-run (default 1), N > 1 searches the
+                         tree with work stealing
   --log-interval SECONDS Seconds between progress logs (default 120, 0 disables)
   --log-file PATH        Append progress logs to PATH instead of stderr.
                          Warnings always also go to stderr
   -h, --help             Show this help
+
+Testing options:
+  --split-test N         With --single or a 1-thread --dry-run: split the search
+                         region every N DFS steps into a work list and run the
+                         pieces afterwards (tests region splitting without threads)
+  --split-test-order O   lifo (default) or fifo order for the --split-test work list
+  --steal-stress         With --parallel or a threaded --dry-run: idle threads ask
+                         for work continuously, without backing off
+  --steal-max-prefix K   With --parallel or a threaded --dry-run: split a region only
+                         while its fixed prefix has fewer than K primes (default
+                         omega, i.e. any depth; e.g. omega - 3 never splits the
+                         last three levels). 1 <= K <= omega
 
 Exit codes:
   0  complete: every candidate certified and Grosswald's inequality holds
@@ -100,6 +126,7 @@ inline ParseResult parse(int argc, char* argv[]) {
     Options options;
     int modes_given = 0;
     bool threads_given = false;
+    bool split_order_given = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -127,6 +154,9 @@ inline ParseResult parse(int argc, char* argv[]) {
         } else if (arg == "--parallel" && flag_only()) {
             options.mode = RunMode::Parallel;
             ++modes_given;
+        } else if (arg == "--parallel-queue" && flag_only()) {
+            options.mode = RunMode::ParallelQueue;
+            ++modes_given;
         } else if (arg == "--dry-run" && flag_only()) {
             options.mode = RunMode::DryRun;
             ++modes_given;
@@ -151,6 +181,23 @@ inline ParseResult parse(int argc, char* argv[]) {
             const auto n = v ? parse_unsigned(*v) : std::nullopt;
             if (!n) return {std::nullopt, arg + " needs a non-negative integer"};
             (arg == "--omega" ? options.search.omega : options.search.s) = *n;
+        } else if (arg == "--split-test") {
+            const auto v = value();
+            const auto n = v ? parse_unsigned(*v) : std::nullopt;
+            if (!n || *n == 0) return {std::nullopt, "--split-test needs a positive integer (DFS steps)"};
+            options.split_test_interval = *n;
+        } else if (arg == "--split-test-order") {
+            const auto v = value();
+            if (!v || (*v != "lifo" && *v != "fifo")) return {std::nullopt, "--split-test-order needs lifo or fifo"};
+            options.split_test_fifo = (*v == "fifo");
+            split_order_given = true;
+        } else if (arg == "--steal-stress" && flag_only()) {
+            options.steal_stress = true;
+        } else if (arg == "--steal-max-prefix") {
+            const auto v = value();
+            const auto n = v ? parse_unsigned(*v) : std::nullopt;
+            if (!n || *n == 0) return {std::nullopt, "--steal-max-prefix needs a positive integer"};
+            options.steal_max_prefix = *n;
         } else if (arg == "--log-file") {
             const auto v = value();
             if (!v || v->empty()) return {std::nullopt, "--log-file needs a path"};
@@ -161,13 +208,14 @@ inline ParseResult parse(int argc, char* argv[]) {
     }
 
     if (modes_given > 1) {
-        return {std::nullopt, "give at most one of --single, --parallel, --dry-run"};
+        return {std::nullopt, "give at most one of --single, --parallel, --parallel-queue, --dry-run"};
     }
-    if (threads_given && options.mode != RunMode::Parallel) {
-        return {std::nullopt, "--threads is only valid with --parallel"};
+    const bool parallel_mode = options.mode == RunMode::Parallel || options.mode == RunMode::ParallelQueue;
+    if (threads_given && !parallel_mode && options.mode != RunMode::DryRun) {
+        return {std::nullopt, "--threads is only valid with --parallel, --parallel-queue or --dry-run"};
     }
 
-    if (options.mode == RunMode::Parallel && !threads_given) {
+    if (parallel_mode && !threads_given) {
         const char* slurm = std::getenv("SLURM_CPUS_PER_TASK");
         const auto slurm_threads = slurm ? parse_unsigned(slurm) : std::nullopt;
         if (slurm_threads) {
@@ -180,10 +228,32 @@ inline ParseResult parse(int argc, char* argv[]) {
             return {std::nullopt, "could not detect the thread count; pass --threads N"};
         }
     }
-    if (options.mode == RunMode::Parallel && options.threads < 2) {
-        return {std::nullopt, "--parallel needs at least 2 threads (1 producer + 1 consumer), got "
+    if (options.mode == RunMode::ParallelQueue && options.threads < 2) {
+        return {std::nullopt, "--parallel-queue needs at least 2 threads (1 producer + 1 consumer), got "
                               + std::to_string(options.threads) + " from "
                               + thread_source_name(options.thread_source) + "; use --single instead"};
+    }
+    if ((options.mode == RunMode::Parallel || options.mode == RunMode::DryRun) && options.threads < 1) {
+        return {std::nullopt, std::string("--") + mode_name(options.mode) + " needs at least 1 thread"};
+    }
+
+    // Testing options
+    const bool threaded_search = options.mode == RunMode::Parallel
+                                 || (options.mode == RunMode::DryRun && options.threads > 1);
+    if (options.split_test_interval > 0 && threaded_search) {
+        return {std::nullopt, "--split-test is single-threaded: use it with --single or a 1-thread --dry-run"};
+    }
+    if (options.split_test_interval > 0 && options.mode == RunMode::ParallelQueue) {
+        return {std::nullopt, "--split-test is single-threaded: use it with --single or a 1-thread --dry-run"};
+    }
+    if (split_order_given && options.split_test_interval == 0) {
+        return {std::nullopt, "--split-test-order needs --split-test N"};
+    }
+    if (options.steal_stress && !threaded_search) {
+        return {std::nullopt, "--steal-stress needs --parallel or a threaded --dry-run (--threads N, N > 1)"};
+    }
+    if (options.steal_max_prefix > 0 && !threaded_search) {
+        return {std::nullopt, "--steal-max-prefix needs --parallel or a threaded --dry-run (--threads N, N > 1)"};
     }
 
     return {options, ""};

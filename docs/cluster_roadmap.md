@@ -106,6 +106,8 @@ $\omega = 32$ takes about 6 h on 8 threads, and even at the 14-thread ceiling th
    - If the producer keeps up at the core count you have, stages 2 and 3 can wait.
 4. Find out the cluster's wall-time limit, cores per node, and whether jobs can be requeued or pre-empted. These decide how urgent stage 1 is.
 
+> **Update 23/10/26:** parallelism is now work stealing (`--parallel`; `docs/work_stealing.md`), which replaces stages 2–3 below: every thread searches its own region, so there is no single producer to limit scaling. Checkpointing (stage 1) becomes simpler: a checkpoint is each worker's region and DFS position, with no completion buffer (`docs/work_stealing_plan.md`, phase 6). Item 3 ("size jobs to the single producer") applies only to `--parallel-queue`.
+
 ## Stage 1: Checkpoint/resume with the single producer (the first code change)
 Needed as soon as a run can exceed the wall-time limit. OMEGA=32 takes about 6 h on 8 threads.
 - **Batch sequence numbers:** the producer numbers each batch and records its first support.

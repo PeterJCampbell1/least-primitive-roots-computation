@@ -11,9 +11,14 @@
  * exceeds the bound, or Corollary 4 covers every d for it, then by domination
  * the same holds for every completion of the prefix.
  *
+ * The DFS runs one region of the tree at a time (detail::run_region), so a
+ * region can be split off and handed to another worker (detail::split_region;
+ * see work_stealing.hpp and docs/work_stealing.md).
+ *
  * Entry points (lpr::producer): generate_supports (single-threaded, processes
- * jobs inline), generate_supports_parallel (batches jobs into a
- * JobQueue) and generate_supports_dry_run (only counts jobs).
+ * jobs inline), generate_supports_dry_run (only counts jobs),
+ * generate_supports_split_test (single-threaded splitting test) and
+ * generate_supports_parallel (the queue mode: batches jobs into a JobQueue).
  **/
 
 #pragma once
@@ -28,6 +33,8 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
+#include <deque>
 #include <string>
 #include <vector>
 #include <cassert>
@@ -35,12 +42,26 @@
 
 namespace lpr::producer::detail { // Internal; named (not anonymous) as this is a header
 struct StackFrame {
-    std::size_t next_prime_idx;
+    std::size_t next_prime_idx = 0;
     mpz_class product;
     mpz_class delta_Q;
     mpz_class delta_sop;
-    mpz_class cor4_bound; // Bound on Q*d for every leaf below the node (see dfs_iter_)
+    mpz_class cor4_bound; // Bound on Q*d for every leaf below the node (see run_region)
     std::uint64_t prefix_hash = 0; // lpr::bits::support_hash of the prefix, built one prime at a time
+};
+
+/**
+ * A region of the search tree, owned by one worker (see docs/work_stealing.md):
+ * the fixed prefix above base_depth, and the siblings at base_depth from
+ * frames[base_depth].next_prime_idx up to (excluding) prime index base_limit.
+ * Depths below base_depth are unrestricted. Its supports form one contiguous
+ * block in lexicographic order.
+ **/
+struct Region {
+    std::size_t base_depth = 1;
+    std::size_t base_limit = 0;
+    std::vector<StackFrame> frames;       // frames[0..base_depth], as in DfsStack
+    std::vector<unsigned> support_prefix; // support[0..base_depth): the primes chosen above base_depth
 };
 
 /**
@@ -51,10 +72,15 @@ struct StackFrame {
  * Frame depth+1 receives the values for the prefix including the current
  * choice, and doubles as scratch space at the final depth.
  * Frame 0 corresponds to the prime 2, which every support must contain.
+ *
+ * The stack runs one region: siblings at base_depth_ stop before base_limit_,
+ * and backtracking past base_depth_ ends the region. The root region
+ * (base_depth_ = 1, base_limit_ = number of primes) is the whole search.
  **/
 class DfsStack {
 public:
-    explicit DfsStack(const mpz_class& root_bound) {
+    // The whole search: the root node {2} with the global bound
+    DfsStack(const mpz_class& root_bound, std::size_t num_primes) {
         frames_[0].next_prime_idx = 0;
         frames_[0].product   = 1;
         frames_[0].delta_Q   = 1;
@@ -67,12 +93,46 @@ public:
         frames_[1].delta_sop = 0;
         frames_[1].cor4_bound = root_bound; // Bound for the root node {2}
         frames_[1].prefix_hash = lpr::bits::mix64(frames_[0].prefix_hash ^ 2); // Prefix (2)
+
+        depth_ = 1;
+        base_depth_ = 1;
+        base_limit_ = num_primes;
+    }
+
+    // Become `region`: copy its frames and prefix, and start at its first sibling
+    void load(const Region& region, std::vector<unsigned>& support) {
+        assert(region.base_depth >= 1 && region.base_depth < frames_.size());
+        assert(region.frames.size() == region.base_depth + 1);
+        assert(region.support_prefix.size() == region.base_depth);
+        for (std::size_t d = 0; d <= region.base_depth; ++d) {
+            frames_[d] = region.frames[d];
+        }
+        for (std::size_t d = 0; d < region.base_depth; ++d) {
+            support[d] = region.support_prefix[d];
+        }
+        depth_ = region.base_depth;
+        base_depth_ = region.base_depth;
+        base_limit_ = region.base_limit;
     }
 
     __attribute__((always_inline)) std::size_t depth() const { return depth_; }
     __attribute__((always_inline)) StackFrame& current() { return frames_[depth_]; }
     __attribute__((always_inline)) StackFrame& child() { return frames_[depth_ + 1]; }
     __attribute__((always_inline)) StackFrame& parent() { return frames_[depth_ - 1]; }
+    __attribute__((always_inline)) StackFrame& frame(std::size_t d) { return frames_[d]; }
+
+    __attribute__((always_inline)) std::size_t base_depth() const { return base_depth_; }
+    __attribute__((always_inline)) std::size_t base_limit() const { return base_limit_; }
+    void set_base(std::size_t depth, std::size_t limit) {
+        assert(depth >= 1 && depth <= depth_);
+        base_depth_ = depth;
+        base_limit_ = limit;
+    }
+
+    // False if prime index i is past the region's end at the current depth
+    __attribute__((always_inline)) bool within_region(std::size_t i) const {
+        return depth_ != base_depth_ || i < base_limit_;
+    }
 
     // Descend one level, starting the choice at first_idx
     __attribute__((always_inline)) void push(std::size_t first_idx) {
@@ -85,9 +145,9 @@ public:
     }
 
     // Pop the current depth and advance the parent.
-    // Returns false once the traversal is complete.
+    // Returns false once the region is finished (it would pop the base depth).
     __attribute__((always_inline)) bool backtrack() {
-        if (depth_ == 1) return false;
+        if (depth_ == base_depth_) return false;
         --depth_;
         advance();
         return true;
@@ -95,11 +155,19 @@ public:
 
 private:
     std::array<StackFrame, parameters::MAX_OMEGA + 1> frames_; // Uses search_config().omega + 1
-    std::size_t depth_ = 1; // Depth 0 (the prime 2) is fixed
+    std::size_t depth_ = 1;       // Depth 0 (the prime 2) is fixed
+    std::size_t base_depth_ = 1;  // The region's base depth
+    std::size_t base_limit_ = 0;  // Siblings at base_depth_ stop before this prime index
 };
 
 /**
- * Iterative implementation of DFS
+ * Runs the DFS over the region in `stack`, calling emit(job) for every support.
+ *
+ * `support` holds the primes chosen so far (support[0..depth]); its prefix above
+ * the base depth must already be set (DfsStack::load does this). poll(stack,
+ * support) is called at the top of every iteration, when the stack is between
+ * nodes; it may split the region (split_region), which only moves the base
+ * depth down or lowers the base limit.
  *
  * Maintains that support contains an increasing list of primes.
  * Supports are iterated through in lexicographic order.
@@ -124,43 +192,41 @@ private:
  *
  * Note: We know that support must always contain 2 (as Q*d + 1 must be odd).
  **/
-template <typename Callable>
-__attribute__((always_inline)) inline void dfs_iter_(
+template <typename Emit, typename Poll>
+__attribute__((always_inline)) inline void run_region(
+    DfsStack& stack,
+    std::vector<unsigned>& support,
     const std::vector<unsigned>& primes,
-    const mpz_class& global_bound,
-    Callable process_job
+    Emit&& process_job,
+    Poll&& poll
 ) {
     const auto& config = lpr::config::search_config();
     const std::size_t OMEGA = config.omega;
 
     assert(OMEGA > 2 && OMEGA <= parameters::MAX_OMEGA && "Must have at least 2 prime factors to use Cor 4");
     assert(!primes.empty() && primes[0] == 2);
+    assert(support.size() == OMEGA && support[0] == 2);
     auto& stats = lpr::stats::get_thread_local_stats();
-
-    // Initialise DFS data
-    DfsStack stack(global_bound);
-    std::vector<unsigned> support(OMEGA);
-    support[0] = primes[0]; // primes[0] == 2
 
     // Number of primes to ignore
     const std::size_t DELTA_START_DEPTH = config.delta_start_depth();
     assert(DELTA_START_DEPTH > 0 && "We cannot have OMEGA == S as 2 must be excluded");
     assert(DELTA_START_DEPTH < OMEGA && "Need S >= 1 so leaves always have a Cor 4 bound");
 
-    mpz_class min_complete_product;
-    mpz_class min_complete_delta_Q;
-    mpz_class min_complete_delta_sop;
+    // Scratch values, reused across regions to avoid GMP allocations
+    static thread_local mpz_class min_complete_product;
+    static thread_local mpz_class min_complete_delta_Q;
+    static thread_local mpz_class min_complete_delta_sop;
+    static thread_local mpz_class d_max_mpz;
 
-    // Reserve space to avoid reallocations later
-    mpz_realloc2(min_complete_product.get_mpz_t(), 1024);
-
-    mpz_class d_max_mpz;
     while (true) {
+        poll(stack, support); // May split the region (between nodes, so the stack is consistent)
+
         const std::size_t depth = stack.depth();
         const std::size_t remaining_after_choice = OMEGA - depth - 1;
         const std::size_t i = stack.current().next_prime_idx; // The prime chosen at this depth
 
-        if (i >= primes.size() || primes.size() - (i + 1) < remaining_after_choice) {
+        if (!stack.within_region(i) || i >= primes.size() || primes.size() - (i + 1) < remaining_after_choice) {
             if (!stack.backtrack()) break;
             continue;
         }
@@ -265,12 +331,159 @@ __attribute__((always_inline)) inline void dfs_iter_(
             if (d_max > stats.d_max_max) {
                 stats.d_max_max = d_max;
             }
-            process_job(parallel::make_job(support, next.product, d_max)); // Works for both single/multi-threaded calls
+            process_job(parallel::make_job(support, next.product, d_max)); // Works for every mode
             stack.advance(); // Move to sibling leaf node at same depth
         } else {
             stack.push(i + 1); // Move to next depth and use later primes
         }
     } // while (true)
+}
+
+// What the DFS's first checks decide for one sibling (see sibling_fate)
+enum class SiblingFate { Survives, InheritedPrune, Cor4Prune };
+
+/*
+ * The outcome of run_region's checks for choosing prime index j at depth `depth`
+ * under the prefix whose values are in `frame` (the stack frame at that depth),
+ * computed exactly as run_region computes them for a sibling that is not a first
+ * child: the inherited-bound prune (minimal completion's product exceeds
+ * frame.cor4_bound), then, from DELTA_START_DEPTH on, the Corollary 4 prune
+ * (product exceeds the minimal completion's own Cor 4 bound). Both are monotone
+ * in j. Requires j + 1 + (OMEGA - depth - 1) <= primes.size().
+ */
+inline SiblingFate sibling_fate(
+    const StackFrame& frame,
+    std::size_t depth,
+    std::size_t j,
+    const std::vector<unsigned>& primes
+) {
+    const auto& config = lpr::config::search_config();
+    const std::size_t rem = config.omega - depth - 1;
+    const bool evaluates_cor4 = depth >= config.delta_start_depth();
+    assert(j + 1 + rem <= primes.size());
+    static thread_local mpz_class product, delta_Q, delta_sop, bound;
+    mpz_mul_ui(product.get_mpz_t(), frame.product.get_mpz_t(), primes[j]);
+    if (evaluates_cor4) {
+        mpz_mul_ui(delta_Q.get_mpz_t(), frame.delta_Q.get_mpz_t(), primes[j]);
+        mpz_set(delta_sop.get_mpz_t(), frame.delta_Q.get_mpz_t());
+        mpz_addmul_ui(delta_sop.get_mpz_t(), frame.delta_sop.get_mpz_t(), primes[j]);
+    }
+    for (std::size_t t = 1; t <= rem; ++t) {
+        mpz_mul_ui(product.get_mpz_t(), product.get_mpz_t(), primes[j + t]);
+        if (evaluates_cor4) {
+            delta_sop *= primes[j + t];
+            delta_sop += delta_Q;
+            delta_Q *= primes[j + t];
+        }
+    }
+    if (product > frame.cor4_bound) {
+        return SiblingFate::InheritedPrune;
+    }
+    if (evaluates_cor4) {
+        corollary4_qd_bound(delta_Q, delta_sop, bound);
+        if (product > bound) {
+            return SiblingFate::Cor4Prune;
+        }
+    }
+    return SiblingFate::Survives;
+}
+
+/*
+ * Splits off part of the region in `stack` into `out` (see docs/work_stealing.md,
+ * section 3). Called between DFS iterations, on the stack's own thread.
+ *
+ * Only untouched siblings at the base depth b (indices cur+1 .. base_limit-1,
+ * where cur = frames[b].next_prime_idx is the sibling in progress or about to
+ * be visited) are given away: `out` gets [mid, base_limit) and the stack keeps
+ * [cur, mid). mid is chosen among the untouched siblings that survive the DFS's
+ * first checks (sibling_fate), so a single-threaded run visits it too and every
+ * DFS counter stays identical. If no untouched sibling at b survives, the
+ * stack's remaining work is the subtree of cur, so the base moves one level
+ * down (behaviour-preserving) and the search repeats there; the one visit the
+ * traversal would have made to sibling cur+1 (and its prune) is counted, so
+ * the DFS counters still match a single-threaded run exactly. Depths deeper than max_split_depth are
+ * never split. Returns false (and changes nothing in `out`) if nothing can be
+ * given away.
+ */
+inline bool split_region(
+    DfsStack& stack,
+    const std::vector<unsigned>& support,
+    const std::vector<unsigned>& primes,
+    std::size_t max_split_depth,
+    Region& out
+) {
+    const std::size_t OMEGA = lpr::config::search_config().omega;
+    const std::size_t num_primes = primes.size();
+    auto& stats = lpr::stats::get_thread_local_stats();
+
+    while (true) {
+        const std::size_t b = stack.base_depth();
+        if (b > max_split_depth || b >= OMEGA) {
+            return false;
+        }
+        const std::size_t rem = OMEGA - b - 1;
+        const std::size_t cur = stack.frame(b).next_prime_idx;
+        const std::size_t lo = cur + 1; // First untouched sibling
+        // Untouched siblings that can be completed at all: j + 1 + rem <= num_primes
+        const std::size_t completable_end = num_primes >= rem ? num_primes - rem : 0;
+        const std::size_t range_end = std::min(stack.base_limit(), completable_end);
+
+        // feasible_end: first index in [lo, range_end) pruned by the DFS's first
+        // checks (monotone in the index), or range_end if none is
+        std::size_t feasible_end = lo;
+        if (lo < range_end) {
+            std::size_t left = lo, right = range_end; // Invariant: indices < left survive, >= right are pruned
+            while (left < right) {
+                const std::size_t probe = left + (right - left) / 2;
+                if (sibling_fate(stack.frame(b), b, probe, primes) != SiblingFate::Survives) {
+                    right = probe;
+                } else {
+                    left = probe + 1;
+                }
+            }
+            feasible_end = left;
+        }
+
+        if (feasible_end > lo) { // At least one untouched sibling survives the first checks
+            const std::size_t count = feasible_end - lo;
+            const std::size_t mid = lo + count / 2; // The thief gets ceil(count / 2) of them
+            out.base_depth = b;
+            out.base_limit = stack.base_limit();
+            out.frames.resize(b + 1);
+            for (std::size_t d = 0; d <= b; ++d) {
+                out.frames[d] = stack.frame(d);
+            }
+            out.frames[b].next_prime_idx = mid;
+            out.support_prefix.assign(support.begin(), support.begin() + static_cast<std::ptrdiff_t>(b));
+            stack.set_base(b, mid);
+            ++stats.regions_split;
+            ++stats.splits_at_depth[b];
+            return true;
+        }
+
+        // Nothing worth giving away at b. Step down if the DFS is below b, so all
+        // remaining work is in the subtree of cur.
+        if (stack.depth() <= b) {
+            return false;
+        }
+        if (lo < range_end) {
+            // The traversal would visit sibling lo after finishing cur and prune it
+            // (it can't be a first child: cur >= parent + 1, so the checks are not
+            // skipped). Count that visit as run_region would, so the DFS counters
+            // match a single-threaded run exactly.
+            assert(b == 1 || lo > stack.frame(b - 1).next_prime_idx + 1);
+            ++stats.dfs_nodes_visited;
+            const SiblingFate fate = sibling_fate(stack.frame(b), b, lo, primes);
+            assert(fate != SiblingFate::Survives && "feasible_end == lo means sibling lo is pruned");
+            if (fate == SiblingFate::InheritedPrune) {
+                ++stats.inherited_bound_prunes;
+            } else {
+                ++stats.cor4_evaluations; // Pruned by its own Corollary 4 bound
+            }
+        }
+        stack.set_base(b + 1, num_primes);
+        ++stats.region_step_downs;
+    }
 }
 
 } // namespace lpr::producer::detail
@@ -321,50 +534,121 @@ inline std::string dfs_position_string() {
     return out;
 }
 
+// The support array for a new search: OMEGA entries, support[0] = 2 (fixed)
+inline std::vector<unsigned> initial_support(const std::vector<unsigned>& primes) {
+    std::vector<unsigned> support(lpr::config::search_config().omega);
+    support[0] = primes[0]; // primes[0] == 2
+    return support;
+}
+
+// A poll that never splits (single-threaded modes)
+struct NoPoll {
+    void operator()(detail::DfsStack&, std::vector<unsigned>&) const {}
+};
+
+/*
+ * The emit callables of the single-threaded modes: process each support inline
+ * (or, for dry runs, only count it, which run_region does), and every
+ * BATCH_SIZE supports update the progress position and publish statistics (at
+ * most once per STATS_PUBLISH_INTERVAL_MS).
+ */
+template <bool Process>
+struct InlineEmit {
+    std::size_t since_publish = 0;
+    void operator()(const parallel::LPRJob& job) {
+        if constexpr (Process) {
+            consumer::process_support(job);
+        }
+        if (++since_publish == parameters::BATCH_SIZE) {
+            since_publish = 0;
+            update_dfs_position(job);
+            stats::maybe_publish_thread_local_stats();
+        }
+    }
+};
+
 /*
  * Single-threaded: processes each support as soon as it is emitted.
- * Every BATCH_SIZE supports the progress position is updated and statistics
- * are published (at most once per STATS_PUBLISH_INTERVAL_MS).
  */
 inline void generate_supports(
     const std::vector<unsigned>& primes,
     const mpz_class& global_bound
 ) {
     set_dfs_first_primes(primes);
-    std::size_t since_publish = 0;
-    detail::dfs_iter_(primes, global_bound, [&](const parallel::LPRJob& job) {
-        consumer::process_support(job);
-        if (++since_publish == parameters::BATCH_SIZE) {
-            since_publish = 0;
-            update_dfs_position(job);
-            stats::maybe_publish_thread_local_stats();
-        }
-    });
+    detail::DfsStack stack(global_bound, primes.size());
+    std::vector<unsigned> support = initial_support(primes);
+    detail::run_region(stack, support, primes, InlineEmit<true>{}, NoPoll{});
     stats::publish_thread_local_stats();
 }
 
 /*
  * Runs the DFS without processing any supports, to measure producer speed.
- * Producer statistics (including supports emitted) are gathered by dfs_iter_.
+ * Producer statistics (including supports emitted) are gathered by run_region.
  */
 inline void generate_supports_dry_run(
     const std::vector<unsigned>& primes,
     const mpz_class& global_bound
 ) {
     set_dfs_first_primes(primes);
-    std::size_t since_publish = 0;
-    detail::dfs_iter_(primes, global_bound, [&](const parallel::LPRJob& job) {
-        if (++since_publish == parameters::BATCH_SIZE) {
-            since_publish = 0;
-            update_dfs_position(job);
-            stats::maybe_publish_thread_local_stats();
-        }
-    });
+    detail::DfsStack stack(global_bound, primes.size());
+    std::vector<unsigned> support = initial_support(primes);
+    detail::run_region(stack, support, primes, InlineEmit<false>{}, NoPoll{});
     stats::publish_thread_local_stats();
 }
 
 /*
- * Producer for the multi-threaded mode.
+ * Split test (--split-test N, single-threaded): every `interval` DFS steps the
+ * current region is split (detail::split_region) and the split-off region is
+ * put on a work list, which is run once the current region is finished: last
+ * in, first out, or first in, first out with `fifo`. This exercises region
+ * splitting and stepping down without threads: the supports checksum and every
+ * consumer counter must equal a plain single-threaded run, and the DFS counters
+ * may exceed it by at most the number of regions split off. At most
+ * MAX_PENDING regions are kept; beyond that, splitting pauses.
+ */
+template <bool Process>
+void generate_supports_split_test(
+    const std::vector<unsigned>& primes,
+    const mpz_class& global_bound,
+    std::size_t interval,
+    bool fifo
+) {
+    constexpr std::size_t MAX_PENDING = 100000;
+    set_dfs_first_primes(primes);
+    const std::size_t OMEGA = lpr::config::search_config().omega;
+    detail::DfsStack stack(global_bound, primes.size());
+    std::vector<unsigned> support = initial_support(primes);
+    std::deque<detail::Region> pending;
+    std::size_t steps = 0;
+    InlineEmit<Process> emit;
+
+    auto poll = [&](detail::DfsStack& st, std::vector<unsigned>& sup) {
+        if (++steps < interval || pending.size() >= MAX_PENDING) return;
+        steps = 0;
+        pending.emplace_back();
+        if (!detail::split_region(st, sup, primes, OMEGA - 1, pending.back())) {
+            pending.pop_back();
+        }
+    };
+
+    detail::run_region(stack, support, primes, emit, poll);
+    while (!pending.empty()) {
+        if (fifo) {
+            stack.load(pending.front(), support);
+            pending.pop_front();
+        } else {
+            stack.load(pending.back(), support);
+            pending.pop_back();
+        }
+        detail::run_region(stack, support, primes, emit, poll);
+    }
+    stats::publish_thread_local_stats();
+}
+
+/*
+ * Producer for the queue mode (--parallel-queue): one producer thread and
+ * consumer threads connected by a JobQueue (the design before work stealing,
+ * kept for comparison).
  *
  * Batches jobs and offers each full batch to the queue. If the queue is full
  * the producer processes the batch itself (producer co-processing), so it never
@@ -399,7 +683,7 @@ void generate_supports_parallel(
         stats::maybe_publish_thread_local_stats();
     };
 
-    // Lambda passed into dfs_iter_ to emit candidate supports
+    // Called by run_region to emit candidate supports
     auto emit_job = [&](const LPRJob& job) {
         current_batch.push_back(job);
         if (current_batch.size() == BATCH_SIZE) {
@@ -407,8 +691,10 @@ void generate_supports_parallel(
         }
     };
 
-    // Run DFS candidate generator
-    detail::dfs_iter_(primes, global_bound, emit_job);
+    // Run DFS candidate generator over the whole search
+    detail::DfsStack stack(global_bound, primes.size());
+    std::vector<unsigned> support = initial_support(primes);
+    detail::run_region(stack, support, primes, emit_job, NoPoll{});
 
     // Flush remaining candidates in final batch
     if (!current_batch.empty()) {

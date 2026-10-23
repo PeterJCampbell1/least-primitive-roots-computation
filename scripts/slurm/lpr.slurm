@@ -45,11 +45,11 @@ fi
 
 # Search parameters. LPR_ARGS (set by scripts/submit.sh --lpr-args) replaces the default
 # "--config config/omega33.conf", e.g. "--omega 32 --s 29" or "--config config/x.conf --s 29".
-# The mode is --parallel unless LPR_ARGS gives one (--single, --parallel or --dry-run;
-# lpr accepts only one).
+# The mode is --parallel (work stealing) unless LPR_ARGS gives one (--single,
+# --parallel, --parallel-queue or --dry-run; lpr accepts only one).
 lpr_args=${LPR_ARGS:---config config/omega33.conf}
 case " $lpr_args " in
-    *" --single "*|*" --parallel "*|*" --dry-run "*) lpr_mode="" ;;
+    *" --single "*|*" --parallel "*|*" --parallel-queue "*|*" --dry-run "*) lpr_mode="" ;;
     *) lpr_mode="--parallel" ;;
 esac
 srun ./lpr ${lpr_mode} ${lpr_args} --log-interval 120 --log-file "lpr_${SLURM_JOB_ID}.log"

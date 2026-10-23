@@ -58,6 +58,20 @@ struct Counters {
     std::uint64_t consumer_waits = 0; // Consumer pops that found the queue empty
     std::uint64_t consumer_wait_ns = 0; // Total time consumers spent waiting on an empty queue
 
+    // Region splitting and work stealing (generate_supports.hpp, work_stealing.hpp)
+    std::uint64_t regions_split = 0; // Regions split off and handed out (stolen, or split-tested)
+    std::uint64_t region_step_downs = 0; // Base depth moved down because the base level had nothing to give
+    std::uint64_t steal_requests = 0; // Steal requests posted by idle workers
+    std::uint64_t steal_refusals = 0; // Requests answered "nothing to give"
+    std::uint64_t steal_withdrawals = 0; // Requests withdrawn unanswered at termination
+    std::uint64_t worker_idle_ns = 0; // Time workers spent without a region (looking for work)
+    std::uint64_t steal_wait_ns = 0; // Part of idle time spent waiting for answers to requests
+    std::uint64_t steal_backoff_ns = 0; // Part of idle time spent backing off after failed attempts
+    std::uint64_t split_ns = 0; // Time victims spent in split_region answering requests
+    std::uint64_t requests_refused_idle = 0; // Requests refused by a worker without a region (avoidable)
+    std::uint64_t requests_refused_busy = 0; // Requests refused by a busy worker with nothing to give
+    std::array<std::uint64_t, parameters::MAX_OMEGA + 1> splits_at_depth = {}; // Regions split off, by base depth
+
     // Least primitive root search statistics (find_least_primitive_root)
     std::uint64_t lpr_jacobi_calls = 0; // Candidates g reaching the Jacobi filter
     std::uint64_t lpr_legendre_survivors = 0; // Candidates g tested with the power tree
@@ -92,6 +106,18 @@ struct Counters {
         batches_coprocessed += other.batches_coprocessed;
         consumer_waits += other.consumer_waits;
         consumer_wait_ns += other.consumer_wait_ns;
+        regions_split += other.regions_split;
+        region_step_downs += other.region_step_downs;
+        steal_requests += other.steal_requests;
+        steal_refusals += other.steal_refusals;
+        steal_withdrawals += other.steal_withdrawals;
+        worker_idle_ns += other.worker_idle_ns;
+        steal_wait_ns += other.steal_wait_ns;
+        steal_backoff_ns += other.steal_backoff_ns;
+        split_ns += other.split_ns;
+        requests_refused_idle += other.requests_refused_idle;
+        requests_refused_busy += other.requests_refused_busy;
+        add(splits_at_depth, other.splits_at_depth);
 
         lpr_jacobi_calls += other.lpr_jacobi_calls;
         lpr_legendre_survivors += other.lpr_legendre_survivors;
@@ -167,7 +193,25 @@ struct Counters {
                   << "Batches pushed to queue: " << batches_pushed << '\n'
                   << "Batches co-processed by producer: " << batches_coprocessed << '\n'
                   << "Consumer waits on empty queue: " << consumer_waits
-                  << " (" << consumer_wait_ns / 1e9 << " s in total)\n";
+                  << " (" << consumer_wait_ns / 1e9 << " s in total)\n"
+                  << "Regions split off (work stealing or split test): " << regions_split
+                  << " (base depth stepped down " << region_step_downs << " times)\n"
+                  << "Steal requests: " << steal_requests << " (" << steal_refusals << " refused, "
+                  << steal_withdrawals << " withdrawn at termination)\n"
+                  << "Worker idle time: " << worker_idle_ns / 1e9 << " s in total ("
+                  << steal_wait_ns / 1e9 << " s waiting for answers, "
+                  << steal_backoff_ns / 1e9 << " s backing off)\n"
+                  << "Requests refused: " << requests_refused_idle << " by idle workers, "
+                  << requests_refused_busy << " by busy workers with nothing to give\n"
+                  << "Time spent splitting regions: " << split_ns / 1e9 << " s\n";
+        std::cout << "Regions split off by base depth:";
+        bool any = false;
+        for (std::size_t d = 0; d < splits_at_depth.size(); ++d) {
+            if (splits_at_depth[d] == 0) continue;
+            std::cout << "  " << d << ": " << splits_at_depth[d];
+            any = true;
+        }
+        std::cout << (any ? "\n" : " none\n");
     }
 
 private:

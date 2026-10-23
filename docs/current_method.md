@@ -155,19 +155,21 @@ Otherwise the program exits with code 1, and prints each offending $p$ to stderr
 
 ## 9. Parallel architecture
 
-**Implementation:** `src/main.cpp`, `src/job_queue.hpp`, `src/generate_supports.hpp`, `src/process_support.hpp`.
+**Implementation:** `src/main.cpp`, `src/work_stealing.hpp`, `src/generate_supports.hpp`, `src/process_support.hpp` (and `src/job_queue.hpp` for the queue mode). Full design, invariants and verification: [`work_stealing.md`](work_stealing.md).
 
 - **Single mode** (`--single`, the default): the DFS calls `process_support` on each emitted support directly.
-- **Parallel mode** (`--parallel --threads N`): one producer thread runs the DFS and groups jobs into batches of `BATCH_SIZE` (256). $N - 1$ consumer threads take batches from a bounded queue (at most `HWM` = 512 batches).
-  - **Producer co-processing:** if the queue is full, the producer processes the batch itself instead of waiting, so no thread sleeps while there is work.
-  - After the DFS, the producer marks the queue finished and helps drain it.
-  - Every emitted batch is processed exactly once, by a consumer or by the producer, so the results are identical to single mode.
-  - The thread count defaults to `SLURM_CPUS_PER_TASK`, then the hardware thread count.
+- **Parallel mode** (`--parallel --threads N`, work stealing): every thread is a worker. It runs the DFS on its own **region** of the tree, a fixed prefix plus a range of sibling indices at one base depth, and processes its own supports inline, as single mode does. There is no producer or queue.
+  - **Stealing:** a worker whose region is finished asks a random other worker for work. The victim, on its own thread, splits off the upper half of the untouched siblings at its base depth that survive the DFS's first checks (inherited bound and Corollary 4), and hands them over through a mailbox. If its base level has nothing to give, it moves its base one level down.
+  - **Correctness:** regions partition the tree, so every support is emitted and processed exactly once. A shared count of workers holding regions decides termination.
+  - **Results:** identical to single mode in every line, including the supports checksum and the DFS counters: the split point is chosen among siblings that survive the DFS's first checks, so no node is visited that a single-threaded run would skip.
+  - The thread count defaults to `SLURM_CPUS_PER_TASK`, then the hardware thread count; `--threads 1` behaves like single mode.
+- **Queue mode** (`--parallel-queue --threads N`), the previous design kept for comparison: one producer thread runs the DFS and groups jobs into batches of `BATCH_SIZE` (256). $N - 1$ consumer threads take batches from a bounded queue (at most `HWM` = 512 batches); if the queue is full, the producer processes the batch itself. Its throughput is limited by the single producer: on a 2014 Xeon, 15 consumers spent 40% of their time waiting (`optimisation_notes.md`, 22/10/26).
 - **Jobs:** each job (`LPRJob`) is fixed size, with the support and $Q$ stored inline, so producing and consuming jobs needs no heap allocation.
-- **Statistics:** each thread counts into thread-local `Counters` and merges them into a mutex-guarded master copy at most once per second (staggered across threads), and finally when the thread exits. Consumers also record how long they wait on an empty queue (`consumer_wait_ns`), which measures how far the single producer limits the run.
-- **Monitoring:** a monitor thread logs a progress line every `--log-interval` seconds (default 120) to `--log-file`, or to stderr. Each line gives the supports emitted and processed, the rate, candidates, Fermat survivors, certified, failed, unresolved, the largest $g(p)$, the queue length, co-processed batches, consumer waits, and the current DFS position.
-- **Signals:** on SIGTERM or SIGINT the monitor prints the statistics so far and exits with code 3. Runs cannot yet be resumed; the planned design is in [`parallelise_producer.md`](parallelise_producer.md).
-- **Dry run** (`--dry-run`): runs the DFS only and discards the supports. It measures the producer and checks the number of supports emitted, which must equal "K-prime supports examined" in a full run.
+- **Statistics:** each thread counts into thread-local `Counters` and merges them into a mutex-guarded master copy at most once per second (staggered across threads), and finally when the thread exits. The work-stealing counters record the regions split off, the base step-downs, the steal requests (refused or withdrawn) and the workers' idle time. The queue mode records how long consumers wait on an empty queue (`consumer_wait_ns`).
+- **Monitoring:** a monitor thread logs a progress line every `--log-interval` seconds (default 120) to `--log-file`, or to stderr. Each line gives the supports emitted and processed, the rate, candidates, Fermat survivors, certified, failed, unresolved, the largest $g(p)$, the number of workers holding a region (or the queue length), the regions split off, the idle time, and the latest DFS position (in parallel mode, the position of whichever worker reported last).
+- **Signals:** on SIGTERM or SIGINT the monitor prints the statistics so far and exits with code 3. Runs cannot yet be resumed; with work stealing, a checkpoint is just each worker's region and DFS position (`work_stealing_plan.md`, phase 6).
+- **Dry run** (`--dry-run [--threads N]`): runs the DFS only and discards the supports; with N > 1 it uses work stealing. It checks the number of supports emitted, and the checksum, which must equal those of a full run.
+- **Testing options:** `--split-test N` (single-threaded splitting every N DFS steps) and `--steal-stress` (idle workers never back off); see `work_stealing.md`.
 
 ## 10. Current results ($\omega = 33$, $s = 30$)
 

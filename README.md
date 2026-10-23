@@ -63,9 +63,10 @@ g++ -O3 -DNDEBUG -std=c++17 -Wall -Wextra -pthread src/main.cpp src/primality.cp
 
 ```bash
 ./lpr                          # single-threaded (same as --single)
-./lpr --parallel               # multi-threaded, thread count auto-detected
-./lpr --parallel --threads 16  # 1 producer + 15 consumers
-./lpr --dry-run                # support enumeration only: nothing is verified
+./lpr --parallel               # multi-threaded (work stealing), thread count auto-detected
+./lpr --parallel --threads 16  # 16 workers, each searching and processing its own part of the tree
+./lpr --parallel-queue --threads 16  # previous design, for comparison: 1 producer + 15 consumers
+./lpr --dry-run [--threads N]  # support enumeration only: nothing is verified
 ./lpr --help
 ```
 
@@ -83,8 +84,12 @@ exceeds `MAX_PRIME_LIMIT` in `src/parameters.hpp` the program stops with an erro
 `PRIMITIVE_ROOT_SEARCH_LIMIT` remains a compile-time setting.
 
 Options:
-- `--threads N`: total threads for `--parallel` (at least 2). Defaults to
-  `SLURM_CPUS_PER_TASK` (for running on HPC clusters), then the hardware thread count.
+- `--threads N`: threads for `--parallel` (at least 1) or `--parallel-queue` (at least 2).
+  Defaults to `SLURM_CPUS_PER_TASK` (for running on HPC clusters), then the hardware
+  thread count. With `--dry-run` (default 1), N > 1 enumerates with work stealing.
+- Testing: `--split-test N` (with `--single` or a 1-thread `--dry-run`) splits the
+  search every N DFS steps, single-threaded; `--steal-stress` makes idle workers ask
+  for work without backing off. See [`docs/work_stealing.md`](docs/work_stealing.md).
 - `--log-interval SECONDS`: seconds between progress logs (default 120, 0 disables).
 - `--log-file PATH`: append progress logs to `PATH` instead of stderr.
 
@@ -115,7 +120,7 @@ submit from the repository root:
 sbatch scripts/slurm/lpr.slurm
 ```
 
-The job runs `lpr --parallel` with the thread count taken from
+The job runs `lpr --parallel` (work stealing) with the thread count taken from
 `SLURM_CPUS_PER_TASK`, logs progress every 2 minutes to `lpr_<jobid>.log`, and
 asks Slurm (`--signal=TERM@300`) to send SIGTERM 5 minutes before the time
 limit so that the statistics so far are recorded. Runs cannot yet be resumed;

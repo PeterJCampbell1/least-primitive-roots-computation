@@ -947,3 +947,29 @@ Throughput was 635–865k supports/s (vs Rangpur's flat ~640k/s with twice the t
 
 ## Conclusion
 The single producer limits every machine with slower cores or more threads than about 12. The next step is a parallel producer; see `docs/work_stealing_plan.md` for the plan (every thread runs the DFS on its own region, processes its own supports, and steals work when idle).
+
+---
+
+Date: **23/10/26**   
+Author: **Mittun Sudhahar** (implemented with Claude)  
+Commit: TODO (uncommitted on `parallelise_33`, on top of `ee72013`)
+OMEGA: 33 (tests), 32 (full run)  
+
+## Work-stealing parallelism (`--parallel`)
+Replaces the single-producer design as the parallel mode; the old design remains as `--parallel-queue`. Full design, invariants and verification log: `docs/work_stealing.md`.
+
+- **Design:** every thread is a worker that runs the DFS on its own **region** (a fixed prefix plus sibling indices `[current, limit)` at one base depth) and processes its own supports inline.
+  - An idle worker posts a request in a random victim's atomic slot.
+  - The victim, polling at the top of each DFS iteration, splits off the upper half of its untouched base-level siblings that survive the DFS's first checks (an exact binary search with the DFS's own inherited-bound and Corollary 4 tests). If its base level has nothing left, it steps its base down a level.
+  - The region is handed over through a mailbox (release/acquire), and an atomic count of workers holding regions decides termination.
+- **Invariant:** output identical to `--single` in every line: supports emitted, the supports checksum, `d_max`, every consumer counter, **and the DFS counters**. The split point is always a sibling the single-threaded traversal visits, and step-downs count the one visit they skip.
+- **Verification:**
+  - 237-run campaign: split tests, 1–64 threads, stress, S=29, queue mode, debug build — all identical;
+  - ThreadSanitizer and ASan/UBSan: 0 reports;
+  - CLI errors, an empty search (OMEGA=34) and SIGTERM;
+  - a full OMEGA=32, S=29 run (see below).
+- **Performance (M2):**
+  - the refactor costs nothing single-threaded (dry run +0.2%);
+  - `--parallel` scales 1.95× on 2 threads and 3.76× on 4 (the performance cores), with idle time ≤ 0.01 s;
+  - 8 threads at S=29: 43.4–48.3 s against 44.3–50.4 s for the queue mode, with 0.5% idle against 5–6.5% waiting.
+  - The large gain is expected on clusters, where the queue mode's single producer left 40% of consumer time idle (Rangpur, 22/10/26).
