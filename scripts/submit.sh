@@ -6,7 +6,7 @@
 # Steps:
 #   1. update the repository: git pull --ff-only on the chosen branch (skip with --no-pull);
 #   2. export the chosen commit (git archive) into a new per-run directory
-#      $LPR_RUN_ROOT/<date>_<commit>[_<name>], so later pulls or edits cannot change a
+#      $LPR_RUN_ROOT/[<name>_]<date>_<commit>, so later pulls or edits cannot change a
 #      queued or running job;
 #   3. record the commit, branch and submission details in RUN_INFO in that directory;
 #   4. submit scripts/slurm/lpr.slurm with the run directory as the working directory and
@@ -21,7 +21,7 @@
 # Options:
 #   -b, --branch NAME   branch to pull and run (default: the repository's current branch)
 #   -c, --commit REF    run this commit instead of the branch tip (any git revision)
-#   -n, --name LABEL    label appended to the run directory name
+#   -n, --name LABEL    label at the start of the run directory name
 #   -a, --lpr-args "A"  lpr arguments for this run, replacing the job file's default
 #                       "--config config/omega33.conf", e.g. "--omega 32 --s 29" or
 #                       "--config config/omega33.conf --single". The job adds --parallel
@@ -120,7 +120,7 @@ fi
 # 2. Resolve the commit and export it into a new run directory
 sha=$(git -C "$repo" rev-parse --verify "${commit:-$branch}^{commit}")
 short=$(git -C "$repo" rev-parse --short "$sha")
-run_dir="$run_root/$(date +%Y%m%d_%H%M%S)_${short}${name:+_$name}"
+run_dir="$run_root/${name:+${name}_}$(date +%Y%m%d_%H%M%S)_${short}" # [<name>_]<date>_<commit>
 if [ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]; then
     echo "submit.sh: note: the repository has uncommitted changes; they are NOT included (running $short)" >&2
 fi

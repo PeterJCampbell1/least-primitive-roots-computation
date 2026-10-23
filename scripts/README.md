@@ -14,7 +14,7 @@ This directory holds everything needed to run `lpr` as Slurm jobs:
 `submit.sh` never builds or runs anything on the login node. For each submission it:
 
 1. updates the repository (`git pull --ff-only`);
-2. exports the chosen **commit** into a new **run directory**, `~/lpr_runs/<date>_<commit>_<name>/`, and copies `build_lpr.sh` into it;
+2. exports the chosen **commit** into a new **run directory**, `~/lpr_runs/<name>_<date>_<commit>/` (just `<date>_<commit>` without `-n`), and copies `build_lpr.sh` into it;
 3. writes `RUN_INFO` there: the commit, branch, time, `lpr` arguments, build settings and job id;
 4. submits the job with that directory as its working directory.
 
@@ -108,7 +108,7 @@ The output's `[build_lpr]` lines and the run header's `build:` line show what wa
 
 | Option | Effect |
 |---|---|
-| `-n NAME` | Label in the run directory name. |
+| `-n NAME` | Label at the start of the run directory name: `-n w32` gives `~/lpr_runs/w32_<date>_<commit>/`. |
 | `-c REF` | Run a specific commit, e.g. `-c 2aca1ee`, instead of the branch tip. |
 | `-b BRANCH` | Pull and run another branch. |
 | `--no-pull` | Don't update the repository first. |
