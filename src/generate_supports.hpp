@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "bit_tricks.hpp"
 #include "config.hpp"
 #include "corollary4.hpp"
 #include "job_queue.hpp"
@@ -39,6 +40,7 @@ struct StackFrame {
     mpz_class delta_Q;
     mpz_class delta_sop;
     mpz_class cor4_bound; // Bound on Q*d for every leaf below the node (see dfs_iter_)
+    std::uint64_t prefix_hash = 0; // lpr::bits::support_hash of the prefix, built one prime at a time
 };
 
 /**
@@ -57,12 +59,14 @@ public:
         frames_[0].product   = 1;
         frames_[0].delta_Q   = 1;
         frames_[0].delta_sop = 0;
+        frames_[0].prefix_hash = 0; // Empty prefix
 
         frames_[1].next_prime_idx = 1;
         frames_[1].product   = 2;
         frames_[1].delta_Q   = 1;
         frames_[1].delta_sop = 0;
         frames_[1].cor4_bound = root_bound; // Bound for the root node {2}
+        frames_[1].prefix_hash = lpr::bits::mix64(frames_[0].prefix_hash ^ 2); // Prefix (2)
     }
 
     __attribute__((always_inline)) std::size_t depth() const { return depth_; }
@@ -240,6 +244,10 @@ __attribute__((always_inline)) inline void dfs_iter_(
             }
         }
 
+        // The node survived pruning: extend the prefix hash by this prime (one mix64
+        // per node instead of a full support_hash per leaf)
+        next.prefix_hash = lpr::bits::mix64(cur.prefix_hash ^ primes[i]);
+
         if (depth == OMEGA - 1) {
             mpz_fdiv_q(
                 d_max_mpz.get_mpz_t(),
@@ -250,6 +258,9 @@ __attribute__((always_inline)) inline void dfs_iter_(
             const unsigned d_max = d_max_mpz.get_ui();
 
             ++stats.supports_emitted;
+            assert(next.prefix_hash == lpr::bits::support_hash(support.data(), support.size())
+                   && "incremental prefix hash disagrees with support_hash");
+            stats.supports_checksum += next.prefix_hash;
             stats.d_max_sum += d_max;
             if (d_max > stats.d_max_max) {
                 stats.d_max_max = d_max;

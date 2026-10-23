@@ -48,6 +48,9 @@ struct Counters {
     std::uint64_t cor4_reused = 0; // First child reuses its parent's minimal completion
     std::uint64_t inherited_bound_prunes = 0; // Pruned by parent's Cor 4 bound before evaluating Cor 4
     std::uint64_t supports_emitted = 0;
+    // Sum (mod 2^64) of lpr::bits::support_hash over emitted supports: a checksum of
+    // the set of supports, independent of emission order, to compare runs
+    std::uint64_t supports_checksum = 0;
     std::uint64_t d_max_sum = 0;
     std::uint64_t d_max_max = 0;
     std::uint64_t batches_pushed = 0; // Batches handed to the queue
@@ -82,6 +85,7 @@ struct Counters {
         cor4_reused += other.cor4_reused;
         inherited_bound_prunes += other.inherited_bound_prunes;
         supports_emitted += other.supports_emitted;
+        supports_checksum += other.supports_checksum; // Wraps mod 2^64
         d_max_sum += other.d_max_sum;
         d_max_max = std::max(d_max_max, other.d_max_max);
         batches_pushed += other.batches_pushed;
@@ -157,6 +161,7 @@ struct Counters {
                   << "Corollary 4 results reused by first child: " << cor4_reused << '\n'
                   << "Pruned by inherited Corollary 4 bound: " << inherited_bound_prunes << '\n'
                   << "Supports emitted: " << supports_emitted << '\n'
+                  << "Supports checksum: 0x" << std::hex << supports_checksum << std::dec << '\n'
                   << "Sum of d_max over emitted supports: " << d_max_sum << '\n'
                   << "Largest d_max: " << d_max_max << '\n'
                   << "Batches pushed to queue: " << batches_pushed << '\n'
