@@ -1,4 +1,4 @@
-# Plan: one search across several nodes (shared task pool), and interleaved multiplication
+# Plan: one search across several nodes (shared task pool), interleaved multiplication and single-node speed-ups
 
 Status: **plan, written 24/10/26; not implemented.** It replaces the sketch in `cluster_roadmap.md` Stage 5. It builds on work stealing (`work_stealing.md`) and checkpoints (`checkpointing.md`).
 
@@ -100,3 +100,42 @@ With hundreds of nodes, polling every 10–30 s with one directory listing each 
 
   If the best choice depends on SMT, choose it at startup from `/sys/devices/system/cpu/smt/active` (the job script already prints it), or with a flag.
 - **After adopting it,** re-tune `TRIAL_DIVISION_MAX_PRIME`: cheaper Fermat tests move the best trial-division limit.
+
+## 6. Single-node speed-ups to do first (planned 24/10/26)
+The search-size estimates (`experimental/estimate`, 24/10/26) put OMEGA=31 S=28 at roughly 2×10^12 supports, about 3 weeks on 24 Rangpur cores, and OMEGA=30 S=27 at roughly 4–5×10^13 supports, about 1–1.5 years on 24 cores (lower bounds; see `experimental/estimate/README.md`). Each step down in OMEGA costs roughly 20–30× more. The ideas below are verifiable exactly, like everything else: identical summaries, supports checksum and DFS counters.
+
+### 6.1 Trial division by the residue of d (`process_support`, `trial_division.hpp`)
+- **Now:** each candidate p = Q·d + 1, a number of up to 190 bits, is reduced modulo 64-bit products of small primes (`remainder_3` per chunk), then tested per prime.
+- **Idea:** for a small prime r not dividing Q, r | p ⟺ Q·d ≡ −1 (mod r) ⟺ d ≡ t_r := −Q⁻¹ (mod r). So, per support:
+  - compute Q mod r for every trial prime (one pass over Q's limbs per chunk, as now, but per support rather than per candidate);
+  - invert it (a table of inverses mod r, or one extended-gcd step);
+  - after that, each candidate needs only `d % r == t_r` on a 32-bit d, or a Granlund–Montgomery divisibility test of d − t_r. That's no multiprecision arithmetic per candidate, and it vectorises across primes.
+- **Primes dividing Q** (support primes) never divide p and are skipped, as now.
+- **Gain:** grows with candidates per support. OMEGA=32 has 1.48 per support (modest gain); OMEGA=30 has much larger d_max (up to about 2×10^5 seen, against 965 at OMEGA=32), so trial division would become almost free there.
+- **Also:** re-tune `TRIAL_DIVISION_MAX_PRIME` afterwards. Cheaper trial division moves the best limit up, which removes more Fermat tests.
+- **Verification:**
+  - identical counts per trial-division chunk;
+  - a debug cross-check against `remainder_3` for every candidate;
+  - an exhaustive test of the residue computation for every r in the table.
+
+### 6.2 Log-domain DFS checks with an exact fallback (`run_region`, `sibling_fate`, `split_region`)
+- **The identity:** with r = SOP/Q = Σ 1/p over the Corollary 4 window, Q cancels:
+  - lhs/rhs = 4218 · 2^(16(ω−s)) · ((s+1−2r)/(1−r))^16;
+  - bound = floor(lhs/rhs − 1).
+- **The check:** each node needs only log(product), log(stored bound) and r, so a check costs about 60 floating-point operations (about 30 log and reciprocal additions plus one log) instead of about 30 GMP multiplications and two 16th powers.
+- **Exactness:** every comparison whose margin is below 1e-9 in log space is decided by the exact GMP check (float error is about 1e-12). The DFS's decisions therefore stay exact.
+- **Still exact where it matters:** leaves still compute `d_max` and Q exactly for the job, because `process_support` needs the exact values. The exact frames can be rebuilt lazily for leaves only, or kept for the last levels.
+- **Evidence:** in `experimental/estimate` this is implemented and validated:
+  - it reproduces OMEGA=33 S=30 exactly with 6 fallbacks;
+  - its children ranges match exact ones at 9,600 of 9,600 random nodes.
+- **Expected gain:** the DFS is about 15% of a run at OMEGA=33, and less where processing per support grows. Also faster splits and estimates.
+- **Verification:**
+  - identical DFS counters and checksum;
+  - debug builds run both checks on every node and compare;
+  - a count of fallbacks per run in the producer summary.
+
+### 6.3 Later, if still needed: GPU Fermat tests
+- **Why the Fermat test:** it is a fixed-size (3-limb) Montgomery exponentiation over huge independent batches, the ideal GPU workload. Montgomery arithmetic is about 79% of the work (notes, 18/10/26).
+- **Split of work:** the CPU keeps the DFS, trial division and certification of g(p).
+- **The proof needs safeguards:** a wrongly reported "composite" silently drops a prime. Use ECC hardware, CPU recomputation of a random sample (or of all survivors), and per-batch checksums.
+- **When:** consider it after 6.1, 6.2, interleaving (§5) and the shared pool (§2) are in, if the remaining gap justifies it.

@@ -370,3 +370,22 @@ Currently the thief gets ⌈count/2⌉ of the feasible untouched siblings, i.e. 
   - **Usage errors (exit 2):** `--steal-max-prefix` 0 and 34; `--single --threads`; two modes at once; `--parallel --split-test`; a bad `--split-test-order`.
   - **Exit 0:** OMEGA=34 with 4 threads (0 supports, checksum 0x0).
   - **Exit 3:** SIGTERM.
+
+## 8. Observation: work stealing reverses the processing order (24/10/26)
+The two OMEGA=32, S=29 runs on Rangpur process the same 6,057,734,933 supports (8,986,188,918 candidates, 1.483 per support overall) in very different orders. Candidates per support over time, from the progress logs:
+
+| Supports done | Queue mode, cumulative (job 685755, 16 threads) | Queue mode, latest interval | Work stealing, cumulative (job 690984, 24 threads) | Work stealing, latest interval |
+|---|---|---|---|---|
+| first ~2% | 2.25 | 2.25 | 1.38 | 1.38 |
+| ~30% | 1.67 | 1.57 | 1.38 | 1.38 |
+| ~60% | 1.58 | 1.45 | 1.41 | 1.52 |
+| ~85% | 1.52 | 1.25 | 1.46 | 1.63 |
+| 100% | 1.483 | 1.14 | 1.483 | 1.63 |
+
+- **Queue mode** emits supports in global lexicographic order. The first supports (consecutive small primes with a late deviation) have the most candidates, and later ones, with larger primes earlier in the support, have fewer. Candidates per support fall steadily (2.25 → 1.14 per interval), as intuition suggests.
+- **Work stealing** splits off the *upper* half of the untouched siblings at the shallowest possible level. So the first steals hand the large-prime, late-lexicographic regions, which are cheap per support, to 23 of the 24 workers, while worker 0 continues from the start. Early on, most of the machine processes cheap supports; the expensive early-lexicographic part is shared out later, as those regions are split again. Candidates per support therefore *rise* over time (1.38 → 1.63 per interval).
+- **Consequences:**
+  - **Progress estimates:** under work stealing, an ETA from supports per second is optimistic. Job 690984's rate fell from 1.45M to 1.26M supports/s, and its projected 08:52 finish became 08:56. Candidates per second stayed flat at about 2.0M/s and are the better progress measure. A later improvement: an ETA in the progress line based on candidates, or on `experimental/estimate`'s estimate of the total.
+  - **Nothing changes for correctness or for the totals,** which are identical between the modes.
+  - **A checkpoint taken mid-run holds a mix of expensive and cheap regions,** not a lexicographic prefix. "x% of supports done" is therefore not "x% of the time".
+  - **For the multi-node pool** (`multinode_plan.md`): tasks split off early are cheap per support, so "largest first" must mean largest by estimated *work* (candidates), not by number of supports or by index range.

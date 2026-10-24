@@ -17,6 +17,7 @@
 #include "config.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -43,6 +44,7 @@ struct Options {
     double checkpoint_interval = 600; // --checkpoint-interval SECONDS between checkpoints (0 = only on signals and at the end)
     std::string resume_file; // --resume PATH: continue the run saved there (empty = new search)
     bool resume_any_commit = false; // --resume-any-commit: accept a checkpoint from another commit
+    std::uint64_t expected_candidates = 0; // --expected-candidates N: total for the progress ETA (0 = unknown)
     bool help = false;
 
     bool checkpointing() const { return !checkpoint_file.empty() || !resume_file.empty(); }
@@ -98,6 +100,12 @@ Options:
   --log-interval SECONDS Seconds between progress logs (default 120, 0 disables)
   --log-file PATH        Append progress logs to PATH instead of stderr.
                          Warnings always also go to stderr
+  --expected-candidates N
+                         Expected total of "Candidates not covered by Corollary 4"
+                         (from experimental/estimate or an earlier run): the
+                         progress line then shows the percentage done and an ETA.
+                         Under work stealing candidates/s is steadier than
+                         supports/s, so the ETA is based on candidates
   -h, --help             Show this help
 
 Checkpoints (with --single, --parallel or --dry-run; see docs/checkpointing.md):
@@ -140,6 +148,19 @@ inline std::optional<unsigned> parse_unsigned(const std::string& text) {
     for (char c : text) {
         if (c < '0' || c > '9') return std::nullopt;
         value = value * 10 + static_cast<unsigned>(c - '0');
+    }
+    return value;
+}
+
+// Strict unsigned 64-bit decimal: digits only, no overflow
+inline std::optional<std::uint64_t> parse_u64(const std::string& text) {
+    if (text.empty() || text.size() > 20) return std::nullopt;
+    std::uint64_t value = 0;
+    for (char c : text) {
+        if (c < '0' || c > '9') return std::nullopt;
+        const std::uint64_t digit = static_cast<std::uint64_t>(c - '0');
+        if (value > (UINT64_MAX - digit) / 10) return std::nullopt;
+        value = value * 10 + digit;
     }
     return value;
 }
@@ -251,6 +272,11 @@ inline ParseResult parse(int argc, char* argv[]) {
             options.resume_file = *v;
         } else if (arg == "--resume-any-commit" && flag_only()) {
             options.resume_any_commit = true;
+        } else if (arg == "--expected-candidates") {
+            const auto v = value();
+            const auto n = v ? parse_u64(*v) : std::nullopt;
+            if (!n || *n == 0) return {std::nullopt, "--expected-candidates needs a positive integer"};
+            options.expected_candidates = *n;
         } else if (arg == "--log-file") {
             const auto v = value();
             if (!v || v->empty()) return {std::nullopt, "--log-file needs a path"};

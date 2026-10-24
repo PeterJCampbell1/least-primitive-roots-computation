@@ -82,3 +82,5 @@ dfs_test
 __pycache__/
 
 TODO.md
+.bench/*
+.runs/*

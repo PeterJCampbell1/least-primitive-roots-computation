@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -108,7 +109,8 @@ std::string hostname() {
 std::string progress_line(
     const lpr::stats::Counters& s,
     double supports_per_second,
-    const std::string& mode_fields
+    const std::string& mode_fields,
+    const std::string& eta_fields = ""
 ) {
     std::ostringstream out;
     out << "progress:"
@@ -127,7 +129,45 @@ std::string progress_line(
         << " consumer_wait_s=" << std::setprecision(1) << s.consumer_wait_ns / 1e9
         << " regions_split=" << s.regions_split
         << " idle_s=" << std::setprecision(1) << s.worker_idle_ns / 1e9
-        << " position=" << lpr::producer::dfs_position_string();
+        << " position=" << lpr::producer::dfs_position_string()
+        << eta_fields;
+    return out.str();
+}
+
+// "1d 02h", "3h 25m", "12m 05s" or "40s"
+std::string duration_string(double seconds) {
+    const auto s = static_cast<long long>(seconds + 0.5);
+    char buf[64];
+    if (s >= 86400) std::snprintf(buf, sizeof buf, "%lldd %02lldh", s / 86400, (s % 86400) / 3600);
+    else if (s >= 3600) std::snprintf(buf, sizeof buf, "%lldh %02lldm", s / 3600, (s % 3600) / 60);
+    else if (s >= 60) std::snprintf(buf, sizeof buf, "%lldm %02llds", s / 60, s % 60);
+    else std::snprintf(buf, sizeof buf, "%llds", s);
+    return buf;
+}
+
+/*
+ * Candidate-based rate and ETA fields for the progress line: the average number
+ * of candidates per second since this run started (steadier than supports per
+ * second under work stealing, which does cheap supports first; see
+ * docs/work_stealing.md section 8) and, if the expected total is known
+ * (--expected-candidates), the percentage done and the time remaining.
+ */
+std::string eta_fields(const lpr::stats::Counters& s, std::uint64_t start_candidates, double seconds,
+                       std::uint64_t expected_candidates) {
+    std::ostringstream out;
+    const double done = static_cast<double>(s.candidate_count - start_candidates);
+    const double rate = seconds > 0 ? done / seconds : 0.0;
+    out << std::fixed << std::setprecision(0) << " candidates_per_s=" << rate;
+    if (expected_candidates > 0) {
+        const double total = static_cast<double>(expected_candidates);
+        const double have = static_cast<double>(s.candidate_count);
+        out << std::setprecision(1) << " done=" << 100.0 * have / total << '%';
+        if (have >= total) {
+            out << " eta=past_expected_total";
+        } else if (rate > 0) {
+            out << " eta=" << duration_string((total - have) / rate);
+        }
+    }
     return out.str();
 }
 
@@ -157,10 +197,12 @@ public:
         std::function<std::string()> mode_fields,
         CheckpointFn checkpoint = {},
         double checkpoint_interval = 0,
-        std::string checkpoint_path = ""
+        std::string checkpoint_path = "",
+        std::uint64_t expected_candidates = 0
     ) : log_interval_(log_interval), start_(start), mode_fields_(std::move(mode_fields)),
         checkpoint_(std::move(checkpoint)), checkpoint_interval_(checkpoint_interval),
-        checkpoint_path_(std::move(checkpoint_path)) {
+        checkpoint_path_(std::move(checkpoint_path)), expected_candidates_(expected_candidates),
+        start_candidates_(lpr::stats::get_master_stats().snapshot().candidate_count) {
         thread_ = std::thread([this]() { run(); });
     }
 
@@ -187,6 +229,8 @@ private:
     CheckpointFn checkpoint_;
     double checkpoint_interval_;
     std::string checkpoint_path_;
+    std::uint64_t expected_candidates_;
+    std::uint64_t start_candidates_; // Candidates done in earlier runs (resumed), excluded from the rate
     bool ignore_signals_ = false; // A signal arrived while the search was finishing
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -232,7 +276,9 @@ private:
                 const lpr::stats::Counters snapshot = lpr::stats::get_master_stats().snapshot();
                 const double seconds = std::chrono::duration<double>(now - last_log).count();
                 const double rate = (snapshot.total_support_count - last_processed) / seconds;
-                lpr::log::info(progress_line(snapshot, rate, mode_fields_()));
+                const double since_start = std::chrono::duration<double>(now - start_).count();
+                lpr::log::info(progress_line(snapshot, rate, mode_fields_(),
+                                             eta_fields(snapshot, start_candidates_, since_start, expected_candidates_)));
                 last_processed = snapshot.total_support_count;
                 last_log = now;
             }
@@ -562,6 +608,9 @@ int main(int argc, char* argv[])
                   << (commit_differs ? "; WARNING: written by commit " + resumed.fingerprint.commit : "")
                   << ")\n";
     }
+    if (options.expected_candidates > 0) {
+        std::cout << "expected candidates: " << options.expected_candidates << " (for the progress ETA)\n";
+    }
     std::cout << "progress log: ";
     if (options.log_interval == 0) {
         std::cout << "disabled\n";
@@ -657,7 +706,7 @@ int main(int argc, char* argv[])
             if (work_stealing) return "queue=- active_workers=" + std::to_string(scheduler.active_workers());
             return "queue=-";
         }, options.checkpoint_file.empty() ? Monitor::CheckpointFn{} : Monitor::CheckpointFn(take_checkpoint),
-           options.checkpoint_interval, options.checkpoint_file);
+           options.checkpoint_interval, options.checkpoint_file, options.expected_candidates);
 
         if (use_scheduler && mode == RunMode::DryRun) {
             scheduler.run<false>();
