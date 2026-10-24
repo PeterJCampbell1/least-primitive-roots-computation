@@ -108,6 +108,8 @@ $\omega = 32$ takes about 6 h on 8 threads, and even at the 14-thread ceiling th
 
 > **Update 23/10/26:** parallelism is now work stealing (`--parallel`; `docs/work_stealing.md`), which replaces stages 2–3 below: every thread searches its own region, so there is no single producer to limit scaling. Checkpointing (stage 1) becomes simpler: a checkpoint is each worker's region and DFS position, with no completion buffer (`docs/work_stealing_plan.md`, phase 6). Item 3 ("size jobs to the single producer") applies only to `--parallel-queue`.
 
+> **Update 24/10/26:** checkpoint/resume (stage 1 below, and items 4–5 of the earlier list) is implemented for `--single`, `--parallel` and `--dry-run`: `--checkpoint`, `--checkpoint-interval`, `--resume`, exit code 4, and a Slurm job that requeues itself after the time-limit signal. See `docs/checkpointing.md`.
+
 ## Stage 1: Checkpoint/resume with the single producer (the first code change)
 Needed as soon as a run can exceed the wall-time limit. OMEGA=32 takes about 6 h on 8 threads.
 - **Batch sequence numbers:** the producer numbers each batch and records its first support.
@@ -142,6 +144,8 @@ Needed as soon as a run can exceed the wall-time limit. OMEGA=32 takes about 6 h
 - Profile lock contention at 64+ threads.
 
 ## Stage 5 (only if one node is not enough): several nodes
+> **Update 24/10/26:** superseded by the detailed plan in [`multinode_plan.md`](multinode_plan.md): a shared task pool on the cluster filesystem, with donation when the pool runs low, a termination rule and a coverage-checked merge. It also keeps interleaved multiplication (with an SMT test) on the TODO list. The original sketch follows.
+
 The simplest route is a Slurm job array **without MPI**:
 - split the tree statically into disjoint regions (for example by first-level sibling ranges, using the stage 2 code), and give each array task one region;
 - each task runs its own multi-threaded `lpr` with checkpointing;

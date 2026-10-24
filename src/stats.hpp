@@ -6,7 +6,8 @@
  * the monitor thread reads for progress logs and main prints at the end.
  *
  * Counters is a plain aggregate, so it copies correctly by default. When adding
- * a counter, add it to merge() and to print() or print_producer().
+ * a counter, add it to merge(), to for_each_field() (checkpoints) and to print()
+ * or print_producer().
  **/
 
 #pragma once
@@ -22,6 +23,7 @@
 #include <cstdint>
 #include <iostream>
 #include <mutex>
+#include <string>
 
 namespace lpr::stats {
 
@@ -214,10 +216,79 @@ struct Counters {
         std::cout << (any ? "\n" : " none\n");
     }
 
+    /*
+     * Calls f(name, field) for every counter (array entries as "name.i"), in a
+     * fixed order. Used to save and load statistics in checkpoints
+     * (checkpoint.hpp). Every member must be listed: field_bytes() checks that
+     * the listed fields cover sizeof(Counters) (main checks it at startup).
+     */
+    template <typename Self, typename F>
+    static void for_each_field(Self& c, F&& f) {
+        f("total_support_count", c.total_support_count);
+        f("candidate_count", c.candidate_count);
+        f("small_prime_composite_count", c.small_prime_composite_count);
+        each(c.composite_caught_at, "composite_caught_at", f);
+        f("fermat_composite_count", c.fermat_composite_count);
+        f("fermat_survivor_count", c.fermat_survivor_count);
+        f("mont3_fallback_count", c.mont3_fallback_count);
+        f("certified_count", c.certified_count);
+        f("unresolved_count", c.unresolved_count);
+        f("certified_inequality_pass_count", c.certified_inequality_pass_count);
+        f("certified_inequality_fail_count", c.certified_inequality_fail_count);
+        f("largest_least_primitive_root", c.largest_least_primitive_root);
+        each(c.winners_by_g, "winners_by_g", f);
+
+        f("dfs_nodes_visited", c.dfs_nodes_visited);
+        f("cor4_evaluations", c.cor4_evaluations);
+        f("cor4_reused", c.cor4_reused);
+        f("inherited_bound_prunes", c.inherited_bound_prunes);
+        f("supports_emitted", c.supports_emitted);
+        f("supports_checksum", c.supports_checksum);
+        f("d_max_sum", c.d_max_sum);
+        f("d_max_max", c.d_max_max);
+        f("batches_pushed", c.batches_pushed);
+        f("batches_coprocessed", c.batches_coprocessed);
+        f("consumer_waits", c.consumer_waits);
+        f("consumer_wait_ns", c.consumer_wait_ns);
+        f("regions_split", c.regions_split);
+        f("region_step_downs", c.region_step_downs);
+        f("steal_requests", c.steal_requests);
+        f("steal_refusals", c.steal_refusals);
+        f("steal_withdrawals", c.steal_withdrawals);
+        f("worker_idle_ns", c.worker_idle_ns);
+        f("steal_wait_ns", c.steal_wait_ns);
+        f("steal_backoff_ns", c.steal_backoff_ns);
+        f("split_ns", c.split_ns);
+        f("requests_refused_idle", c.requests_refused_idle);
+        f("requests_refused_busy", c.requests_refused_busy);
+        each(c.splits_at_depth, "splits_at_depth", f);
+
+        f("lpr_jacobi_calls", c.lpr_jacobi_calls);
+        f("lpr_legendre_survivors", c.lpr_legendre_survivors);
+        f("lpr_root_powm_count", c.lpr_root_powm_count);
+        f("lpr_tree_powm_count", c.lpr_tree_powm_count);
+        each(c.winners_by_class, "winners_by_class", f);
+    }
+
+    // Bytes covered by for_each_field (must equal sizeof(Counters))
+    static std::size_t field_bytes() {
+        Counters c;
+        std::size_t bytes = 0;
+        for_each_field(c, [&](const std::string&, std::uint64_t& v) { bytes += sizeof(v); });
+        return bytes;
+    }
+
 private:
     template <typename Array>
     static void add(Array& into, const Array& from) {
         for (std::size_t i = 0; i < into.size(); ++i) into[i] += from[i];
+    }
+
+    template <typename Array, typename F>
+    static void each(Array& array, const char* name, F& f) {
+        for (std::size_t i = 0; i < array.size(); ++i) {
+            f(std::string(name) + "." + std::to_string(i), array[i]);
+        }
     }
 };
 

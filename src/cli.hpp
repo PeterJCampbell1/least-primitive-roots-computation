@@ -5,6 +5,8 @@
  *          --parallel-queue (1 producer + consumers), --dry-run.
  * Options: --threads N, --log-interval SECONDS, --log-file PATH,
  *          --config PATH, --omega N, --s N, -h/--help.
+ * Checkpoints: --checkpoint PATH, --checkpoint-interval SECONDS, --resume PATH,
+ *          --resume-any-commit (docs/checkpointing.md).
  * Testing/tuning: --split-test N, --split-test-order lifo|fifo, --steal-stress,
  *          --steal-max-prefix K.
  * Value options accept both "--opt value" and "--opt=value".
@@ -14,6 +16,7 @@
 
 #include "config.hpp"
 
+#include <cmath>
 #include <cstdlib>
 #include <optional>
 #include <string>
@@ -36,7 +39,13 @@ struct Options {
     bool split_test_fifo = false; // --split-test-order fifo (default lifo)
     bool steal_stress = false; // --steal-stress: idle workers never back off
     unsigned steal_max_prefix = 0; // --steal-max-prefix K: split only regions whose prefix has < K primes (0 = omega)
+    std::string checkpoint_file; // --checkpoint PATH: write checkpoints there (empty = none)
+    double checkpoint_interval = 600; // --checkpoint-interval SECONDS between checkpoints (0 = only on signals and at the end)
+    std::string resume_file; // --resume PATH: continue the run saved there (empty = new search)
+    bool resume_any_commit = false; // --resume-any-commit: accept a checkpoint from another commit
     bool help = false;
+
+    bool checkpointing() const { return !checkpoint_file.empty() || !resume_file.empty(); }
 };
 
 struct ParseResult {
@@ -91,6 +100,18 @@ Options:
                          Warnings always also go to stderr
   -h, --help             Show this help
 
+Checkpoints (with --single, --parallel or --dry-run; see docs/checkpointing.md):
+  --checkpoint PATH      Save progress to PATH every --checkpoint-interval seconds,
+                         on SIGTERM/SIGINT (then exit with code 4) and at the end
+  --checkpoint-interval SECONDS
+                         Seconds between checkpoints (default 600; decimals allowed;
+                         0 = only on signals and at the end)
+  --resume PATH          Continue the run saved in PATH (refused if omega, s, the
+                         bound, other search settings, dry run or the commit
+                         differ). The thread count and mode may differ. Usually
+                         combined with --checkpoint PATH (the same file)
+  --resume-any-commit    With --resume: accept a checkpoint written by another commit
+
 Testing options:
   --split-test N         With --single or a 1-thread --dry-run: split the search
                          region every N DFS steps into a work list and run the
@@ -107,7 +128,8 @@ Exit codes:
   0  complete: every candidate certified and Grosswald's inequality holds
   1  complete, but a Grosswald failure or an unresolved candidate was found
   2  usage error
-  3  interrupted (SIGTERM/SIGINT): partial run, nothing is verified
+  3  interrupted (SIGTERM/SIGINT): partial run, nothing is verified, no checkpoint
+  4  interrupted (SIGTERM/SIGINT) and a checkpoint was written: continue with --resume
 )";
 }
 
@@ -122,11 +144,26 @@ inline std::optional<unsigned> parse_unsigned(const std::string& text) {
     return value;
 }
 
+// Strict non-negative decimal (e.g. "600", "0.5"); at most 10^7
+inline std::optional<double> parse_seconds(const std::string& text) {
+    if (text.empty() || text.size() > 20) return std::nullopt;
+    for (char c : text) {
+        if (!((c >= '0' && c <= '9') || c == '.')) return std::nullopt;
+    }
+    char* end = nullptr;
+    const double value = std::strtod(text.c_str(), &end);
+    if (end == text.c_str() || *end != '\0' || !std::isfinite(value) || value < 0 || value > 1e7) {
+        return std::nullopt;
+    }
+    return value;
+}
+
 inline ParseResult parse(int argc, char* argv[]) {
     Options options;
     int modes_given = 0;
     bool threads_given = false;
     bool split_order_given = false;
+    bool checkpoint_interval_given = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -198,6 +235,22 @@ inline ParseResult parse(int argc, char* argv[]) {
             const auto n = v ? parse_unsigned(*v) : std::nullopt;
             if (!n || *n == 0) return {std::nullopt, "--steal-max-prefix needs a positive integer"};
             options.steal_max_prefix = *n;
+        } else if (arg == "--checkpoint") {
+            const auto v = value();
+            if (!v || v->empty()) return {std::nullopt, "--checkpoint needs a path"};
+            options.checkpoint_file = *v;
+        } else if (arg == "--checkpoint-interval") {
+            const auto v = value();
+            const auto t = v ? parse_seconds(*v) : std::nullopt;
+            if (!t) return {std::nullopt, "--checkpoint-interval needs a non-negative number of seconds"};
+            options.checkpoint_interval = *t;
+            checkpoint_interval_given = true;
+        } else if (arg == "--resume") {
+            const auto v = value();
+            if (!v || v->empty()) return {std::nullopt, "--resume needs a path"};
+            options.resume_file = *v;
+        } else if (arg == "--resume-any-commit" && flag_only()) {
+            options.resume_any_commit = true;
         } else if (arg == "--log-file") {
             const auto v = value();
             if (!v || v->empty()) return {std::nullopt, "--log-file needs a path"};
@@ -254,6 +307,21 @@ inline ParseResult parse(int argc, char* argv[]) {
     }
     if (options.steal_max_prefix > 0 && !threaded_search) {
         return {std::nullopt, "--steal-max-prefix needs --parallel or a threaded --dry-run (--threads N, N > 1)"};
+    }
+
+    // Checkpoints
+    if (checkpoint_interval_given && options.checkpoint_file.empty()) {
+        return {std::nullopt, "--checkpoint-interval needs --checkpoint PATH"};
+    }
+    if (options.resume_any_commit && options.resume_file.empty()) {
+        return {std::nullopt, "--resume-any-commit needs --resume PATH"};
+    }
+    if (options.checkpointing() && options.mode == RunMode::ParallelQueue) {
+        return {std::nullopt, "--checkpoint and --resume work with --single, --parallel or --dry-run, "
+                              "not --parallel-queue"};
+    }
+    if (options.checkpointing() && options.split_test_interval > 0) {
+        return {std::nullopt, "--checkpoint and --resume cannot be combined with --split-test"};
     }
 
     return {options, ""};

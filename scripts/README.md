@@ -115,6 +115,24 @@ The output's `[build_lpr]` lines and the run header's `build:` line show what wa
 | `--dry-run` | Prepare everything and print the `sbatch` command without submitting. |
 | `--help` | Full description. |
 
+## Long runs: checkpoints and automatic requeueing
+
+Every job (except `--parallel-queue`) saves its progress to `lpr.ckpt` in its run directory: every 600 s (`LPR_CHECKPOINT_INTERVAL`), and when Slurm sends SIGTERM 5 minutes before the time limit (`--signal=TERM@300`). `lpr` then exits with code 4, and the job **requeues itself**. The requeued job keeps its job id, rebuilds `lpr` on whichever node it gets, finds `lpr.ckpt` and continues from it. This repeats until the search is complete, or until 20 runs (`LPR_MAX_RUNS`). So a search longer than the partition's time limit, such as OMEGA=32, can be submitted once with any `--time`.
+
+- **Output:** every run is appended to the same `lpr_<jobid>.out`. Its header says `resumed from: lpr.ckpt (run k; …)`, and the final summary is identical to an uninterrupted run's, with an extra line `Elapsed time over all k runs`.
+- **Continuing by hand** (if requeueing is disabled with `LPR_REQUEUE=0`, `scontrol requeue` is not allowed on your cluster, or the run limit was reached): run `resubmit.sh` in the run directory, optionally with new `sbatch` options:
+  ```bash
+  ~/lpr_runs/<run>/resubmit.sh --time=12:00:00
+  ```
+  It repeats the original submission in the same directory, using the job file as it was submitted (`job.slurm` there).
+- **Refusals:**
+  - `lpr` refuses to resume a checkpoint from a different search or commit. Each run directory is one commit, so this only matters if files are copied between directories.
+  - It refuses to start a new search over an existing checkpoint without `--resume`.
+- **After completion** `lpr.ckpt` is marked `complete 1`. A stray requeue just prints the final summary again.
+- **Job state:** `sacct -j <jobid>` shows a requeued job as `REQUEUED`, then `PENDING`/`RUNNING` again. `scontrol show job <jobid> | grep Restarts` counts the restarts.
+
+Details: [`docs/checkpointing.md`](../docs/checkpointing.md).
+
 ## Checking on runs
 
 ```bash
@@ -140,6 +158,9 @@ A successful verification run ends with `lpr finished: verification complete` an
 | `cannot download GMP from this node` | The compute nodes have no internet access. Copy `gmp-6.3.0.tar.xz` to `~` (see setup step 4). |
 | `lpr did not start: usage error` | Bad `--lpr-args`, e.g. two mode flags. `lpr_<jobid>.err` has `lpr`'s message. |
 | Results differ from the reference values | A real problem: stop and inspect the full output. |
+| `lpr was interrupted and saved its progress` but the job did not come back | Requeueing failed or was disabled (the `.out` file says which). Run `resubmit.sh` in the run directory. |
+| `cannot resume ... written by a different search` | `lpr.ckpt` belongs to another search (omega, s or a dry run). Use the run directory it came from. |
+| `checkpoint file 'lpr.ckpt' already exists` | A new search was started in a directory that already holds one. Don't reuse run directories; `submit.sh` always makes a new one. |
 
 ## The optional Makefile
 

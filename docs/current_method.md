@@ -151,7 +151,7 @@ A run verifies the case only if it **completes** (exit code 0) with
 - `Grosswald inequality failed: 0`, and
 - `No least primitive root certified within search limit: 0`.
 
-Otherwise the program exits with code 1, and prints each offending $p$ to stderr. An interrupted run (exit code 3) verifies nothing.
+Otherwise the program exits with code 1, and prints each offending $p$ to stderr. An interrupted run (exit code 3 or 4) verifies nothing by itself; a run continued from checkpoints (§9) verifies the case when its final run completes with exit code 0.
 
 ## 9. Parallel architecture
 
@@ -167,7 +167,7 @@ Otherwise the program exits with code 1, and prints each offending $p$ to stderr
 - **Jobs:** each job (`LPRJob`) is fixed size, with the support and $Q$ stored inline, so producing and consuming jobs needs no heap allocation.
 - **Statistics:** each thread counts into thread-local `Counters` and merges them into a mutex-guarded master copy at most once per second (staggered across threads), and finally when the thread exits. The work-stealing counters record the regions split off, the base step-downs, the steal requests (refused or withdrawn) and the workers' idle time. The queue mode records how long consumers wait on an empty queue (`consumer_wait_ns`).
 - **Monitoring:** a monitor thread logs a progress line every `--log-interval` seconds (default 120) to `--log-file`, or to stderr. Each line gives the supports emitted and processed, the rate, candidates, Fermat survivors, certified, failed, unresolved, the largest $g(p)$, the number of workers holding a region (or the queue length), the regions split off, the idle time, and the latest DFS position (in parallel mode, the position of whichever worker reported last).
-- **Signals:** on SIGTERM or SIGINT the monitor prints the statistics so far and exits with code 3. Runs cannot yet be resumed; with work stealing, a checkpoint is just each worker's region and DFS position (`work_stealing_plan.md`, phase 6).
+- **Signals and checkpoints:** on SIGTERM or SIGINT the monitor prints the statistics so far and exits with code 3. With `--checkpoint PATH` it first writes a checkpoint and exits with code 4, and it also checkpoints every `--checkpoint-interval` seconds and at the end. Supports are processed inline, so a worker's progress is its DFS position. A checkpoint therefore holds, after pausing every worker at a safe point, each remaining region with its index path, plus the statistics, which cover exactly the work before those positions. `--resume PATH` rebuilds the frames by replaying the paths and continues; the final summary equals an uninterrupted run's. Design and verification: [`checkpointing.md`](checkpointing.md).
 - **Dry run** (`--dry-run [--threads N]`): runs the DFS only and discards the supports; with N > 1 it uses work stealing. It checks the number of supports emitted, and the checksum, which must equal those of a full run.
 - **Testing options:** `--split-test N` (single-threaded splitting every N DFS steps) and `--steal-stress` (idle workers never back off); see `work_stealing.md`.
 

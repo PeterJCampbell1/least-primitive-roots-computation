@@ -13,6 +13,10 @@
 #      LPR_BUILD=1, so lpr is built on the compute node that runs it (with the commit
 #      compiled in via LPR_COMMIT). The job's output, error and log files are written to
 #      the run directory.
+# The job saves checkpoints to lpr.ckpt in the run directory and, when stopped by the
+# time limit, requeues itself until the search is complete (see scripts/slurm/lpr.slurm
+# and docs/checkpointing.md). To continue a stopped run by hand, run resubmit.sh in its
+# run directory (it resubmits the same job there; extra sbatch options may be given).
 # The build (scripts/slurm/build_lpr.sh, copied into the run directory from this
 # repository) runs in the job, never on the login node: it picks a compiler that can
 # link GMP and, if there is no usable GMP, builds GMP into $HOME/opt (once, shared by
@@ -129,6 +133,8 @@ mkdir -p "$run_dir"
 git -C "$repo" archive "$sha" | tar -x -C "$run_dir"
 # The build script comes from this repository, so it also works for older commits
 cp "$repo/scripts/slurm/build_lpr.sh" "$run_dir/build_lpr.sh"
+# The job file as submitted, so resubmit.sh uses the same one even if it is edited later
+cp "$job_script" "$run_dir/job.slurm"
 
 # 3. Record what is being run
 {
@@ -152,7 +158,20 @@ if [ -n "$pgo_train" ]; then export LPR_PGO_TRAIN="$pgo_train"; fi
 if [ -n "$gmp_tarball" ]; then export LPR_GMP_TARBALL="$gmp_tarball"; fi
 # (sbatch options must come before the job script; "${a[@]+...}" keeps bash 3.2 happy with set -u)
 cmd=(sbatch --parsable --chdir="$run_dir" --export=ALL,LPR_BUILD=1,LPR_COMMIT="$short"
-     ${sbatch_args[@]+"${sbatch_args[@]}"} "$job_script")
+     ${sbatch_args[@]+"${sbatch_args[@]}"})
+# resubmit.sh: the same submission, to continue a stopped run from its lpr.ckpt
+{
+    echo '#!/bin/bash'
+    echo "# Continue this run: resubmits its job in this directory, where lpr resumes from"
+    echo "# lpr.ckpt. Extra sbatch options may be given, e.g. resubmit.sh --time=08:00:00"
+    echo 'set -euo pipefail'
+    for var in LPR_CXX LPR_ARGS LPR_CXXFLAGS LPR_PGO LPR_PGO_TRAIN LPR_GMP_TARBALL; do
+        if [ -n "${!var:-}" ]; then printf 'export %s=%q\n' "$var" "${!var}"; fi
+    done
+    printf '%q ' "${cmd[@]}"; printf '"$@" %q\n' "$run_dir/job.slurm"
+} > "$run_dir/resubmit.sh"
+chmod +x "$run_dir/resubmit.sh"
+cmd+=("$run_dir/job.slurm")
 if [ "$dry_run" = 1 ]; then
     echo "Dry run: would submit from $run_dir:"
     printf '  %q' "${cmd[@]}"; echo

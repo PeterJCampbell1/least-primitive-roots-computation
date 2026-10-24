@@ -114,7 +114,9 @@ find_toolchain() {
             inc=""; lib=""
             [ -n "$prefix" ] && inc="-I$prefix/include" && lib="-L$prefix/lib -Wl,-rpath,$prefix/lib"
             if "$cxx" -std=c++17 -O1 $lto ${LPR_CXXFLAGS:-} $inc .build_test.cpp $ld $lib -lgmpxx -lgmp -pthread \
-                   -o .build_test > .build_test.log 2>&1 && ./.build_test > /dev/null 2>&1; then
+                   -o .build_test > .build_test.log 2>&1 && ( ./.build_test; exit $? ) > /dev/null 2>&1; then
+                # (a subshell that is not a bare exec: a GMP that dies with SIGILL is expected on some nodes; this
+                # keeps bash's "Illegal instruction" notice out of the job's .err file)
                 chosen="$name|$cxx|$lto|$ld|$prefix"
                 return 0
             fi

@@ -4,6 +4,7 @@
 #include "corollary4.hpp"
 #include "generate_supports.hpp"
 #include "work_stealing.hpp"
+#include "checkpoint.hpp"
 #include "process_support.hpp"
 #include "cli.hpp"
 #include "config.hpp"
@@ -29,7 +30,10 @@
 #include <ctime>
 #include <optional>
 #include <string>
-#include <unistd.h> // gethostname
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h> // gethostname, access, unlink
 
 #ifndef LPR_GIT_COMMIT
 #define LPR_GIT_COMMIT "unknown"
@@ -39,6 +43,8 @@
 namespace {
 
 constexpr int EXIT_INTERRUPTED = 3;
+constexpr int EXIT_CHECKPOINTED = 4; // Interrupted after writing a checkpoint
+constexpr auto PAUSE_TIMEOUT = std::chrono::seconds(120); // Workers must stop for a checkpoint within this
 
 // Generate all primes <= limit using the Sieve of Eratosthenes.
 // 64-bit indices so that limits close to UINT_MAX do not overflow.
@@ -125,18 +131,36 @@ std::string progress_line(
     return out.str();
 }
 
+// The result of an attempt to write a checkpoint (see main's take_checkpoint)
+struct CheckpointOutcome {
+    enum Kind { Written, SearchFinishing, Failed } kind = Failed;
+    lpr::stats::Counters stats; // Written: the statistics saved in the checkpoint
+    std::string message;        // Failed: why
+};
+
 /*
- * Background thread that logs progress every log_interval seconds (if non-zero)
- * and handles SIGTERM/SIGINT. It wakes once per second; on a signal it prints
- * the statistics so far (stdout and log) and exits with EXIT_INTERRUPTED.
+ * Background thread that logs progress every log_interval seconds (if non-zero),
+ * writes a checkpoint every checkpoint_interval seconds (if `checkpoint` is set
+ * and the interval is non-zero) and handles SIGTERM/SIGINT. It wakes at least
+ * once per second. On a signal it writes a checkpoint (if enabled; the workers
+ * stay stopped), prints the statistics so far (stdout and log) and exits with
+ * EXIT_CHECKPOINTED, or with EXIT_INTERRUPTED if there is no checkpoint. If the
+ * search is already finishing it lets the run complete normally instead.
  */
 class Monitor {
 public:
+    using CheckpointFn = std::function<CheckpointOutcome(bool stay_paused)>;
+
     Monitor(
         unsigned log_interval,
         std::chrono::steady_clock::time_point start,
-        std::function<std::string()> mode_fields
-    ) : log_interval_(log_interval), start_(start), mode_fields_(std::move(mode_fields)) {
+        std::function<std::string()> mode_fields,
+        CheckpointFn checkpoint = {},
+        double checkpoint_interval = 0,
+        std::string checkpoint_path = ""
+    ) : log_interval_(log_interval), start_(start), mode_fields_(std::move(mode_fields)),
+        checkpoint_(std::move(checkpoint)), checkpoint_interval_(checkpoint_interval),
+        checkpoint_path_(std::move(checkpoint_path)) {
         thread_ = std::thread([this]() { run(); });
     }
 
@@ -160,6 +184,10 @@ private:
     unsigned log_interval_;
     std::chrono::steady_clock::time_point start_;
     std::function<std::string()> mode_fields_;
+    CheckpointFn checkpoint_;
+    double checkpoint_interval_;
+    std::string checkpoint_path_;
+    bool ignore_signals_ = false; // A signal arrived while the search was finishing
     std::mutex mutex_;
     std::condition_variable cv_;
     bool stop_ = false;
@@ -168,18 +196,35 @@ private:
     void run() {
         using clock = std::chrono::steady_clock;
         auto last_log = clock::now();
-        std::uint64_t last_processed = 0;
+        // Resumed runs start with the earlier runs' statistics
+        std::uint64_t last_processed = lpr::stats::get_master_stats().snapshot().total_support_count;
+        const bool periodic = checkpoint_ && checkpoint_interval_ > 0;
+        const auto checkpoint_period = std::chrono::duration_cast<clock::duration>(
+            std::chrono::duration<double>(periodic ? checkpoint_interval_ : 1.0));
+        const auto wake_period = std::min<clock::duration>(std::chrono::seconds(1), checkpoint_period);
+        auto next_checkpoint = clock::now() + checkpoint_period;
 
         while (true) {
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                if (cv_.wait_for(lock, std::chrono::seconds(1), [this]() { return stop_; })) {
+                if (cv_.wait_for(lock, wake_period, [this]() { return stop_; })) {
                     return;
                 }
             }
 
-            if (g_signal != 0) {
+            if (g_signal != 0 && !ignore_signals_) {
                 handle_interrupt();
+            }
+
+            if (periodic && clock::now() >= next_checkpoint) {
+                const CheckpointOutcome outcome = checkpoint_(false);
+                if (outcome.kind == CheckpointOutcome::Written) {
+                    lpr::log::info("checkpoint: written to " + checkpoint_path_ + " ("
+                                   + std::to_string(outcome.stats.total_support_count) + " supports processed)");
+                } else if (outcome.kind == CheckpointOutcome::Failed) {
+                    lpr::log::warn("checkpoint not written: " + outcome.message);
+                }
+                next_checkpoint = clock::now() + checkpoint_period;
             }
 
             const auto now = clock::now();
@@ -194,13 +239,37 @@ private:
         }
     }
 
-    [[noreturn]] void handle_interrupt() {
+    // Exits the process, unless the search is already finishing (then it returns)
+    void handle_interrupt() {
         const int sig = g_signal;
-        const lpr::stats::Counters snapshot = lpr::stats::get_master_stats().snapshot();
+        lpr::stats::Counters snapshot;
+        int exit_code = EXIT_INTERRUPTED;
+        std::string checkpoint_note = "no checkpoint was written";
+        if (checkpoint_) {
+            const CheckpointOutcome outcome = checkpoint_(true); // Workers stay stopped until exit
+            if (outcome.kind == CheckpointOutcome::SearchFinishing) {
+                lpr::log::info("signal " + std::to_string(sig)
+                               + " received while the search is finishing: completing normally");
+                ignore_signals_ = true;
+                return;
+            }
+            if (outcome.kind == CheckpointOutcome::Written) {
+                snapshot = outcome.stats; // Exactly the work saved in the checkpoint
+                exit_code = EXIT_CHECKPOINTED;
+                checkpoint_note = "checkpoint written to " + checkpoint_path_ + "; continue with --resume "
+                                  + checkpoint_path_;
+            } else {
+                lpr::log::warn("checkpoint not written: " + outcome.message);
+                snapshot = lpr::stats::get_master_stats().snapshot();
+            }
+        } else {
+            snapshot = lpr::stats::get_master_stats().snapshot();
+        }
         const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_).count();
 
         const std::string notice = "INTERRUPTED by signal " + std::to_string(sig)
-            + " after " + std::to_string(elapsed) + " s: partial run, nothing has been verified";
+            + " after " + std::to_string(elapsed) + " s: partial run, nothing has been verified ("
+            + checkpoint_note + ")";
         lpr::log::info(notice);
         lpr::log::info(progress_line(snapshot, 0.0, mode_fields_()));
 
@@ -212,7 +281,7 @@ private:
         std::cout << "Elapsed time: " << elapsed << " s\n" << notice << '\n';
         std::cout.flush();
         std::cerr.flush();
-        std::_Exit(EXIT_INTERRUPTED);
+        std::_Exit(exit_code);
     }
 };
 
@@ -222,6 +291,11 @@ private:
 int main(int argc, char* argv[])
 {
     using lpr::cli::RunMode;
+
+    // First of all, so a signal during startup is not fatal: it is recorded and
+    // handled by the monitor once the search starts (a checkpoint, if enabled)
+    std::signal(SIGTERM, on_signal);
+    std::signal(SIGINT, on_signal);
 
     const lpr::cli::ParseResult parsed = lpr::cli::parse(argc, argv);
     if (!parsed.options) {
@@ -264,6 +338,12 @@ int main(int argc, char* argv[])
     // complete-tree split; this guards against regressions)
     if (!lpr::primality::testing::power_tree_layout_is_valid(search.omega - 1)) {
         std::cerr << "Error: invalid power tree layout for omega = " << search.omega << '\n';
+        return 2;
+    }
+
+    // Checkpoints save every statistic through Counters::for_each_field
+    if (lpr::stats::Counters::field_bytes() != sizeof(lpr::stats::Counters)) {
+        std::cerr << "Error: Counters::for_each_field does not list every counter\n";
         return 2;
     }
 
@@ -370,6 +450,82 @@ int main(int argc, char* argv[])
         return 2;
     }
 
+    // Checkpoints: this run's fingerprint, and the run to continue (--resume)
+    lpr::checkpoint::Fingerprint fingerprint;
+    {
+        std::string commit = LPR_GIT_COMMIT;
+        std::replace(commit.begin(), commit.end(), ' ', '_'); // One word in the file
+        fingerprint.commit = commit;
+        fingerprint.omega = OMEGA;
+        fingerprint.s = search.s;
+        fingerprint.prime_limit = prime_limit;
+        fingerprint.num_primes = primes.size();
+        fingerprint.bound_hex = bound.get_str(16);
+        fingerprint.primitive_root_search_limit = parameters::PRIMITIVE_ROOT_SEARCH_LIMIT;
+        fingerprint.trial_division_min = lpr::trial_division::table().min_prime;
+        fingerprint.trial_division_max = lpr::trial_division::table().max_prime;
+        fingerprint.processing = mode != RunMode::DryRun;
+    }
+    std::vector<lpr::producer::detail::Task> tasks{lpr::producer::detail::root_task(primes.size())};
+    lpr::checkpoint::Checkpoint resumed; // Valid if resuming
+    const bool resuming = !options.resume_file.empty();
+    bool commit_differs = false;
+    if (resuming) {
+        std::string error;
+        if (!lpr::checkpoint::load(options.resume_file, resumed, error)) {
+            std::cerr << "Error: cannot resume: " << error << '\n';
+            return 2;
+        }
+        const std::string differences = lpr::checkpoint::compare(resumed.fingerprint, fingerprint, &commit_differs);
+        if (!differences.empty()) {
+            std::cerr << "Error: cannot resume from '" << options.resume_file
+                      << "': it was written by a different search:\n" << differences;
+            return 2;
+        }
+        if (commit_differs && !options.resume_any_commit) {
+            std::cerr << "Error: cannot resume from '" << options.resume_file << "': it was written by commit "
+                      << resumed.fingerprint.commit << ", this is " << fingerprint.commit
+                      << " (pass --resume-any-commit to accept it)\n";
+            return 2;
+        }
+        // Every task must be a position the DFS can reach (checked by replaying it)
+        lpr::producer::detail::DfsStack check(bound, primes.size());
+        std::vector<unsigned> check_support = lpr::producer::initial_support(primes);
+        for (std::size_t k = 0; k < resumed.tasks.size(); ++k) {
+            if (!check.restore(resumed.tasks[k], primes, bound, check_support, &error)) {
+                std::cerr << "Error: cannot resume from '" << options.resume_file << "': task " << k + 1
+                          << " is invalid: " << error << '\n';
+                return 2;
+            }
+        }
+        if (!lpr::producer::detail::tasks_disjoint(resumed.tasks, &error)) {
+            std::cerr << "Error: cannot resume from '" << options.resume_file << "': " << error << '\n';
+            return 2;
+        }
+        tasks = resumed.tasks;
+    }
+    if (!options.checkpoint_file.empty()) {
+        // Never overwrite another run's progress: an existing checkpoint file may only
+        // be replaced by the run that continues it
+        if (access(options.checkpoint_file.c_str(), F_OK) == 0 && options.resume_file != options.checkpoint_file) {
+            std::cerr << "Error: checkpoint file '" << options.checkpoint_file << "' already exists. Continue that "
+                      << "run with --resume " << options.checkpoint_file << ", or delete the file to start a new search\n";
+            return 2;
+        }
+        // Fail now rather than hours later: the checkpoint's temporary file must be creatable
+        const std::string probe = options.checkpoint_file + ".tmp";
+        const int fd = ::open(probe.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            std::cerr << "Error: cannot write checkpoints: cannot create '" << probe << "': "
+                      << std::strerror(errno) << '\n';
+            return 2;
+        }
+        ::close(fd);
+        ::unlink(probe.c_str());
+    }
+    const std::uint64_t segment = resuming ? resumed.segments + 1 : 1;
+    const double earlier_elapsed = resuming ? resumed.elapsed_seconds : 0.0;
+
     // Print run and configuration settings
     const std::string log_target = options.log_file.empty() ? "stderr" : options.log_file;
     std::cout << "Run:\n"
@@ -390,6 +546,21 @@ int main(int argc, char* argv[])
     if (mode == RunMode::Parallel || (mode == RunMode::DryRun && options.threads > 1)) {
         std::cout << "split regions while prefix < " << steal_max_prefix << " primes"
                   << (options.steal_max_prefix > 0 ? " (--steal-max-prefix)" : " (default: omega)") << '\n';
+    }
+    if (!options.checkpoint_file.empty()) {
+        std::cout << "checkpoint: " << options.checkpoint_file << " (";
+        if (options.checkpoint_interval > 0) {
+            std::cout << "every " << options.checkpoint_interval << " s, ";
+        }
+        std::cout << "on SIGTERM/SIGINT and at the end)\n";
+    }
+    if (resuming) {
+        std::cout << "resumed from: " << options.resume_file << " (run " << segment << "; "
+                  << (resumed.complete ? "search already complete" : std::to_string(tasks.size()) + " tasks")
+                  << "; " << resumed.stats.total_support_count << " supports already processed, "
+                  << resumed.stats.supports_emitted << " emitted; " << earlier_elapsed << " s in earlier runs"
+                  << (commit_differs ? "; WARNING: written by commit " + resumed.fingerprint.commit : "")
+                  << ")\n";
     }
     std::cout << "progress log: ";
     if (options.log_interval == 0) {
@@ -428,25 +599,69 @@ int main(int argc, char* argv[])
                    + " threads=" + std::to_string(threaded ? options.threads : 1)
                    + " omega=" + std::to_string(OMEGA)
                    + " s=" + std::to_string(search.s)
-                   + " commit=" + LPR_GIT_COMMIT);
-
-    std::signal(SIGTERM, on_signal);
-    std::signal(SIGINT, on_signal);
+                   + " commit=" + LPR_GIT_COMMIT
+                   + (resuming ? " resumed_from=" + options.resume_file + " run=" + std::to_string(segment) : ""));
+    if (resuming) {
+        lpr::stats::get_master_stats().merge(resumed.stats); // The earlier runs' work
+    }
 
     lpr::parallel::JobQueue<> queue; // Only used in queue mode
     const bool work_stealing = mode == RunMode::Parallel || (mode == RunMode::DryRun && options.threads > 1);
+    // Checkpointing runs single-threaded modes through the scheduler with one worker
+    const bool use_scheduler = work_stealing || options.checkpointing();
     lpr::stealing::Scheduler scheduler(primes, bound, work_stealing ? options.threads : 1, options.steal_stress,
-                                       steal_max_prefix);
+                                       steal_max_prefix, tasks);
+
+    // Writes a checkpoint of the current state (monitor thread). With stay_paused
+    // the workers are left stopped (the process is about to exit).
+    auto take_checkpoint = [&](bool stay_paused) -> CheckpointOutcome {
+        CheckpointOutcome outcome;
+        const auto paused = scheduler.pause(PAUSE_TIMEOUT);
+        if (paused == lpr::stealing::Scheduler::PauseResult::SearchFinishing) {
+            outcome.kind = CheckpointOutcome::SearchFinishing;
+            return outcome;
+        }
+        if (paused == lpr::stealing::Scheduler::PauseResult::TimedOut) {
+            outcome.message = "the workers did not stop within " + std::to_string(PAUSE_TIMEOUT.count()) + " s";
+            return outcome;
+        }
+        lpr::checkpoint::Checkpoint ck;
+        ck.fingerprint = fingerprint;
+        ck.segments = segment;
+        ck.elapsed_seconds = earlier_elapsed
+            + std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+        ck.stats = lpr::stats::get_master_stats().snapshot(); // Every worker published before stopping
+        std::string error;
+        bool ok = scheduler.remaining_tasks(ck.tasks, error);
+        if (ok && ck.tasks.empty()) { // The last region has just finished
+            scheduler.resume();
+            outcome.kind = CheckpointOutcome::SearchFinishing;
+            return outcome;
+        }
+        ok = ok && lpr::checkpoint::write_atomic(options.checkpoint_file, ck, error);
+        if (!ok || !stay_paused) {
+            scheduler.resume();
+        }
+        if (!ok) {
+            outcome.message = error;
+            return outcome;
+        }
+        outcome.kind = CheckpointOutcome::Written;
+        outcome.stats = ck.stats;
+        return outcome;
+    };
+
     {
         Monitor monitor(options.log_interval, start_time, [&]() -> std::string {
             if (mode == RunMode::ParallelQueue) return "queue=" + std::to_string(queue.size());
             if (work_stealing) return "queue=- active_workers=" + std::to_string(scheduler.active_workers());
             return "queue=-";
-        });
+        }, options.checkpoint_file.empty() ? Monitor::CheckpointFn{} : Monitor::CheckpointFn(take_checkpoint),
+           options.checkpoint_interval, options.checkpoint_file);
 
-        if (work_stealing && mode == RunMode::DryRun) {
+        if (use_scheduler && mode == RunMode::DryRun) {
             scheduler.run<false>();
-        } else if (work_stealing) {
+        } else if (use_scheduler) {
             scheduler.run<true>();
         } else if (mode == RunMode::DryRun && options.split_test_interval > 0) {
             lpr::producer::generate_supports_split_test<false>(
@@ -490,17 +705,40 @@ int main(int argc, char* argv[])
     const lpr::stats::Counters master_stats = lpr::stats::get_master_stats().snapshot();
     lpr::log::info("finished after " + std::to_string(elapsed.count()) + " s");
     lpr::log::info(progress_line(master_stats, 0.0, "queue=-"));
+    const double total_elapsed = earlier_elapsed + elapsed.count();
+
+    // The final checkpoint: the search is complete (resuming it prints this summary)
+    if (!options.checkpoint_file.empty()) {
+        lpr::checkpoint::Checkpoint ck;
+        ck.fingerprint = fingerprint;
+        ck.segments = segment;
+        ck.elapsed_seconds = total_elapsed;
+        ck.complete = true;
+        ck.stats = master_stats;
+        std::string error;
+        if (lpr::checkpoint::write_atomic(options.checkpoint_file, ck, error)) {
+            lpr::log::info("checkpoint: final state (search complete) written to " + options.checkpoint_file);
+        } else {
+            lpr::log::warn("final checkpoint not written: " + error);
+        }
+    }
+    auto print_elapsed = [&]() {
+        std::cout << "Elapsed time: " << elapsed.count() << " s\n";
+        if (segment > 1) {
+            std::cout << "Elapsed time over all " << segment << " runs: " << total_elapsed << " s\n";
+        }
+    };
 
     if (mode == RunMode::DryRun) {
         master_stats.print_producer();
-        std::cout << "Elapsed time: " << elapsed.count() << " s\n"
-                  << "DRY RUN: no primes were tested or verified\n";
+        print_elapsed();
+        std::cout << "DRY RUN: no primes were tested or verified\n";
         return 0;
     }
     master_stats.print();
     std::cout << '\n';
     master_stats.print_producer();
-    std::cout << "Elapsed time: " << elapsed.count() << " s\n";
+    print_elapsed();
 
     if (master_stats.unresolved_count > 0 ||
         master_stats.certified_inequality_fail_count > 0) {

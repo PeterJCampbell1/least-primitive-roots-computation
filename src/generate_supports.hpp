@@ -31,6 +31,7 @@
 #include "process_support.hpp"
 #include "stats.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -65,6 +66,91 @@ struct Region {
 };
 
 /**
+ * A resumable DFS position, as saved in checkpoints (docs/checkpointing.md):
+ * the region (base_depth, base_limit) plus the stack's index path at the top of
+ * a run_region iteration. path[d] for d < depth is the prime index chosen at
+ * depth d (path[0] = 0, the prime 2), and path[depth] is the next index to try
+ * at the current depth. Everything before this position in the region has been
+ * searched and processed; the rest of the region has not. The frames' values
+ * are rebuilt by DfsStack::restore, which replays the path.
+ **/
+struct Task {
+    std::size_t base_depth = 1;
+    std::size_t base_limit = 0;
+    std::size_t depth = 1;
+    std::vector<std::size_t> path; // depth + 1 entries
+
+    bool operator==(const Task& other) const {
+        return base_depth == other.base_depth && base_limit == other.base_limit
+               && depth == other.depth && path == other.path;
+    }
+};
+
+// The whole search (the state of a new DfsStack)
+inline Task root_task(std::size_t num_primes) {
+    return Task{1, num_primes, 1, {0, 1}};
+}
+
+// A Region handed over by split_region, as a Task (it starts at its base depth)
+inline Task region_task(const Region& region) {
+    Task task{region.base_depth, region.base_limit, region.base_depth, {}};
+    for (std::size_t d = 0; d <= region.base_depth; ++d) {
+        task.path.push_back(region.frames[d].next_prime_idx);
+    }
+    return task;
+}
+
+/*
+ * True if no two tasks cover a common support (else false, with a reason).
+ * In lexicographic order of index tuples, a task covers the interval
+ * [lo, hi): lo = its path (tuples whose first depth+1 indices are >= the path)
+ * and hi = (path[0..base_depth), base_limit) (tuples whose first base_depth+1
+ * indices are below it). A shorter bound compares on fewer indices. Sorted by
+ * lo, the intervals are disjoint iff each ends at or before the next begins.
+ * Finished tasks (empty intervals) are ignored. Catches a region listed twice.
+ */
+inline bool tasks_disjoint(const std::vector<Task>& tasks, std::string* error) {
+    struct Interval {
+        std::vector<std::size_t> lo, hi;
+        std::size_t task;
+    };
+    std::vector<Interval> intervals;
+    for (std::size_t k = 0; k < tasks.size(); ++k) {
+        const Task& t = tasks[k];
+        if (t.depth == t.base_depth && t.path[t.base_depth] >= t.base_limit) {
+            continue; // Finished: covers nothing
+        }
+        Interval iv{t.path, std::vector<std::size_t>(t.path.begin(), t.path.begin() + static_cast<std::ptrdiff_t>(t.base_depth)), k};
+        iv.hi.push_back(t.base_limit);
+        intervals.push_back(std::move(iv));
+    }
+    std::sort(intervals.begin(), intervals.end(), [](const Interval& a, const Interval& b) { return a.lo < b.lo; });
+    for (std::size_t i = 0; i + 1 < intervals.size(); ++i) {
+        const Interval& a = intervals[i];
+        const Interval& b = intervals[i + 1];
+        // b.lo >= a.hi on their common indices, and if equal there b.lo must be at
+        // least as long (a shorter lower bound would include tuples below a.hi)
+        const std::size_t m = std::min(a.hi.size(), b.lo.size());
+        const bool equal = std::equal(b.lo.begin(), b.lo.begin() + static_cast<std::ptrdiff_t>(m), a.hi.begin());
+        const bool after = std::lexicographical_compare(a.hi.begin(), a.hi.begin() + static_cast<std::ptrdiff_t>(m),
+                                                        b.lo.begin(), b.lo.begin() + static_cast<std::ptrdiff_t>(m));
+        if (!(after || (equal && b.lo.size() >= a.hi.size()))) {
+            if (error) {
+                *error = "tasks " + std::to_string(a.task + 1) + " and " + std::to_string(b.task + 1) + " overlap";
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+// Equal values (the index is compared separately, through the Task path)
+inline bool same_values(const StackFrame& a, const StackFrame& b) {
+    return a.product == b.product && a.delta_Q == b.delta_Q && a.delta_sop == b.delta_sop
+           && a.cor4_bound == b.cor4_bound && a.prefix_hash == b.prefix_hash;
+}
+
+/**
  * Explicit DFS stack over prime indices.
  *
  * Frame k holds the index of the prime chosen at depth k (next_prime_idx)
@@ -81,6 +167,11 @@ class DfsStack {
 public:
     // The whole search: the root node {2} with the global bound
     DfsStack(const mpz_class& root_bound, std::size_t num_primes) {
+        reset_root(root_bound, num_primes);
+    }
+
+    // The root state of the constructor
+    void reset_root(const mpz_class& root_bound, std::size_t num_primes) {
         frames_[0].next_prime_idx = 0;
         frames_[0].product   = 1;
         frames_[0].delta_Q   = 1;
@@ -115,11 +206,109 @@ public:
         base_limit_ = region.base_limit;
     }
 
+    // The current position as a Task. Valid at the top of a run_region iteration.
+    Task task() const {
+        Task t{base_depth_, base_limit_, depth_, {}};
+        for (std::size_t d = 0; d <= depth_; ++d) {
+            t.path.push_back(frames_[d].next_prime_idx);
+        }
+        return t;
+    }
+
+    /*
+     * Becomes `task`: rebuilds frames 0..task.depth by replaying its path from
+     * the root with the same arithmetic as run_region, and sets support[0..depth).
+     * Returns false (with a reason in *error) if the task is malformed or is not
+     * a position run_region can reach: indices out of range or not increasing,
+     * outside its region, or a prefix that run_region would have pruned.
+     * Callers that also hold the live frames compare them (same_values) to
+     * cross-check the replay.
+     */
+    bool restore(const Task& task, const std::vector<unsigned>& primes, const mpz_class& root_bound,
+                 std::vector<unsigned>& support, std::string* error) {
+        const auto& config = lpr::config::search_config();
+        const std::size_t OMEGA = config.omega;
+        const std::size_t DELTA_START_DEPTH = config.delta_start_depth();
+        const std::size_t n = primes.size();
+        auto fail = [&](const std::string& why) {
+            if (error) *error = why;
+            return false;
+        };
+        if (task.depth < 1 || task.depth >= OMEGA) return fail("depth out of range");
+        if (task.base_depth < 1 || task.base_depth > task.depth) return fail("base depth out of range");
+        if (task.path.size() != task.depth + 1) return fail("path length does not match depth");
+        if (task.base_limit > n) return fail("base limit beyond the prime list");
+        if (task.path[0] != 0) return fail("path does not start with the prime 2");
+        if (support.size() != OMEGA) return fail("support array has the wrong size");
+
+        static thread_local mpz_class min_product, min_delta_Q, min_delta_sop;
+        reset_root(root_bound, n);
+        support[0] = primes[0];
+        for (std::size_t d = 1; d < task.depth; ++d) { // Replay the choice at depth d
+            const std::size_t i = task.path[d];
+            const std::size_t rem = OMEGA - d - 1;
+            if (i <= task.path[d - 1]) return fail("path indices are not increasing");
+            if (i >= n || n - (i + 1) < rem) return fail("path index cannot be completed");
+            if (d == task.base_depth && i >= task.base_limit) return fail("path leaves its region");
+            frames_[d].next_prime_idx = i;
+            const StackFrame& cur = frames_[d];
+            StackFrame& next = frames_[d + 1];
+            if (d >= DELTA_START_DEPTH) {
+                mpz_mul_ui(next.delta_Q.get_mpz_t(), cur.delta_Q.get_mpz_t(), primes[i]);
+                mpz_set(next.delta_sop.get_mpz_t(), cur.delta_Q.get_mpz_t());
+                mpz_addmul_ui(next.delta_sop.get_mpz_t(), cur.delta_sop.get_mpz_t(), primes[i]);
+            } else {
+                next.delta_Q = 1;
+                next.delta_sop = 0;
+            }
+            mpz_mul_ui(next.product.get_mpz_t(), cur.product.get_mpz_t(), primes[i]);
+            const bool parent_evaluated_cor4 = d > DELTA_START_DEPTH;
+            if (parent_evaluated_cor4 && i == task.path[d - 1] + 1) {
+                mpz_set(next.cor4_bound.get_mpz_t(), cur.cor4_bound.get_mpz_t()); // First child
+            } else {
+                min_product = next.product;
+                if (d >= DELTA_START_DEPTH) {
+                    min_delta_Q = next.delta_Q;
+                    min_delta_sop = next.delta_sop;
+                }
+                for (std::size_t j = 1; j <= rem; ++j) {
+                    mpz_mul_ui(min_product.get_mpz_t(), min_product.get_mpz_t(), primes[i + j]);
+                    if (d >= DELTA_START_DEPTH) {
+                        min_delta_sop *= primes[i + j];
+                        min_delta_sop += min_delta_Q;
+                        min_delta_Q *= primes[i + j];
+                    }
+                }
+                if (min_product > cur.cor4_bound) return fail("path prefix is pruned by its inherited bound");
+                if (d >= DELTA_START_DEPTH) {
+                    corollary4_qd_bound(min_delta_Q, min_delta_sop, next.cor4_bound);
+                    if (min_product > next.cor4_bound) return fail("path prefix is pruned by Corollary 4");
+                    if (cur.cor4_bound < next.cor4_bound) {
+                        mpz_set(next.cor4_bound.get_mpz_t(), cur.cor4_bound.get_mpz_t());
+                    }
+                } else {
+                    mpz_set(next.cor4_bound.get_mpz_t(), cur.cor4_bound.get_mpz_t());
+                }
+            }
+            next.prefix_hash = lpr::bits::mix64(cur.prefix_hash ^ primes[i]);
+            support[d] = primes[i];
+        }
+        const std::size_t last = task.path[task.depth]; // Next index to try at the current depth
+        if (last <= task.path[task.depth - 1]) return fail("path indices are not increasing");
+        if (last > n) return fail("path index beyond the prime list");
+        frames_[task.depth].next_prime_idx = last;
+        depth_ = task.depth;
+        base_depth_ = task.base_depth;
+        base_limit_ = task.base_limit;
+        return true;
+    }
+
     __attribute__((always_inline)) std::size_t depth() const { return depth_; }
     __attribute__((always_inline)) StackFrame& current() { return frames_[depth_]; }
     __attribute__((always_inline)) StackFrame& child() { return frames_[depth_ + 1]; }
     __attribute__((always_inline)) StackFrame& parent() { return frames_[depth_ - 1]; }
     __attribute__((always_inline)) StackFrame& frame(std::size_t d) { return frames_[d]; }
+    const StackFrame& frame(std::size_t d) const { return frames_[d]; }
 
     __attribute__((always_inline)) std::size_t base_depth() const { return base_depth_; }
     __attribute__((always_inline)) std::size_t base_limit() const { return base_limit_; }

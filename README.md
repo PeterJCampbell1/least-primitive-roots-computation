@@ -105,10 +105,24 @@ Exit codes:
 | 0 | Complete: every candidate certified and Grosswald's inequality holds |
 | 1 | Complete, but a Grosswald failure or an unresolved candidate was found |
 | 2 | Usage error |
-| 3 | Interrupted by SIGTERM/SIGINT: partial run, nothing is verified |
+| 3 | Interrupted by SIGTERM/SIGINT: partial run, nothing is verified, no checkpoint |
+| 4 | Interrupted by SIGTERM/SIGINT after writing a checkpoint: continue with `--resume` |
 
 On SIGTERM or SIGINT the program prints the statistics so far and the current
-position of the search, then exits with code 3.
+position of the search, then exits with code 3, or with code 4 after writing a
+checkpoint if `--checkpoint` was given.
+
+## Checkpoints
+
+```bash
+./lpr --parallel --checkpoint run.ckpt                      # every 600 s, on SIGTERM/SIGINT and at the end
+./lpr --parallel --resume run.ckpt --checkpoint run.ckpt    # continue (any mode or thread count)
+```
+
+A resumed run's final summary is identical to an uninterrupted run's. `--resume`
+refuses a checkpoint from a different search (omega, s, bound, settings, dry run)
+or commit (`--resume-any-commit` accepts another commit). See
+[`docs/checkpointing.md`](docs/checkpointing.md).
 
 ## Running on a cluster
 
@@ -123,6 +137,6 @@ sbatch scripts/slurm/lpr.slurm
 The job runs `lpr --parallel` (work stealing) with the thread count taken from
 `SLURM_CPUS_PER_TASK`, logs progress every 2 minutes to `lpr_<jobid>.log`, and
 asks Slurm (`--signal=TERM@300`) to send SIGTERM 5 minutes before the time
-limit so that the statistics so far are recorded. Runs cannot yet be resumed;
-see [`docs/parallelise_producer.md`](docs/parallelise_producer.md) for the
-planned checkpointing design.
+limit. It checkpoints to `lpr.ckpt` and, when stopped by the time limit, requeues
+itself and continues from the checkpoint until the search is complete (see
+[`scripts/README.md`](scripts/README.md) and [`docs/checkpointing.md`](docs/checkpointing.md)).

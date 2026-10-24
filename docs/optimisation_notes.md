@@ -973,3 +973,34 @@ Replaces the single-producer design as the parallel mode; the old design remains
   - `--parallel` scales 1.95× on 2 threads and 3.76× on 4 (the performance cores), with idle time ≤ 0.01 s;
   - 8 threads at S=29: 43.4–48.3 s against 44.3–50.4 s for the queue mode, with 0.5% idle against 5–6.5% waiting.
   - The large gain is expected on clusters, where the queue mode's single producer left 40% of consumer time idle (Rangpur, 22/10/26).
+
+---
+
+Date: **24/10/26**   
+Author: **Mittun Sudhahar** (implemented with Claude)  
+Commit: TODO (uncommitted on `parallelise_33`, on top of `76cbb36`)
+OMEGA: 33 (tests)  
+
+## Checkpoint and resume (`--checkpoint`, `--resume`)
+Full design, file format, Slurm workflow and verification log: `docs/checkpointing.md`.
+
+- **Design:** the monitor thread pauses every worker at a safe point (between DFS nodes, or in the idle loop). Each worker publishes its statistics before stopping. The monitor then saves:
+  - every remaining region as a `Task` (base depth, limit and index path) from the stacks, mailboxes in transit and pending tasks;
+  - every `Counters` field.
+
+  It writes the file atomically (fsync, read back, rename) every `--checkpoint-interval` seconds (default 600), on SIGTERM/SIGINT (then exit code 4) and at the end (`complete 1`). `--resume` rebuilds each task by replaying its path with the DFS's own arithmetic and continues in any mode and with any thread count.
+- **Safety checks:**
+  - at every write, each task's replay is compared with the live frames, the task count with the scheduler's region count, and the tasks are checked to be disjoint;
+  - a fingerprint (omega, s, prime list, B, search limit, trial-division range, dry run or not, commit), a checksum line and strict parsing;
+  - refusal to overwrite another run's checkpoint;
+  - a startup check that `for_each_field` lists every counter.
+- **Slurm:** the job checkpoints to `lpr.ckpt`, resumes from it if present, and requeues itself after the time-limit signal (at most 20 runs). `resubmit.sh` in each run directory continues a run by hand.
+- **Verification:**
+  - 95 random interrupt/resume chains (release, debug, TSan, ASan), all identical to uninterrupted runs;
+  - thousands of periodic checkpoints in sanitizer builds;
+  - 19 error-handling checks;
+  - 60 signal-at-startup trials;
+  - a simulated Slurm requeue cycle.
+
+  Testing found and fixed three issues: a SIGTERM during startup was fatal, an unwritable path produced only warnings, and overlapping tasks were not detected.
+- **Cost:** none at the default interval. S=29 with 8 threads takes 42.2–43.5 s with or without checkpointing; with a checkpoint every second it is within noise to +10%.
