@@ -16,7 +16,6 @@
 
 #include "config.hpp"
 
-#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -173,7 +172,10 @@ inline std::optional<double> parse_seconds(const std::string& text) {
     }
     char* end = nullptr;
     const double value = std::strtod(text.c_str(), &end);
-    if (end == text.c_str() || *end != '\0' || !std::isfinite(value) || value < 0 || value > 1e7) {
+    // (Only digits and dots are accepted, so value cannot be NaN; > 1e7 also rejects
+    // infinity. No <cmath>: with GCC 8, including it makes the compiler constant-fold
+    // through MPFR/GMP, which crashes on Rangpur's r730 nodes; see build_lpr.sh.)
+    if (end == text.c_str() || *end != '\0' || !(value >= 0) || value > 1e7) {
         return std::nullopt;
     }
     return value;

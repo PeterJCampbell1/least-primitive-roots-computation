@@ -155,6 +155,7 @@ A successful verification run ends with `lpr finished: verification complete` an
 | `sbatch` rejects the job | Partition, account line or limits in your job file. Check them with `sbatch --test-only`. |
 | Job stays pending (`PD`) | Partition busy or restricted; `squeue -u $USER -o "%i %T %r"` shows the reason. |
 | `Build failed on <node>` | The `[build_lpr]` lines in `lpr_<jobid>.out` show which step failed: compiler, GMP download, GMP build or `make`. |
+| `internal compiler error: Illegal instruction` in `lpr_<jobid>.err` | The *compiler* crashed: GCC uses the system GMP (through MPFR) to fold constants, and on the r730 nodes that GMP dies with SIGILL. It happens when a source file includes `<cmath>`, which `lpr` therefore avoids (job 692610, 24/10/26). `build_lpr.sh` now tries the next compiler when a build fails, and warns if the compiler cannot handle `<cmath>`. |
 | `cannot download GMP from this node` | The compute nodes have no internet access. Copy `gmp-6.3.0.tar.xz` to `~` (see setup step 4). |
 | `lpr did not start: usage error` | Bad `--lpr-args`, e.g. two mode flags. `lpr_<jobid>.err` has `lpr`'s message. |
 | Results differ from the reference values | A real problem: stop and inspect the full output. |

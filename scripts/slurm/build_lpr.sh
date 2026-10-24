@@ -49,11 +49,45 @@ log() { echo "[build_lpr] $*"; }
 # (multiplication at several sizes, squaring, division, modular exponentiation). A GMP
 # built for a newer CPU than this node's dies here with "Illegal instruction" (e.g. ADX
 # code on a Haswell node), so that GMP is skipped instead of crashing lpr later.
+# The test program includes exactly the standard headers lpr uses (keep this list in
+# step with src/). Not <cmath>: GCC links the system GMP (through MPFR, for constant
+# folding), and on nodes where that GMP dies with SIGILL, GCC 8 crashes ("internal
+# compiler error: Illegal instruction") on <cmath> (see the probe below).
 cat > .build_test.cpp <<'EOF'
 #include <gmpxx.h>
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cassert>
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <csignal>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <deque>
+#include <fstream>
+#include <functional>
+#include <iomanip>
 #include <iostream>
+#include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <queue>
+#include <sstream>
+#include <stdexcept>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
+#include <fcntl.h>
+#include <unistd.h>
 int main() {
     int failures = 0;
     // Fermat test of the Mersenne prime 2^127 - 1 (as in lpr: powm modulo a few limbs)
@@ -106,6 +140,7 @@ gmp_prefixes() {
 }
 
 chosen=""
+working=()   # Every candidate that passes the test, in order of preference
 find_toolchain() {
     local prefix cand name cxx lto ld inc lib
     while IFS= read -r prefix; do
@@ -113,16 +148,16 @@ find_toolchain() {
             IFS='|' read -r name cxx lto ld <<< "$cand"
             inc=""; lib=""
             [ -n "$prefix" ] && inc="-I$prefix/include" && lib="-L$prefix/lib -Wl,-rpath,$prefix/lib"
-            if "$cxx" -std=c++17 -O1 $lto ${LPR_CXXFLAGS:-} $inc .build_test.cpp $ld $lib -lgmpxx -lgmp -pthread \
+            if "$cxx" -std=c++17 -O3 $lto ${LPR_CXXFLAGS:-} $inc .build_test.cpp $ld $lib -lgmpxx -lgmp -pthread \
                    -o .build_test > .build_test.log 2>&1 && ( ./.build_test; exit $? ) > /dev/null 2>&1; then
                 # (a subshell that is not a bare exec: a GMP that dies with SIGILL is expected on some nodes; this
                 # keeps bash's "Illegal instruction" notice out of the job's .err file)
-                chosen="$name|$cxx|$lto|$ld|$prefix"
-                return 0
+                [ -n "$chosen" ] || chosen="$name|$cxx|$lto|$ld|$prefix"
+                working+=("$name|$cxx|$lto|$ld|$prefix")
             fi
         done
     done < <(gmp_prefixes)
-    return 1
+    [ -n "$chosen" ]
 }
 
 build_gmp() {
@@ -180,45 +215,69 @@ if ! find_toolchain; then
 fi
 rm -f .build_test .build_test.cpp .build_test.log
 
-IFS='|' read -r name cxx lto ld prefix <<< "$chosen"
-log "using: $name; GMP: ${prefix:-system}${LPR_CXXFLAGS:+; extra flags: $LPR_CXXFLAGS}"
-# GMP_PREFIX and LDFLAGS go through the environment so the Makefile appends its own flags
-# to them; CXX, LTOFLAGS and EXTRA_CXXFLAGS are make arguments.
-export GMP_PREFIX="$prefix"
-export LDFLAGS="${ld}${prefix:+ -Wl,-rpath,$prefix/lib}"
-commit_tag=""                # "-pgo" for PGO builds, so the run header shows it
-[ "${LPR_PGO:-0}" = 1 ] && commit_tag="-pgo"
-build() {   # build ./lpr with extra flags $1 (on top of LPR_CXXFLAGS)
-    rm -f lpr
-    make release CXX="$cxx" LTOFLAGS="$lto" EXTRA_CXXFLAGS="${LPR_CXXFLAGS:-} $1" \
-        ${LPR_COMMIT:+GIT_COMMIT=$LPR_COMMIT$commit_tag}
+# Builds ./lpr with candidate $1 ("name|cxx|lto|ld|prefix"); returns non-zero on failure
+attempt() {
+    IFS='|' read -r name cxx lto ld prefix <<< "$1"
+    log "using: $name; GMP: ${prefix:-system}${LPR_CXXFLAGS:+; extra flags: $LPR_CXXFLAGS}"
+    # GMP_PREFIX and LDFLAGS go through the environment so the Makefile appends its own flags
+    # to them; CXX, LTOFLAGS and EXTRA_CXXFLAGS are make arguments.
+    export GMP_PREFIX="$prefix"
+    export LDFLAGS="${ld}${prefix:+ -Wl,-rpath,$prefix/lib}"
+    commit_tag=""                # "-pgo" for PGO builds, so the run header shows it
+    [ "${LPR_PGO:-0}" = 1 ] && commit_tag="-pgo"
+    build() {   # build ./lpr with extra flags $1 (on top of LPR_CXXFLAGS)
+        rm -f lpr
+        make release CXX="$cxx" LTOFLAGS="$lto" EXTRA_CXXFLAGS="${LPR_CXXFLAGS:-} $1" \
+            ${LPR_COMMIT:+GIT_COMMIT=$LPR_COMMIT$commit_tag}
+    }
+
+    if [ "${LPR_PGO:-0}" != 1 ]; then
+        build "" || return 1
+        log "built ./lpr"
+        return 0
+    fi
+
+    # Profile-guided build: instrument, train, rebuild with the profile
+    train=${LPR_PGO_TRAIN:---single}
+    pgo_dir="$PWD/pgo_profile"
+    rm -rf "$pgo_dir" && mkdir -p "$pgo_dir"
+    if "$cxx" --version 2>/dev/null | grep -qi clang; then
+        profdata=${LPR_PROFDATA:-$(command -v llvm-profdata || xcrun --find llvm-profdata 2>/dev/null || true)}
+        [ -n "$profdata" ] || { log "PGO with clang needs llvm-profdata, which is not on PATH"; return 1; }
+        build "-fprofile-instr-generate" || return 1
+        log "PGO training run: ./lpr $train"
+        LLVM_PROFILE_FILE="$pgo_dir/train.profraw" ./lpr $train --log-interval 0 > "$pgo_dir/train.out" 2>&1 \
+            || { log "PGO training run failed:"; tail -20 "$pgo_dir/train.out"; return 1; }
+        "$profdata" merge -output="$pgo_dir/train.profdata" "$pgo_dir/train.profraw" || return 1
+        build "-fprofile-instr-use=$pgo_dir/train.profdata" || return 1
+    else
+        # GCC names the profile files after the output, so both builds produce ./lpr
+        build "-fprofile-generate -fprofile-dir=$pgo_dir" || return 1
+        log "PGO training run: ./lpr $train"
+        ./lpr $train --log-interval 0 > "$pgo_dir/train.out" 2>&1 \
+            || { log "PGO training run failed:"; tail -20 "$pgo_dir/train.out"; return 1; }
+        build "-fprofile-use -fprofile-dir=$pgo_dir" || return 1
+    fi
+    log "built ./lpr (PGO, trained with: $train; training output in $pgo_dir/train.out)"
+    return 0
 }
 
-if [ "${LPR_PGO:-0}" != 1 ]; then
-    build ""
-    log "built ./lpr"
-    exit 0
+# Diagnostic only: does the chosen compiler survive <cmath>? (lpr must not include it
+# where it does not; a crash here explains an otherwise baffling build failure)
+IFS='|' read -r _n probe_cxx _l _d _p <<< "$chosen"
+printf '#include <cmath>\nint main() { return static_cast<int>(std::pow(2.0, 0.5)) - 1; }\n' > .cmath_probe.cpp
+if ! ( "$probe_cxx" -std=c++17 -O1 -c .cmath_probe.cpp -o .cmath_probe.o; exit $? ) > .cmath_probe.log 2>&1; then
+    log "warning: $probe_cxx cannot compile <cmath> on this node ($(grep -m1 -o 'internal compiler error[^(]*' .cmath_probe.log || tail -1 .cmath_probe.log)); lpr must not include <cmath>"
 fi
+rm -f .cmath_probe.cpp .cmath_probe.o .cmath_probe.log
 
-# Profile-guided build: instrument, train, rebuild with the profile
-train=${LPR_PGO_TRAIN:---single}
-pgo_dir="$PWD/pgo_profile"
-rm -rf "$pgo_dir" && mkdir -p "$pgo_dir"
-if "$cxx" --version 2>/dev/null | grep -qi clang; then
-    profdata=${LPR_PROFDATA:-$(command -v llvm-profdata || xcrun --find llvm-profdata 2>/dev/null || true)}
-    [ -n "$profdata" ] || { log "PGO with clang needs llvm-profdata, which is not on PATH"; exit 1; }
-    build "-fprofile-instr-generate"
-    log "PGO training run: ./lpr $train"
-    LLVM_PROFILE_FILE="$pgo_dir/train.profraw" ./lpr $train --log-interval 0 > "$pgo_dir/train.out" 2>&1 \
-        || { log "PGO training run failed:"; tail -20 "$pgo_dir/train.out"; exit 1; }
-    "$profdata" merge -output="$pgo_dir/train.profdata" "$pgo_dir/train.profraw"
-    build "-fprofile-instr-use=$pgo_dir/train.profdata"
-else
-    # GCC names the profile files after the output, so both builds produce ./lpr
-    build "-fprofile-generate -fprofile-dir=$pgo_dir"
-    log "PGO training run: ./lpr $train"
-    ./lpr $train --log-interval 0 > "$pgo_dir/train.out" 2>&1 \
-        || { log "PGO training run failed:"; tail -20 "$pgo_dir/train.out"; exit 1; }
-    build "-fprofile-use -fprofile-dir=$pgo_dir"
-fi
-log "built ./lpr (PGO, trained with: $train; training output in $pgo_dir/train.out)"
+# Try the working candidates in order: a compiler that passed the test can still fail
+# on the real sources (e.g. an internal compiler error), and the next one may work
+for cand in "${working[@]}"; do
+    if attempt "$cand"; then
+        exit 0
+    fi
+    log "build with ${cand%%|*} failed; trying the next compiler"
+done
+log "every compiler failed to build lpr"
+exit 1
