@@ -73,6 +73,7 @@ case " $lpr_args " in
            echo "Continuing from lpr.ckpt: $(grep -E '^(segments|elapsed_seconds|complete) ' lpr.ckpt | tr '\n' ' ')"
        fi ;;
 esac
+echo "Running: ./lpr ${lpr_mode} ${lpr_args} ${checkpoint_args} --log-interval 120 --log-file lpr_${SLURM_JOB_ID}.log"
 srun ./lpr ${lpr_mode} ${lpr_args} ${checkpoint_args} --log-interval 120 --log-file "lpr_${SLURM_JOB_ID}.log"
 status=$?
 
@@ -82,7 +83,7 @@ case ${status} in
            *) echo "lpr finished: verification complete" ;;
        esac ;;
     1) echo "lpr finished: Grosswald failure or unresolved candidate (see lpr_${SLURM_JOB_ID}.err)" ;;
-    2) echo "lpr did not start: usage error" ;;
+    2) echo "lpr did not start: usage error (see the Running: line above and lpr_${SLURM_JOB_ID}.err)" ;;
     3) echo "lpr was interrupted: partial run, nothing verified, no checkpoint written" ;;
     4|143) # 143: SIGTERM before lpr had started (lpr.ckpt, if any, is untouched)
        if [ ${status} = 143 ] && [ ! -f lpr.ckpt ]; then

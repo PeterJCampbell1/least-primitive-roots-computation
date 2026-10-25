@@ -4,8 +4,12 @@
 #
 # 1. Find a compiler and LTO setting that can compile, link and run a small C++17
 #    gmpxx test program, trying in order:
-#      clang++ + LTO with lld;  g++ + -flto=auto (GCC >= 10);  g++ + -flto (older GCC);
-#      clang++ without LTO;  g++ without LTO.
+#      clang++ + LTO with lld;  clang++ without LTO;
+#      g++ + -flto=auto (GCC >= 10);  g++ + -flto (older GCC);  g++ without LTO.
+#    Clang comes first even without LTO: on Rangpur's r730 nodes (Haswell) clang 21 made
+#    lpr's Montgomery exponentiation ~25-30% faster than GCC 8.5 (job 695873, 25/10/26).
+#    Each candidate also gets -march=native if that compiler accepts it: the job builds on
+#    the node that runs it, so tuning for this CPU is safe (a requeued job rebuilds).
 #    GMP is looked for in the system paths, in $GMP_PREFIX, then in $LPR_GMP_HOME. The test
 #    exercises GMP's multiplication and powm kernels, so a GMP that crashes on this node's
 #    CPU (built for a newer one) is skipped.
@@ -30,7 +34,9 @@
 #   LPR_GMP_TARBALL  GMP source tarball (default $HOME/gmp-<version>.tar.xz)
 #   GMP_PREFIX       an existing GMP installation to try (include/ and lib/ below it)
 #   LPR_COMMIT       commit to compile into the run header
-#   LPR_CXXFLAGS     extra compiler flags, e.g. "-march=znver3" (also used in the test compile)
+#   LPR_CXXFLAGS     extra compiler flags, e.g. "-march=znver3" (also used in the test compile;
+#                    an -march/-mcpu here replaces the default -march=native)
+#   LPR_NATIVE       0 to build without -march=native (default 1)
 #   LPR_PGO          1 for a profile-guided build
 #   LPR_PGO_TRAIN    lpr arguments for the PGO training run (default "--single", OMEGA=33)
 #   LPR_PROFDATA     llvm-profdata to use for clang PGO (default: from PATH, or xcrun on macOS)
@@ -115,18 +121,32 @@ int main() {
 }
 EOF
 
-# Compiler candidates: "name|cxx|ltoflags|ldflags"
+# Compiler candidates: "name|cxx|ltoflags|ldflags"; the flags field also carries
+# -march=native when the compiler accepts it (and it is not disabled or overridden)
+native_wanted=1
+[ "${LPR_NATIVE:-1}" = 0 ] && native_wanted=0
+case " ${LPR_CXXFLAGS:-} " in *" -march="*|*" -mcpu="*|*" -mtune="*) native_wanted=0 ;; esac
+native_flag() { # prints "-march=native" if compiler $1 accepts it
+    [ "$native_wanted" = 1 ] || return 0
+    if echo 'int main() { return 0; }' | "$1" -march=native -x c++ - -o /dev/null > /dev/null 2>&1; then
+        echo "-march=native"
+    fi
+}
 candidates=()
-add() { command -v "$2" > /dev/null 2>&1 && candidates+=("$1|$2|$3|$4") || true; }
+add() {
+    command -v "$2" > /dev/null 2>&1 || return 0
+    local arch; arch=$(native_flag "$2")
+    candidates+=("$1${arch:+ + $arch}|$2|${arch:+$arch }$3|$4")
+}
 if [ -n "${LPR_CXX:-}" ]; then
     add "$LPR_CXX + -flto=auto" "$LPR_CXX" "-flto=auto" ""
     add "$LPR_CXX + -flto" "$LPR_CXX" "-flto" ""
     add "$LPR_CXX (no LTO)" "$LPR_CXX" "" ""
 else
-    command -v ld.lld > /dev/null 2>&1 && add "clang++ + LTO (lld)" clang++ "-flto=auto" "-fuse-ld=lld"
+    if command -v ld.lld > /dev/null 2>&1; then add "clang++ + LTO (lld)" clang++ "-flto=auto" "-fuse-ld=lld"; fi
+    add "clang++ (no LTO)" clang++ "" ""
     add "g++ + -flto=auto" g++ "-flto=auto" ""
     add "g++ + -flto" g++ "-flto" ""
-    add "clang++ (no LTO)" clang++ "" ""
     add "g++ (no LTO)" g++ "" ""
 fi
 [ ${#candidates[@]} -gt 0 ] || { log "no C++ compiler found (tried ${LPR_CXX:-clang++ and g++})"; exit 1; }

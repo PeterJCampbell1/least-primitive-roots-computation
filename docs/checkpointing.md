@@ -163,3 +163,15 @@ All on the final code; **0 failures**.
 
   At the default interval, checkpointing is free. Each checkpoint pauses the workers for a few ms (a 31 KB file plus fsync).
 - **Regression without checkpoints** (`.bench/final2.sh`): 18 of 18 EXACT (every mode, the debug build, S=29), and all exit codes correct. S=29 with 8 threads takes 42.2 s, unchanged.
+
+### Step 3: first cluster test, Rangpur (24–25/10/26; OMEGA=32 S=29, 16 threads on r730-2, commit `a5932b6`)
+- **The run:** job 692871 was submitted with `--time=00:10:00`, so it was stopped by the time-limit signal 5 minutes in, every time.
+  - Each of its 20 runs: started, rebuilt `lpr`, resumed from `lpr.ckpt`, worked about 4–4.5 minutes, received SIGTERM, wrote the checkpoint, exited 4 and requeued itself (`scontrol requeue` is permitted on Rangpur).
+  - A requeued job restarted about 2.5 minutes later (Slurm's `BeginTime` delay).
+  - At run 20 it stopped as designed: "Not requeueing (… LPR_MAX_RUNS=20): continue with resubmit.sh".
+- **Continued by hand:** job 695165 ran `resubmit.sh` with `LPR_MAX_RUNS=100` and a longer limit. Its header showed "resumed from: lpr.ckpt (run 21; 16 tasks; 4,940,224,551 supports already processed …)", and it finished in 1,345 s.
+- **Result:**
+  - exit 0, "lpr finished: verification complete";
+  - the full summary is EXACT against the uninterrupted M2 run (`.runs/w32_steal.out`), including the supports checksum `0xc66b5efd1a7ac845` and the DFS counters (6,494,306,726 nodes);
+  - 0 failed, 0 unresolved, largest g(p) 678.
+- **No work lost or repeated:** the 21 runs total 6,574.5 s on 16 threads, against 6,666 s predicted from the uninterrupted 24-thread run (4,444 s × 24/16). Only the restarts' wall time (rebuild and queue wait) is extra.

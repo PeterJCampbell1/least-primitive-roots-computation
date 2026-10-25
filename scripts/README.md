@@ -95,7 +95,7 @@ submit.sh -n big -- --cpus-per-task=16 --time=02:00:00 --mem=8G --partition=<p>
 
 | Option | Effect |
 |---|---|
-| (none) | Try, in order: clang++ with LTO (if `ld.lld` exists); g++ with `-flto=auto`; g++ with `-flto` (older GCC); then either without LTO. The first that compiles, links and runs a GMP test program is used. |
+| (none) | Try, in order: clang++ with LTO (if `ld.lld` exists); clang++ without LTO; g++ with `-flto=auto`; g++ with `-flto` (older GCC); g++ without LTO. The first that compiles, links and runs a GMP test program is used. Each also gets `-march=native` if that compiler accepts it (the job builds on its own node; `LPR_NATIVE=0` turns it off, and an `-march`/`-mcpu` in `--cxxflags` replaces it). Clang is preferred because on Rangpur's r730 nodes clang 21 made the Montgomery arithmetic ~25–30% faster than GCC 8.5 (job 695873, 25/10/26). |
 | `--cxx g++` / `--cxx clang++` | Use only that compiler. |
 | `--cxxflags "-march=native"` | Extra compiler flags, added to the defaults. The job builds on the node it runs on, so `-march=native` is safe. |
 | `--pgo` | Profile-guided build: an instrumented build, a training run, then the final build. On the M2, clang + PGO was ~10% faster and GCC + PGO ~8% slower. Clang PGO needs `llvm-profdata` on the node. |

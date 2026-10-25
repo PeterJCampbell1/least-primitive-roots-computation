@@ -1004,3 +1004,38 @@ Full design, file format, Slurm workflow and verification log: `docs/checkpointi
 
   Testing found and fixed three issues: a SIGTERM during startup was fatal, an unwritable path produced only warnings, and overlapping tasks were not detected.
 - **Cost:** none at the default interval. S=29 with 8 threads takes 42.2–43.5 s with or without checkpointing; with a checkpoint every second it is within noise to +10%.
+
+---
+
+Date: **25/10/26**   
+Author: **Mittun Sudhahar** (experiments with Claude)  
+Commit: TODO (experiments only, in scratch copies; `build_lpr.sh` changed)
+OMEGA: 33 (tests)  
+
+## Profiling, trial division, interleaving and compilers
+- **Profile** (OMEGA=33 S=29, single thread, M2, instrumented scratch copy `.bench/prof`):
+
+  | Stage | Share of run time | Per call |
+  |---|---|---|
+  | Root certification | 48.9% | — |
+  | … power tree, winning g | 26.5% | 17.4 µs |
+  | … power tree, rejected g's | 21.3% | 4.1 µs |
+  | Fermat test | 30.3% | 2.0 µs |
+  | Trial division | 2.6% | 122 ns |
+  | Montgomery setup | 2.0% | — |
+  | DFS and the rest | about 15% | — |
+  | Jacobi filter | 0.2% | 18 ns |
+
+  The tree does about 97 exponentiations per prime, with exponents averaging 17.4 bits (73% under 16 bits).
+- **Generating d:** 0.4% of time. The sum of d_max equals the number of candidates exactly at OMEGA=33, and is estimated at 1.002× (OMEGA=31) and 1.006× (OMEGA=30). A smooth-number generator would not help.
+- **Affine trial division** (`utils/gm_affine_test.c`'s idea, scratch `.bench/affine`): r | Q·d + 1 ⟺ x·W_r + r⁻¹ ≤ ⌊(2^64 − 1)/r⌋, with x = q·d and W_r = (Q_prefix mod r)·r⁻¹. W is cached per thread for the current prefix (about 12 supports per recomputation).
+  - **Correct:** EXACT per chunk at limit 1151, and an every-candidate cross-check passed at limits 1151, 10007 and 65537.
+  - **Best limit about 5000:** single-threaded S=29 −1.9% (236.1 → 231.6 s), with 19% fewer composite Fermat tests. 8 threads: within noise. Beyond about 7500 it gets slower.
+  - **OMEGA=32 comparison:** running locally (`.bench/affine/queue32.log`).
+  - Low priority, but a definite gain.
+- **Interleaving:** see `multinode_plan.md` §5 for the numbers. Option A (Legendre lanes): M2 −6%, Rangpur about 0%. Option B (cross-prime): M2 −9 to −13%, Rangpur +13–18%.
+- **Compilers on Rangpur** (r730, Haswell; job 695873):
+  - **One 3-limb exponentiation** (workload mix): 799 ns with GCC 8.5, 782 ns with `-march=native`, 596 ns with clang 21 `-march=native`.
+  - **`lpr`:** −24% with clang at S=30 single-threaded and at S=29 with 24 threads, even without LTO.
+  - **`build_lpr.sh` now prefers clang**, without LTO if `ld.lld` is absent, and adds `-march=native` when the compiler accepts it.
+- **Next:** a handwritten Montgomery kernel. Even clang spends about 70 cycles per 3-limb product, against a realistic 35–45.
