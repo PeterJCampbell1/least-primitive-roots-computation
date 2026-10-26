@@ -33,7 +33,8 @@
 # watchdog found a rank silent for 120 s).
 #
 # Environment (all optional):
-#   MPI_MODULE      environment module to load first, e.g. mpi/mpich-x86_64
+#   MPI_MODULE      MPI environment module to load first (default: the MPI_MODULE line
+#                   below, empty in the template), e.g. mpi/mpich-x86_64
 #   LPR_ARGS        lpr arguments (default "--config config/omega33.conf"); --parallel is
 #                   added unless they give --parallel or --dry-run. --mpi is always added.
 #   LPR_BUILD       1: build lpr_mpi on every node first (set by submit.sh)
@@ -56,24 +57,39 @@
 
 set -u
 
-# Load a compiler, GMP and an MPI library if your cluster uses environment modules, e.g.:
+# Load a compiler and GMP if your cluster uses environment modules, e.g.:
 # module load gcc gmp
-# module load mpi/mpich-x86_64
-if [ -n "${MPI_MODULE:-}" ]; then
-    module load "$MPI_MODULE" || { echo "module load $MPI_MODULE failed"; exit 2; }
+
+# The MPI library: set your cluster's MPI module here (see `module avail mpi`; the MPI hello
+# test, utils/mpi_hello, shows which one works), or pass MPI_MODULE when submitting. Empty:
+# no module is loaded, and mpicxx and mpirun must already be on PATH.
+MPI_MODULE=${MPI_MODULE:-}                  # e.g. mpi/mpich-x86_64 (Rangpur)
+if [ -n "$MPI_MODULE" ]; then
+    module load "$MPI_MODULE" || { echo "Error: module load $MPI_MODULE failed (see module avail mpi)"; exit 2; }
 fi
 
 nodes=${SLURM_NNODES:-1}
 threads=${SLURM_CPUS_PER_TASK:-1}
 echo "Job ${SLURM_JOB_ID}: ${nodes} nodes (${SLURM_JOB_NODELIST}), ${threads} threads per rank, $(date '+%Y-%m-%d %H:%M:%S')"
-echo "MPI: $(mpirun --version 2>&1 | head -1)"
+
+# An MPI library must be available: its compiler wrapper (for the flags) and launcher,
+# unless both are given explicitly
+have_flags=0; [ -n "${LPR_MPI_CFLAGS:-}${LPR_MPI_LIBS:-}" ] && have_flags=1
+have_launch=0; [ -n "${LPR_LAUNCH:-}" ] && have_launch=1
+if { [ $have_flags = 0 ] && ! command -v mpicxx > /dev/null 2>&1; } \
+   || { [ $have_launch = 0 ] && ! command -v mpirun > /dev/null 2>&1; }; then
+    echo "Error: no MPI library found (mpicxx and mpirun are not on PATH)."
+    echo "Load one: set MPI_MODULE in this script, or submit with MPI_MODULE=<module> (see module avail mpi)."
+    exit 2
+fi
+echo "MPI: ${MPI_MODULE:-no module}; $(mpirun --version 2>&1 | head -1)"
 
 # MPI compile and link flags (unless given)
 mpi_cflags=${LPR_MPI_CFLAGS:-}
 mpi_libs=${LPR_MPI_LIBS:-}
 if [ -z "$mpi_cflags$mpi_libs" ]; then
     wrapper=$(mpicxx --showme 2>/dev/null || mpicxx -show 2>/dev/null || true)
-    [ -n "$wrapper" ] || { echo "no MPI compiler wrapper (mpicxx) found: load an MPI module or set LPR_MPI_CFLAGS and LPR_MPI_LIBS"; exit 2; }
+    [ -n "$wrapper" ] || { echo "Error: mpicxx did not report its flags (--showme or -show): set LPR_MPI_CFLAGS and LPR_MPI_LIBS"; exit 2; }
     for flag in $wrapper; do
         case "$flag" in
             -I*) mpi_cflags="$mpi_cflags $flag" ;;
