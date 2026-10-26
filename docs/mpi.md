@@ -10,6 +10,16 @@ mpirun -np 4 ./lpr_mpi --dry-run --mpi --threads 24                       # Open
 LPR_JOB=$HOME/lpr/scripts/slurm/lpr_mpi.slurm scripts/submit.sh -n mpi_s29 \
     -a "--config config/omega33.conf --s 29" -- --nodes=2 --time=00:15:00
 ```
+- **`scripts/slurm/lpr_mpi.slurm`** is a generic template, like `lpr.slurm`, with `<...>` placeholders to fill in. It works as follows:
+  - **Builds `lpr_mpi` once on every node,** in `build_<host>/`, with `build_lpr.sh` (`LPR_TARGET=lpr_mpi`). Slurm runs the job script only on the first node, so a single build with `-march=native` could crash on a node with an older CPU.
+  - **Runs each rank with its own node's binary,** through `run_rank.sh`.
+  - **Takes the MPI flags from `mpicxx`** (`--showme` for Open MPI, `-show` for MPICH and Intel MPI), keeping only `-I`, `-L`, `-l`, `-Wl,` and `-pthread`.
+  - **Chooses the launcher from the MPI library:**
+    - Open MPI uses `srun --mpi=pmix` if Slurm offers PMIx, else `mpirun`;
+    - MPICH and Intel MPI use `srun --mpi=pmi2` if Slurm offers PMI-2, else `mpirun`;
+    - `LPR_LAUNCH` overrides the choice.
+
+  Run `utils/mpi_hello` on a new cluster first.
 - `--threads N` is per rank (per node). Run **one rank per node**; with `mpirun`, add `--map-by ppr:1:node --bind-to none` (Open MPI otherwise binds each rank, and so all its threads, to one core).
 - Only rank 0 prints the header and summary. The summary is the merge of every rank's statistics, so it must equal `--single`'s exactly. An "MPI summary" table follows, with one row per rank.
 - **Logs:** every rank logs, each line tagged `rank r:`.

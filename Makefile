@@ -38,6 +38,8 @@ endif
 # `make CXXFLAGS=...` would drop -std=c++17 and the GMP paths), e.g.
 #   make EXTRA_CXXFLAGS=-march=znver3
 CXXFLAGS += $(EXTRA_CXXFLAGS)
+# Extra libraries, appended likewise (e.g. EXTRA_LDLIBS="-L/path/to/mpi/lib -lmpi")
+LDLIBS += $(EXTRA_LDLIBS)
 
 RELEASEFLAGS := -O3 -DNDEBUG
 DEBUGFLAGS   := -O3 -g -fno-inline -fno-optimize-sibling-calls
@@ -68,9 +70,9 @@ lpr_g: $(SRCS) $(HDRS) Makefile
 
 # MPI build (docs/mpi.md): lpr_mpi, with --mpi for one search across MPI ranks.
 # Uses the MPI compiler wrapper by default; to build with another compiler, pass it plus
-# the MPI paths, as scripts/slurm/lpr_mpi.slurm does on Rangpur:
+# the MPI flags, as scripts/slurm/build_lpr.sh does (LPR_TARGET=lpr_mpi), e.g.
 #   make lpr_mpi MPICXX=clang++ EXTRA_CXXFLAGS=-I/usr/include/mpich-x86_64 \
-#        LDLIBS="-lgmpxx -lgmp -pthread -L/usr/lib64/mpich/lib -Wl,-rpath,/usr/lib64/mpich/lib -lmpi"
+#        EXTRA_LDLIBS="-L/usr/lib64/mpich/lib -Wl,-rpath,/usr/lib64/mpich/lib -lmpi"
 MPICXX ?= mpicxx
 mpi: lpr_mpi
 mpi_debug: lpr_mpi_g

@@ -1,6 +1,7 @@
 #!/bin/bash
 # Build lpr in the current directory (a run directory made by scripts/submit.sh),
-# on the node that will run it. Called by scripts/slurm/lpr.slurm when LPR_BUILD=1.
+# on the node that will run it. Called by scripts/slurm/lpr.slurm when LPR_BUILD=1, and
+# by scripts/slurm/lpr_mpi.slurm once on every node (LPR_TARGET=lpr_mpi).
 #
 # 1. Find a compiler and LTO setting that can compile, link and run a small C++17
 #    gmpxx test program, trying in order:
@@ -40,6 +41,11 @@
 #   LPR_PGO          1 for a profile-guided build
 #   LPR_PGO_TRAIN    lpr arguments for the PGO training run (default "--single", OMEGA=33)
 #   LPR_PROFDATA     llvm-profdata to use for clang PGO (default: from PATH, or xcrun on macOS)
+#   LPR_TARGET       lpr (default) or lpr_mpi (scripts/slurm/lpr_mpi.slurm); lpr_mpi is built
+#                    with the chosen compiler plus LPR_MPI_CFLAGS and LPR_MPI_LIBS (the MPI
+#                    include and library flags), not through the MPI compiler wrapper
+#   LPR_MPI_CFLAGS   MPI compile flags for lpr_mpi, e.g. "-I/usr/include/mpich-x86_64"
+#   LPR_MPI_LIBS     MPI link flags for lpr_mpi, e.g. "-L/usr/lib64/mpich/lib -lmpi"
 
 set -euo pipefail
 
@@ -48,6 +54,14 @@ gmp_home=${LPR_GMP_HOME:-$HOME/opt/gmp-$gmp_version}
 tarball=${LPR_GMP_TARBALL:-$HOME/gmp-$gmp_version.tar.xz}
 gmp_url="https://ftp.gnu.org/gnu/gmp/gmp-$gmp_version.tar.xz"
 jobs=${SLURM_CPUS_PER_TASK:-4}
+target=${LPR_TARGET:-lpr}
+case "$target" in
+    lpr|lpr_mpi) ;;
+    *) echo "[build_lpr] LPR_TARGET must be lpr or lpr_mpi (got $target)"; exit 1 ;;
+esac
+if [ "$target" = lpr_mpi ] && [ "${LPR_PGO:-0}" = 1 ]; then
+    echo "[build_lpr] LPR_PGO is not supported for lpr_mpi"; exit 1
+fi
 
 log() { echo "[build_lpr] $*"; }
 
@@ -235,7 +249,7 @@ if ! find_toolchain; then
 fi
 rm -f .build_test .build_test.cpp .build_test.log
 
-# Builds ./lpr with candidate $1 ("name|cxx|lto|ld|prefix"); returns non-zero on failure
+# Builds ./$target with candidate $1 ("name|cxx|lto|ld|prefix"); returns non-zero on failure
 attempt() {
     IFS='|' read -r name cxx lto ld prefix <<< "$1"
     log "using: $name; GMP: ${prefix:-system}${LPR_CXXFLAGS:+; extra flags: $LPR_CXXFLAGS}"
@@ -245,15 +259,20 @@ attempt() {
     export LDFLAGS="${ld}${prefix:+ -Wl,-rpath,$prefix/lib}"
     commit_tag=""                # "-pgo" for PGO builds, so the run header shows it
     [ "${LPR_PGO:-0}" = 1 ] && commit_tag="-pgo"
-    build() {   # build ./lpr with extra flags $1 (on top of LPR_CXXFLAGS)
-        rm -f lpr
-        make release CXX="$cxx" LTOFLAGS="$lto" EXTRA_CXXFLAGS="${LPR_CXXFLAGS:-} $1" \
-            ${LPR_COMMIT:+GIT_COMMIT=$LPR_COMMIT$commit_tag}
+    build() {   # build ./$target with extra flags $1 (on top of LPR_CXXFLAGS)
+        rm -f "$target"
+        if [ "$target" = lpr_mpi ]; then
+            make lpr_mpi MPICXX="$cxx" LTOFLAGS="$lto" EXTRA_CXXFLAGS="${LPR_CXXFLAGS:-} ${LPR_MPI_CFLAGS:-} $1" \
+                EXTRA_LDLIBS="${LPR_MPI_LIBS:-}" ${LPR_COMMIT:+GIT_COMMIT=$LPR_COMMIT$commit_tag}
+        else
+            make release CXX="$cxx" LTOFLAGS="$lto" EXTRA_CXXFLAGS="${LPR_CXXFLAGS:-} $1" \
+                ${LPR_COMMIT:+GIT_COMMIT=$LPR_COMMIT$commit_tag}
+        fi
     }
 
     if [ "${LPR_PGO:-0}" != 1 ]; then
         build "" || return 1
-        log "built ./lpr"
+        log "built ./$target"
         return 0
     fi
 
@@ -299,5 +318,5 @@ for cand in "${working[@]}"; do
     fi
     log "build with ${cand%%|*} failed; trying the next compiler"
 done
-log "every compiler failed to build lpr"
+log "every compiler failed to build $target"
 exit 1
