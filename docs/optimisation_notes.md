@@ -1074,5 +1074,9 @@ Design, usage and the full verification log are in `mpi.md`.
   - **Donating the upper 2/3** of the base level instead of 1/2 was about 2% slower and moved more tasks.
   - **The idle time comes from the rank without the large part of the search.** It ran 5–10% idle, because a split never gives away the sibling in progress, and that sibling's subtree holds most of the work.
   - **Next:** a work-aware split.
+- **OMEGA=32 S=29 on 2 nodes (job 699035):**
+  - 1,638.6 s, against 3,452 s on 1 node, so 2.11×. One of the two nodes has a faster CPU.
+  - Summary identical to the 1-node runs.
+  - Idle time 0.05% of worker time.
 - **OMEGA=32 S=29, clang 21 on 1 node (job 697335):** 3,452 s, against 4,444 s with GCC (job 690984), with an identical summary.
 - **Builds:** GMP's headers are now included with `-isystem`, which silences clang 21's `-Wdeprecated-literal-operator` warnings from `gmpxx.h`.

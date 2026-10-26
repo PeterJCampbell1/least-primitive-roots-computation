@@ -199,10 +199,12 @@ public:
         CheckpointFn checkpoint = {},
         double checkpoint_interval = 0,
         std::string checkpoint_path = "",
-        std::uint64_t expected_candidates = 0
+        std::uint64_t expected_candidates = 0,
+        std::function<lpr::stats::Counters()> eta_source = {}
     ) : log_interval_(log_interval), start_(start), mode_fields_(std::move(mode_fields)),
         checkpoint_(std::move(checkpoint)), checkpoint_interval_(checkpoint_interval),
         checkpoint_path_(std::move(checkpoint_path)), expected_candidates_(expected_candidates),
+        eta_source_(std::move(eta_source)),
         start_candidates_(lpr::stats::get_master_stats().snapshot().candidate_count) {
         thread_ = std::thread([this]() { run(); });
     }
@@ -231,6 +233,9 @@ private:
     double checkpoint_interval_;
     std::string checkpoint_path_;
     std::uint64_t expected_candidates_;
+    // Counters for the candidate rate and ETA (default: this process's statistics; under
+    // MPI, rank 0 passes the totals over every rank)
+    std::function<lpr::stats::Counters()> eta_source_;
     std::uint64_t start_candidates_; // Candidates done in earlier runs (resumed), excluded from the rate
     bool ignore_signals_ = false; // A signal arrived while the search was finishing
     std::mutex mutex_;
@@ -278,8 +283,9 @@ private:
                 const double seconds = std::chrono::duration<double>(now - last_log).count();
                 const double rate = (snapshot.total_support_count - last_processed) / seconds;
                 const double since_start = std::chrono::duration<double>(now - start_).count();
+                const lpr::stats::Counters eta_counts = eta_source_ ? eta_source_() : snapshot;
                 lpr::log::info(progress_line(snapshot, rate, mode_fields_(),
-                                             eta_fields(snapshot, start_candidates_, since_start, expected_candidates_)));
+                                             eta_fields(eta_counts, start_candidates_, since_start, expected_candidates_)));
                 last_processed = snapshot.total_support_count;
                 last_log = now;
             }
@@ -772,16 +778,33 @@ int main(int argc, char* argv[])
             if (mode == RunMode::ParallelQueue) return "queue=" + std::to_string(queue.size());
 #ifdef LPR_MPI
             if (mpi_node && mpi_rank == 0) {
+                // Rank 0's own counts come first in the line; these cover every rank
+                const lpr::stats::Counters all = mpi_node->global_progress();
                 return "queue=- active_workers=" + std::to_string(scheduler.active_workers())
                        + " mpi_pool=" + std::to_string(mpi_node->pool_size())
-                       + " all_ranks_processed=" + std::to_string(mpi_node->global_processed())
-                       + " all_ranks_candidates=" + std::to_string(mpi_node->global_candidates());
+                       + " all_ranks_emitted=" + std::to_string(all.supports_emitted)
+                       + " all_ranks_processed=" + std::to_string(all.total_support_count)
+                       + " all_ranks_candidates=" + std::to_string(all.candidate_count)
+                       + " all_ranks_fermat_survivors=" + std::to_string(all.fermat_survivor_count)
+                       + " all_ranks_certified=" + std::to_string(all.certified_count)
+                       + " all_ranks_failed=" + std::to_string(all.certified_inequality_fail_count)
+                       + " all_ranks_unresolved=" + std::to_string(all.unresolved_count)
+                       + " all_ranks_largest_g=" + std::to_string(all.largest_least_primitive_root);
             }
 #endif
             if (work_stealing) return "queue=- active_workers=" + std::to_string(scheduler.active_workers());
             return "queue=-";
         }, options.checkpoint_file.empty() ? Monitor::CheckpointFn{} : Monitor::CheckpointFn(take_checkpoint),
-           options.checkpoint_interval, options.checkpoint_file, options.expected_candidates);
+           options.checkpoint_interval, options.checkpoint_file, options.expected_candidates,
+#ifdef LPR_MPI
+           // Under MPI, rank 0's candidate rate and ETA count every rank
+           mpi_node && mpi_rank == 0
+               ? std::function<lpr::stats::Counters()>([&]() { return mpi_node->global_progress(); })
+               : std::function<lpr::stats::Counters()>{}
+#else
+           std::function<lpr::stats::Counters()>{}
+#endif
+           );
 
         if (options.mpi) {
 #ifdef LPR_MPI

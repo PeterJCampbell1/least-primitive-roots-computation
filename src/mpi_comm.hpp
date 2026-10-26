@@ -58,6 +58,7 @@
 #include <iomanip>
 #include <iostream>
 #include <list>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -133,11 +134,16 @@ struct Status {
     std::uint64_t supports_processed = 0; // Progress (from the last statistics snapshot)
     std::uint64_t supports_emitted = 0;
     std::uint64_t candidates = 0;
-    static constexpr std::size_t WORDS = 7;
+    std::uint64_t fermat_survivors = 0;
+    std::uint64_t certified = 0;
+    std::uint64_t failed = 0;            // Grosswald inequality failures
+    std::uint64_t unresolved = 0;        // No least primitive root within the search limit
+    std::uint64_t largest_g = 0;
+    static constexpr std::size_t WORDS = 12;
 
     void append_to(Words& w) const {
         w.insert(w.end(), {received, regions, idle_workers, base_depth, supports_processed, supports_emitted,
-                           candidates});
+                           candidates, fermat_survivors, certified, failed, unresolved, largest_g});
     }
     static Status read(const Words& w) {
         Status s;
@@ -148,6 +154,11 @@ struct Status {
         s.supports_processed = w[4];
         s.supports_emitted = w[5];
         s.candidates = w[6];
+        s.fermat_survivors = w[7];
+        s.certified = w[8];
+        s.failed = w[9];
+        s.unresolved = w[10];
+        s.largest_g = w[11];
         return s;
     }
 };
@@ -348,8 +359,13 @@ public:
 
     // For progress lines (any thread; rank 0's values cover every rank)
     std::uint64_t pool_size() const { return pool_size_.load(std::memory_order_relaxed); }
-    std::uint64_t global_processed() const { return global_processed_.load(std::memory_order_relaxed); }
-    std::uint64_t global_candidates() const { return global_candidates_.load(std::memory_order_relaxed); }
+    // Rank 0: progress over every rank, from each rank's latest Status (at most a second
+    // or two old). Fills the progress fields of Counters: supports processed and emitted,
+    // candidates, Fermat survivors, certified, failed, unresolved and the largest g(p).
+    stats::Counters global_progress() const {
+        std::lock_guard<std::mutex> lock(global_mutex_);
+        return global_;
+    }
 
     NodeCounters& counters() { return counters_; }
 
@@ -414,8 +430,8 @@ private:
     unsigned stop_acks_ = 0;
     Clock::time_point last_heartbeat_sent_{};
     std::atomic<std::uint64_t> pool_size_{0};
-    std::atomic<std::uint64_t> global_processed_{0};
-    std::atomic<std::uint64_t> global_candidates_{0};
+    mutable std::mutex global_mutex_; // Guards global_ (read by the monitor thread)
+    stats::Counters global_;
 
     static std::uint64_t elapsed_ns(Clock::time_point since) {
         return static_cast<std::uint64_t>(
@@ -516,6 +532,11 @@ private:
         s.supports_processed = progress_.total_support_count;
         s.supports_emitted = progress_.supports_emitted;
         s.candidates = progress_.candidate_count;
+        s.fermat_survivors = progress_.fermat_survivor_count;
+        s.certified = progress_.certified_count;
+        s.failed = progress_.certified_inequality_fail_count;
+        s.unresolved = progress_.unresolved_count;
+        s.largest_g = progress_.largest_least_primitive_root;
         return s;
     }
 
@@ -713,13 +734,22 @@ private:
         v.status = Status::read(data);
         v.known = true;
         v.last_heard = Clock::now();
-        std::uint64_t processed = 0, candidates = 0;
-        for (const RankView& view : ranks_) {
-            processed += view.status.supports_processed;
-            candidates += view.status.candidates;
+        {
+            stats::Counters total;
+            for (const RankView& view : ranks_) {
+                const Status& st = view.status;
+                total.total_support_count += st.supports_processed;
+                total.supports_emitted += st.supports_emitted;
+                total.candidate_count += st.candidates;
+                total.fermat_survivor_count += st.fermat_survivors;
+                total.certified_count += st.certified;
+                total.certified_inequality_fail_count += st.failed;
+                total.unresolved_count += st.unresolved;
+                total.largest_least_primitive_root = std::max(total.largest_least_primitive_root, st.largest_g);
+            }
+            std::lock_guard<std::mutex> lock(global_mutex_);
+            global_ = total;
         }
-        global_processed_.store(processed, std::memory_order_relaxed);
-        global_candidates_.store(candidates, std::memory_order_relaxed);
         if (v.status.received > v.issued) fatal("rank " + std::to_string(source) + " received more than issued");
         switch (tag) {
         case TAG_REQUEST:

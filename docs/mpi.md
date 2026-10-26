@@ -15,7 +15,13 @@ LPR_JOB=$HOME/lpr/scripts/slurm/lpr_mpi.slurm scripts/submit.sh -n mpi_s29 \
 - **Logs:** every rank logs, each line tagged `rank r:`.
   - Without `--log-file`, the lines go to stderr.
   - With `--log-file PATH`, rank 0 writes PATH and rank r writes `PATH.rank<r>`, so ranks never share a file on the shared filesystem. `lpr_mpi.slurm` passes `--log-file lpr_mpi_<jobid>.log`.
-  - Rank 0's progress lines cover every rank: `mpi_pool`, `all_ranks_processed`, `all_ranks_candidates`.
+  - **Rank 0's progress line** starts with rank 0's own counts, then adds totals over every rank:
+    - `all_ranks_emitted`, `all_ranks_processed`, `all_ranks_candidates`, `all_ranks_fermat_survivors`, `all_ranks_certified`;
+    - `all_ranks_failed`, `all_ranks_unresolved`, `all_ranks_largest_g`;
+    - `mpi_pool` (rank 0's pool).
+
+    The totals come from each rank's once-per-second Status, so they lag by a second or two.
+  - **`candidates_per_s`, and `done=`/`eta=` with `--expected-candidates`,** use the all-ranks candidate total on rank 0.
   - Warnings always go to stderr as well.
 - **Options:**
   - `--mpi-request-idle N` (default 2, capped at `--threads`): the L1 trigger.
@@ -116,10 +122,16 @@ Every test compares the full search and producer summaries with the single-threa
 - **Local re-verification with the new defaults:** 111/111 exact. This used a temporary `--mpi-donate N/D` option, run at 1/2, 1/3, 9/10 and 63/64 with and without stress.
 - **The result:** donations went back to the same half split as local steals, and the option was removed.
 
+### OMEGA=32 S=29 on 2 nodes (job 699035, r730-2 and r730-3, commit 31e950f, 26/10/26)
+- **Exact:** the full summary (108 lines) is identical to the 1-node runs 697335 (clang) and 690984 (GCC):
+  - 6,057,734,933 supports, checksum 0xc66b5efd1a7ac845;
+  - 0 failures, 0 unresolved, largest g(p) 678.
+- **Time:** 1,638.6 s, against 3,452 s on 1 node with clang (r730-0), so 2.11×. The nodes differ: r730-3 is an E5-2680 v3 at 2.5 GHz, and r730-0 and r730-2 are E5-2670 v3 at 2.3 GHz.
+- **Idle time is negligible on a long run:** 36.2 s on rank 0 and 1.3 s on rank 1, out of 78,650 worker-seconds (0.05%). The donation-size question above matters only for short runs.
+- **Transfers:** 636 tasks issued and 687 donations requested.
+
 ## 4. Next steps
-1. **Rangpur:**
-   - OMEGA=32 on 2 nodes, compared with the 1-node clang run (job 697335, 3,452 s);
-   - then 4 nodes.
+1. **Rangpur:** 4 nodes (OMEGA=32 on 2 nodes is done: job 699035, exact, 2.11×).
 2. **M4:** coordinated checkpoints (rank 0 PAUSE → drain → gather tasks and counters → one file) plus `--stop-at`/USR1. Then requeue on multiple nodes.
 3. **Bigger donations:** a work-aware split that can step into the donor's current subtree. Today the rank without the large part of the search idles about 5–10% of its worker time on 2 nodes.
 4. **M3 (peer stealing):** only if rank 0 limits scaling.
