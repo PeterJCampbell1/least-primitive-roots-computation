@@ -1039,3 +1039,40 @@ OMEGA: 33 (tests)
   - **`lpr`:** −24% with clang at S=30 single-threaded and at S=29 with 24 threads, even without LTO.
   - **`build_lpr.sh` now prefers clang**, without LTO if `ld.lld` is absent, and adds `-march=native` when the compiler accepts it.
 - **Next:** a handwritten Montgomery kernel. Even clang spends about 70 cycles per 3-limb product, against a realistic 35–45.
+- **Hand-written x86 kernel, measured on Rangpur** (r730-3, E5-2680 v3; job 696192; scratch `.bench/kernel`):
+  - **Correct:** `mul_x86asm` (BMI2 `mulx`, CIOS, 74 instructions against clang's 132) gives 0 mismatches in 508,000 products under clang and g++. It was also emulated against exact arithmetic before the run.
+  - **Latency per product** (dependent chain): clang current 15.06 ns, asm 17.14 ns, intrinsics 14.83 ns. g++: current 21.91 ns, asm 22.65 ns, intrinsics 31.35 ns.
+  - **Throughput** (4 chains): clang 14.61 / 13.97 / 14.05 ns; g++ 21.29 / **17.04** / 30.41 ns.
+  - **Conclusions:**
+    - clang is already near Haswell's latency floor, about 48 cycles per product. The earlier estimate of "about 70 cycles" wrongly divided whole exponentiations by their product count.
+    - 4 chains barely beat 1, because Haswell is limited by micro-operations (`adc` and `mulx` are 2 each), which explains why interleaving gains nothing there.
+    - The asm kernel helps throughput, mainly under GCC, but not latency, which is what exponentiation needs.
+  - **Next:** a dedicated squaring on Haswell; ADX kernels and interleaving on newer CPUs.
+  - **Measuring note:** cycles were derived by calibrating against a dependent-add loop, which came out at 3.15 GHz for the clang binary and 2.41 GHz for the g++ one. Compare nanoseconds between compilers, or use `perf stat -e cycles`.
+- **Dedicated squaring, measured on Rangpur** (r730-3; job 696241):
+  - **Correct:** `sqr_unrolled` (6 products, SOS) and `sqr_sos` give 0 mismatches in 508,000 inputs each, and 0 in the exponentiations built on them, against the production code.
+  - **clang 21:**
+    - the squaring alone has the same latency as `mul(a, a)` (14.0 ns) and 6% better throughput;
+    - Fermat with a 180-bit exponent: 3,066.8 against 3,145.5 ns (−2.5%);
+    - 17-bit powm: 499.9 against 516.8 ns (−3.3%);
+    - roughly −2–3% of a whole run. Worth adopting for x86 clang builds.
+  - **GCC 8.5:** Fermat is slower (+4.5%), so not worth it there.
+  - **`sqr_sos`:** worse under both compilers.
+  - **`perf stat`:** for the same program, clang executes 50.0 billion instructions in 21.9 billion cycles, against 97.6 billion in 35.1 billion for GCC 8.5. The clock is about 3.07 GHz in both. The add-loop cycle calibration was right for clang and about 1.3× off for GCC, so use `perf` for cycle counts.
+  - **Conclusion:** on Haswell with clang, the arithmetic is near the hardware's limits. Kernel tuning, interleaving and squaring each give 0–3%; the compiler change (−24%) was the large gain.
+
+## MPI across nodes (`lpr_mpi --mpi`, 26/10/26)
+Design, usage and the full verification log are in `mpi.md`.
+- **Shape:** one MPI rank per node runs the existing work stealing. Its main thread is a communication thread that joins the scheduler's protocol as one more thief.
+- **Where work comes from:** an idle worker steals inside its node first. A node asks rank 0 for a task once 2 of its workers are idle. Rank 0 serves from a pool, which it refills by asking the busiest node to split off work (`split_region`, half, as local steals).
+- **Correct:** every local test (Rosetta, 1–8 ranks, including stress modes) and every Rangpur run gave summaries identical to `--single`.
+- **Overhead:** on one machine with the same total thread count, `lpr_mpi` matches plain `lpr` within noise (S=29 with 8 workers: 80.8–83.9 s against 84.8 s).
+- **Rangpur, 2 r730 nodes × 24 threads, OMEGA=33 S=29:**
+  - the clang build took 21.0–21.1 s on 1 node and 10.3–11.2 s on 2;
+  - the tuned defaults (pool reserve 4, request at 2 idle workers) took 10.40 and 10.44 s, against 10.72 and 10.82 s with the first defaults.
+- **Donation size:**
+  - **Donating the upper 2/3** of the base level instead of 1/2 was about 2% slower and moved more tasks.
+  - **The idle time comes from the rank without the large part of the search.** It ran 5–10% idle, because a split never gives away the sibling in progress, and that sibling's subtree holds most of the work.
+  - **Next:** a work-aware split.
+- **OMEGA=32 S=29, clang 21 on 1 node (job 697335):** 3,452 s, against 4,444 s with GCC (job 690984), with an identical summary.
+- **Builds:** GMP's headers are now included with `-isystem`, which silences clang 21's `-Wdeprecated-literal-operator` warnings from `gmpxx.h`.

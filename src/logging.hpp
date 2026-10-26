@@ -27,6 +27,7 @@ struct LogState {
     std::ofstream file;
     bool to_file = false;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::string tag; // E.g. "rank 3: " under MPI (empty otherwise)
 };
 
 inline LogState& state() {
@@ -44,7 +45,7 @@ inline std::string prefix(const LogState& s) {
     ).count();
 
     std::ostringstream out;
-    out << '[' << std::put_time(&local, "%Y-%m-%d %H:%M:%S") << " +" << elapsed << "s] ";
+    out << '[' << std::put_time(&local, "%Y-%m-%d %H:%M:%S") << " +" << elapsed << "s] " << s.tag;
     return out.str();
 }
 
@@ -74,6 +75,13 @@ inline void set_start(std::chrono::steady_clock::time_point start) {
     auto& s = detail::state();
     std::lock_guard<std::mutex> lock(s.mutex);
     s.start = start;
+}
+
+// Text after the timestamp on every line (e.g. the MPI rank)
+inline void set_tag(const std::string& tag) {
+    auto& s = detail::state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    s.tag = tag;
 }
 
 inline void info(const std::string& msg) {

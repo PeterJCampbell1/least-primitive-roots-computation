@@ -1,6 +1,6 @@
 # Plan: one search across several nodes with MPI
 
-Status: **plan, written 25/10/26; not implemented.** It is the chosen first approach to multi-node runs; the shared-task-pool design in `multinode_plan.md` §2 remains the fallback if MPI proves impractical on the clusters. It builds on work stealing (`work_stealing.md`) and checkpoints (`checkpointing.md`).
+Status: **plan, written 25/10/26. Steps M1 and M2 are implemented (26/10/26; see [`mpi.md`](mpi.md)); M4 (checkpoints) is not.** It is the chosen first approach to multi-node runs; the shared-task-pool design in `multinode_plan.md` §2 remains the fallback if MPI proves impractical on the clusters. It builds on work stealing (`work_stealing.md`) and checkpoints (`checkpointing.md`).
 
 ## 1. MPI in one page (what we need from it)
 - **Launch:** `srun ./lpr …` (or `mpirun`) starts the same program as several separate processes, called **ranks** and numbered 0 … size−1, typically one per node. They share no memory: everything they exchange is an explicit message. Slurm starts the ranks and tells them how to find each other (PMI/PMIx); the program does the rest.

@@ -6,6 +6,7 @@ This directory holds everything needed to run `lpr` as Slurm jobs:
 |---|---|
 | `submit.sh` | Run on the **login node**. Prepares a run directory and submits the job. |
 | `slurm/lpr.slurm` | The job script template: resources (`#SBATCH` lines), the build step and the `lpr` command. |
+| `slurm/lpr_mpi.slurm` | Job script for one search across several nodes with `lpr_mpi` (one MPI rank per node; docs/mpi.md). Use it through `submit.sh` with `LPR_JOB=$HOME/lpr/scripts/slurm/lpr_mpi.slurm`. |
 | `slurm/build_lpr.sh` | Run **inside the job** on the compute node. Finds a working compiler and GMP (building GMP if needed) and builds `lpr`. |
 | `Makefile` | Optional shortcuts: one target per common kind of run (`make -C ~/lpr/scripts help`). |
 

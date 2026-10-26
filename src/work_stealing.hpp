@@ -30,6 +30,14 @@
  * are stopped the master statistics cover exactly the work done before their
  * positions. remaining_tasks() then lists every region as a Task (verified by
  * replay against the live frames), and resume() lets the workers continue.
+ *
+ * External endpoint (MPI, docs/mpi.md): with `external`, one more thread (the
+ * rank's communication thread) takes part in the protocol as thief id
+ * num_workers: it adds tasks received from other ranks (add_task), and asks a
+ * busy worker for a split to give to another rank (post_external_request, the
+ * same request slot and mailbox protocol as a thief). active_ reaching 0 then
+ * only means this rank holds no region: the workers wait for more work until
+ * finish() says that no region exists on any rank.
  **/
 
 #pragma once
@@ -64,6 +72,7 @@ enum MailboxState : int { EMPTY = 0, FILLED = 1, REFUSED = 2 };
 struct alignas(64) Worker {
     std::atomic<int> request{-1};         // Id of a thief waiting for an answer, or -1
     std::atomic<int> mailbox_state{EMPTY}; // Written by a victim, reset by this worker
+    std::atomic<int> base_depth{-1};      // Base depth of its region, or -1 if idle (informational)
     producer::detail::Region mailbox;     // Written by a victim before FILLED
 };
 
@@ -78,14 +87,15 @@ public:
     // < max_prefix (tunable with --steal-max-prefix; OMEGA = no limit).
     // tasks: the work to do (the root task for a new search, or a checkpoint's
     // tasks); each must restore (DfsStack::restore), which main checks beforehand.
+    // external: an MPI communication thread takes part (see the header comment)
     Scheduler(const std::vector<unsigned>& primes, const mpz_class& bound, unsigned workers, bool stress,
-              std::size_t max_prefix, std::vector<Task> tasks)
+              std::size_t max_prefix, std::vector<Task> tasks, bool external = false)
         : primes_(primes), bound_(bound), num_workers_(workers), stress_(stress), max_prefix_(max_prefix),
-          pending_(std::move(tasks)), parked_stacks_(workers, nullptr) {
+          external_(external), pending_(std::move(tasks)), parked_stacks_(workers, nullptr) {
         assert(max_prefix >= 1);
         assert(workers >= 1);
-        workers_.reserve(workers);
-        for (unsigned i = 0; i < workers; ++i) {
+        workers_.reserve(workers + 1);
+        for (unsigned i = 0; i < workers + (external ? 1u : 0u); ++i) {
             workers_.push_back(std::make_unique<detail::Worker>());
         }
         active_.store(static_cast<unsigned>(pending_.size()));
@@ -114,6 +124,72 @@ public:
     // Workers currently holding a region (for progress logs; approximate)
     unsigned active_workers() const {
         return active_.load(std::memory_order_relaxed);
+    }
+
+    // ---- External endpoint (MPI communication thread only; requires `external`) ----
+
+    // Regions on this rank (held, being handed over, pending, or in the external
+    // mailbox). 0 is stable until add_task: no region exists here.
+    unsigned regions() const {
+        return active_.load(std::memory_order_acquire);
+    }
+
+    // Workers currently looking for work
+    unsigned idle_workers() const {
+        return idle_.load(std::memory_order_relaxed);
+    }
+
+    std::size_t pending_tasks() {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        return pending_.size();
+    }
+
+    // A task from another rank (the caller has checked that it restores)
+    void add_task(Task task) {
+        assert(external_);
+        active_.fetch_add(1); // Before it can be taken, so active_ never undercounts
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_.push_back(std::move(task));
+    }
+
+    // No region exists on any rank: the workers exit once idle
+    void finish() {
+        assert(external_ && active_.load() == 0);
+        done_.store(true, std::memory_order_release);
+    }
+
+    unsigned num_workers() const { return num_workers_; }
+
+    // Base depth of worker id's region, or -1 if it is idle (informational)
+    int worker_base_depth(unsigned id) const {
+        return workers_[id]->base_depth.load(std::memory_order_relaxed);
+    }
+
+    // Asks worker `victim` for a split, as a thief would. False if another thief
+    // is already waiting on it. The answer arrives in external_mailbox_state().
+    bool post_external_request(unsigned victim) {
+        assert(external_ && victim < num_workers_);
+        int expected = -1;
+        return workers_[victim]->request.compare_exchange_strong(
+            expected, static_cast<int>(num_workers_), std::memory_order_acq_rel, std::memory_order_relaxed);
+    }
+
+    int external_mailbox_state() const {
+        return workers_[num_workers_]->mailbox_state.load(std::memory_order_acquire);
+    }
+
+    const producer::detail::Region& external_mailbox() const {
+        return workers_[num_workers_]->mailbox;
+    }
+
+    void reset_external_mailbox() {
+        workers_[num_workers_]->mailbox_state.store(detail::EMPTY, std::memory_order_relaxed);
+    }
+
+    // After a FILLED answer: the region has been sent to another rank
+    void region_left() {
+        assert(external_ && active_.load() > 0);
+        active_.fetch_sub(1);
     }
 
     enum class PauseResult { Paused, SearchFinishing, TimedOut };
@@ -223,8 +299,11 @@ private:
     const unsigned num_workers_;
     const bool stress_;
     const std::size_t max_prefix_;
+    const bool external_;
     std::vector<std::unique_ptr<detail::Worker>> workers_;
     std::atomic<unsigned> active_{0};
+    std::atomic<unsigned> idle_{0};    // Workers in find_work
+    std::atomic<bool> done_{false};    // External: no region exists on any rank
 
     // Tasks not yet taken by a worker (counted in active_)
     std::mutex pending_mutex_;
@@ -286,7 +365,9 @@ private:
         };
 
         while (find_work(id, stack, support, rng)) {
+            self.base_depth.store(static_cast<int>(stack.base_depth()), std::memory_order_relaxed);
             producer::detail::run_region(stack, support, primes_, emit, poll);
+            self.base_depth.store(-1, std::memory_order_relaxed);
             active_.fetch_sub(1); // This worker's region is finished
         }
         {
@@ -339,6 +420,7 @@ private:
         stats.split_ns += elapsed_ns(split_start);
         if (split) {
             active_.fetch_add(1); // Before the handover, so active_ never reaches 0 while a region is in transit
+            self.base_depth.store(static_cast<int>(stack->base_depth()), std::memory_order_relaxed);
             thief.mailbox_state.store(detail::FILLED, std::memory_order_release);
         } else {
             ++stats.requests_refused_busy;
@@ -383,7 +465,9 @@ private:
         auto& stats = lpr::stats::get_thread_local_stats();
         detail::Worker& self = *workers_[id];
         const auto idle_start = std::chrono::steady_clock::now();
+        idle_.fetch_add(1, std::memory_order_relaxed);
         auto finish = [&](bool found) {
+            idle_.fetch_sub(1, std::memory_order_relaxed);
             stats.worker_idle_ns += elapsed_ns(idle_start);
             return found;
         };
@@ -397,7 +481,17 @@ private:
             if (take_pending(stack, support)) {
                 return finish(true); // active_ already counts it
             }
-            if (active_.load() == 0) {
+            if (external_) {
+                if (done_.load(std::memory_order_acquire)) {
+                    return finish(false); // No region exists on any rank
+                }
+                if (active_.load() == 0 || num_workers_ == 1) {
+                    // Nothing on this rank (or only a region the communication
+                    // thread is handing to another rank): wait for the next task
+                    back_off(failures++);
+                    continue;
+                }
+            } else if (active_.load() == 0) {
                 return finish(false);
             }
             if (num_workers_ == 1) {
@@ -417,7 +511,8 @@ private:
             ++stats.steal_requests;
 
             const auto wait_start = std::chrono::steady_clock::now();
-            int state;
+            bool withdrawn = false;
+            int state = detail::EMPTY;
             while ((state = self.mailbox_state.load(std::memory_order_acquire)) == detail::EMPTY) {
                 if (pause_requested()) {
                     park(id, nullptr); // The request stays posted; the victim answers after the pause
@@ -429,11 +524,19 @@ private:
                                                                std::memory_order_acq_rel, std::memory_order_relaxed)) {
                         ++stats.steal_withdrawals;
                         stats.steal_wait_ns += elapsed_ns(wait_start);
-                        return finish(false); // Nobody will answer: the search is complete
+                        if (!external_) {
+                            return finish(false); // Nobody will answer: the search is complete
+                        }
+                        withdrawn = true; // Nothing on this rank: wait for the next task (top of the loop)
+                        break;
                     }
                     // The victim has taken the request and will answer
                 }
                 std::this_thread::yield();
+            }
+            if (withdrawn) {
+                back_off(failures++);
+                continue;
             }
             stats.steal_wait_ns += elapsed_ns(wait_start);
             self.mailbox_state.store(detail::EMPTY, std::memory_order_relaxed);

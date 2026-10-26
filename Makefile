@@ -28,7 +28,9 @@ else
 endif
 
 ifneq ($(strip $(GMP_PREFIX)),)
-    CXXFLAGS += -I$(GMP_PREFIX)/include
+    # -isystem: GMP's headers are third-party, so their warnings are suppressed (e.g. clang 21's
+    # -Wdeprecated-literal-operator in gmpxx.h); warnings in src/ still show
+    CXXFLAGS += -isystem $(GMP_PREFIX)/include
     LDFLAGS  += -L$(GMP_PREFIX)/lib
 endif
 
@@ -48,7 +50,7 @@ DYADIC_SRC         := utils/dyadic_bound.cpp
 INTERVAL_CHECK_SRC := utils/interval_check.cpp
 DFS_TEST_SRC       := utils/dfs_test.cpp
 
-.PHONY: all release debug dyadic interval_check clean
+.PHONY: all release debug mpi mpi_debug dyadic interval_check clean
 
 # Default target (make / make all) - builds lpr and lpr_g only
 all: release debug
@@ -64,6 +66,21 @@ lpr: $(SRCS) $(HDRS) Makefile
 lpr_g: $(SRCS) $(HDRS) Makefile
 	$(CXX) $(DEBUGFLAGS) $(CXXFLAGS) $(LTOFLAGS) $(SRCS) $(LDFLAGS) $(LDLIBS) -o $@
 
+# MPI build (docs/mpi.md): lpr_mpi, with --mpi for one search across MPI ranks.
+# Uses the MPI compiler wrapper by default; to build with another compiler, pass it plus
+# the MPI paths, as scripts/slurm/lpr_mpi.slurm does on Rangpur:
+#   make lpr_mpi MPICXX=clang++ EXTRA_CXXFLAGS=-I/usr/include/mpich-x86_64 \
+#        LDLIBS="-lgmpxx -lgmp -pthread -L/usr/lib64/mpich/lib -Wl,-rpath,/usr/lib64/mpich/lib -lmpi"
+MPICXX ?= mpicxx
+mpi: lpr_mpi
+mpi_debug: lpr_mpi_g
+
+lpr_mpi: $(SRCS) $(HDRS) Makefile
+	$(MPICXX) $(RELEASEFLAGS) $(CXXFLAGS) -DLPR_MPI $(LTOFLAGS) $(SRCS) $(LDFLAGS) $(LDLIBS) -o $@
+
+lpr_mpi_g: $(SRCS) $(HDRS) Makefile
+	$(MPICXX) $(DEBUGFLAGS) $(CXXFLAGS) -DLPR_MPI $(LTOFLAGS) $(SRCS) $(LDFLAGS) $(LDLIBS) -o $@
+
 # Dyadic approximation helper utility (built only when explicitly requested: 'make dyadic')
 dyadic:
 	$(CXX) -O3 $(CXXFLAGS) $(DYADIC_SRC) $(LDFLAGS) $(LDLIBS) -o dyadic_bound
@@ -75,5 +92,5 @@ dfs_test: $(DFS_TEST_SRC) utils/parameters.hpp
 	$(CXX) $(DEBUGFLAGS) $(CXXFLAGS) $(DFS_TEST_SRC) $(LDFLAGS) $(LDLIBS) -o dfs_test
 
 clean:
-	rm -f lpr lpr_g dyadic_bound interval_check dfs_test
+	rm -f lpr lpr_g lpr_mpi lpr_mpi_g dyadic_bound interval_check dfs_test
 	rm -rf lpr.dSYM lpr_g.dSYM dfs_test.dSYM

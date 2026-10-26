@@ -122,7 +122,7 @@ With hundreds of nodes, polling every 10–30 s with one directory listing each 
 
 ## Priorities (25/10/26, set by the user)
 1. **Highest: multi-node runs with MPI** (`mpi_plan.md`); the shared task pool (§2–4) is the fallback.
-2. **High (likely): a handwritten Montgomery kernel** for `mont3::mul`/`sqr` (x86 `mulx`/`adc`, ARM `mul`/`umulh`/`adcs`; intrinsics first, inline assembly where needed).
+2. **Revised 25/10/26, lower on Haswell: a handwritten Montgomery kernel.** Measured on r730-3 (job 696192). A hand-written `mulx` CIOS kernel (74 instructions) is correct on hardware, but has 14% *worse* latency than clang's code (17.1 against 15.1 ns per product). One product already takes about 48 cycles with clang, close to Haswell's latency floor. Haswell is also limited by instruction throughput: `adc` and `mulx` are 2 micro-operations each, about 150 per product. The dedicated squaring (job 696241) gives −2.5% (Fermat) and −3.3% (powm) under clang, so adopt it for x86 clang builds; it is worse under GCC. Next: re-measure kernels and interleaving on Broadwell or newer (1-micro-operation `adc`, ADX). Original note: **a handwritten Montgomery kernel** for `mont3::mul`/`sqr` (x86 `mulx`/`adc`, ARM `mul`/`umulh`/`adcs`; intrinsics first, inline assembly where needed).
    - **Why:** exponentiation is about 80% of run time.
    - **Headroom:** on Rangpur's Haswell nodes, clang 21 spends about 70 cycles per 3-limb product and GCC 8.5 about 95, against a realistic 35–45.
    - **Expected gain:** perhaps 20–30% on whole runs.

@@ -10,6 +10,7 @@
 #include "config.hpp"
 #include "trial_division.hpp"
 #include "logging.hpp"
+#include "mpi_comm.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -338,6 +339,20 @@ int main(int argc, char* argv[])
 {
     using lpr::cli::RunMode;
 
+#ifdef LPR_MPI
+    // Before anything else (MPI may change argv). Only rank 0 prints to stdout;
+    // warnings and logs from every rank go to stderr, tagged with the rank.
+    lpr::mpi::Session mpi_session(argc, argv);
+    const int mpi_rank = mpi_session.rank();
+    const int mpi_size = mpi_session.size();
+    if (mpi_rank != 0) {
+        std::cout.setstate(std::ios::failbit);
+    }
+#else
+    constexpr int mpi_rank = 0;
+    constexpr int mpi_size = 1;
+#endif
+
     // First of all, so a signal during startup is not fatal: it is recorded and
     // handled by the monitor once the search starts (a checkpoint, if enabled)
     std::signal(SIGTERM, on_signal);
@@ -352,6 +367,14 @@ int main(int argc, char* argv[])
     if (options.help) {
         std::cout << lpr::cli::usage(argv[0]);
         return 0;
+    }
+    if (mpi_size > 1 && !options.mpi) {
+        std::cerr << "Error: running as " << mpi_size << " MPI ranks: pass --mpi (otherwise every rank would "
+                  << "run the whole search)\n";
+        return 2;
+    }
+    if (options.mpi) {
+        lpr::log::set_tag("rank " + std::to_string(mpi_rank) + ": ");
     }
     if (!options.log_file.empty() && !lpr::log::open_file(options.log_file)) {
         std::cerr << "Error: cannot open log file '" << options.log_file << "'\n";
@@ -617,6 +640,20 @@ int main(int argc, char* argv[])
     } else {
         std::cout << "every " << options.log_interval << " s to " << log_target << '\n';
     }
+#ifdef LPR_MPI
+    std::vector<std::string> mpi_hosts;
+    if (options.mpi) {
+        mpi_hosts = lpr::mpi::gather_hostnames(mpi_rank, mpi_size);
+        std::cout << "mpi: " << mpi_size << " ranks x " << options.threads << " threads"
+                  << (options.mpi_static ? ", static split (M1)" : "")
+                  << ", request when " << options.mpi_request_idle << " workers idle, pool reserve "
+                  << options.mpi_pool_reserve
+                  << (options.mpi_stress ? ", STRESS" : "") << '\n'
+                  << "mpi hosts:";
+        for (std::size_t r = 0; r < mpi_hosts.size(); ++r) std::cout << ' ' << r << '=' << mpi_hosts[r]; // Rank 0 only
+        std::cout << '\n';
+    }
+#endif
     std::cout << "host: " << hostname() << '\n'
               << "started: " << local_time_string() << '\n'
               << "build: commit " << LPR_GIT_COMMIT
@@ -655,11 +692,31 @@ int main(int argc, char* argv[])
     }
 
     lpr::parallel::JobQueue<> queue; // Only used in queue mode
-    const bool work_stealing = mode == RunMode::Parallel || (mode == RunMode::DryRun && options.threads > 1);
+    const bool work_stealing = mode == RunMode::Parallel || (mode == RunMode::DryRun && options.threads > 1)
+                               || options.mpi;
     // Checkpointing runs single-threaded modes through the scheduler with one worker
     const bool use_scheduler = work_stealing || options.checkpointing();
+    // Under MPI the tasks start in rank 0's pool, not in the scheduler
     lpr::stealing::Scheduler scheduler(primes, bound, work_stealing ? options.threads : 1, options.steal_stress,
-                                       steal_max_prefix, tasks);
+                                       steal_max_prefix, options.mpi ? std::vector<lpr::producer::detail::Task>{} : tasks,
+                                       options.mpi);
+#ifdef LPR_MPI
+    std::optional<lpr::mpi::Node> mpi_node;
+    if (options.mpi) {
+        lpr::mpi::NodeOptions node_options;
+        node_options.request_idle = options.mpi_request_idle;
+        node_options.pool_reserve = options.mpi_pool_reserve;
+        node_options.stress = options.mpi_stress;
+        node_options.static_split = options.mpi_static;
+        std::vector<lpr::producer::detail::Task> initial;
+        if (mpi_rank == 0) {
+            initial = options.mpi_static
+                ? lpr::mpi::static_split(primes, bound, 4 * static_cast<std::size_t>(mpi_size))
+                : tasks;
+        }
+        mpi_node.emplace(scheduler, primes, bound, mpi_rank, mpi_size, node_options, std::move(initial));
+    }
+#endif
 
     // Writes a checkpoint of the current state (monitor thread). With stay_paused
     // the workers are left stopped (the process is about to exit).
@@ -703,12 +760,31 @@ int main(int argc, char* argv[])
     {
         Monitor monitor(options.log_interval, start_time, [&]() -> std::string {
             if (mode == RunMode::ParallelQueue) return "queue=" + std::to_string(queue.size());
+#ifdef LPR_MPI
+            if (mpi_node && mpi_rank == 0) {
+                return "queue=- active_workers=" + std::to_string(scheduler.active_workers())
+                       + " mpi_pool=" + std::to_string(mpi_node->pool_size())
+                       + " all_ranks_processed=" + std::to_string(mpi_node->global_processed())
+                       + " all_ranks_candidates=" + std::to_string(mpi_node->global_candidates());
+            }
+#endif
             if (work_stealing) return "queue=- active_workers=" + std::to_string(scheduler.active_workers());
             return "queue=-";
         }, options.checkpoint_file.empty() ? Monitor::CheckpointFn{} : Monitor::CheckpointFn(take_checkpoint),
            options.checkpoint_interval, options.checkpoint_file, options.expected_candidates);
 
-        if (use_scheduler && mode == RunMode::DryRun) {
+        if (options.mpi) {
+#ifdef LPR_MPI
+            // The workers on their own threads; this thread (which initialised MPI)
+            // is the rank's communication thread
+            std::thread workers([&]() {
+                if (mode == RunMode::DryRun) scheduler.run<false>();
+                else scheduler.run<true>();
+            });
+            mpi_node->run();
+            workers.join();
+#endif
+        } else if (use_scheduler && mode == RunMode::DryRun) {
             scheduler.run<false>();
         } else if (use_scheduler) {
             scheduler.run<true>();
@@ -751,7 +827,22 @@ int main(int argc, char* argv[])
     // Worker threads publish their counters when they exit (see stats.hpp);
     // this thread's own counters (single and dry-run modes) are published here
     lpr::stats::publish_thread_local_stats();
+#ifdef LPR_MPI
+    // Every rank's statistics, merged on rank 0
+    const lpr::stats::Counters local_stats = lpr::stats::get_master_stats().snapshot();
+    const lpr::stats::Counters master_stats = options.mpi
+        ? lpr::mpi::reduce_counters(local_stats, mpi_rank, mpi_size) : local_stats;
+    std::vector<lpr::mpi::NodeCounters> mpi_rows;
+    if (options.mpi) {
+        lpr::mpi::NodeCounters& row = mpi_node->counters();
+        row.worker_idle_ns = local_stats.worker_idle_ns;
+        row.supports_processed = local_stats.total_support_count;
+        row.supports_emitted = local_stats.supports_emitted;
+        mpi_rows = lpr::mpi::gather_node_counters(row, mpi_rank, mpi_size);
+    }
+#else
     const lpr::stats::Counters master_stats = lpr::stats::get_master_stats().snapshot();
+#endif
     lpr::log::info("finished after " + std::to_string(elapsed.count()) + " s");
     lpr::log::info(progress_line(master_stats, 0.0, "queue=-"));
     const double total_elapsed = earlier_elapsed + elapsed.count();
@@ -778,8 +869,18 @@ int main(int argc, char* argv[])
         }
     };
 
+    auto print_mpi = [&]() {
+#ifdef LPR_MPI
+        if (options.mpi) {
+            std::cout << '\n';
+            lpr::mpi::print_summary(mpi_rows, mpi_hosts);
+        }
+#endif
+    };
+
     if (mode == RunMode::DryRun) {
         master_stats.print_producer();
+        print_mpi();
         print_elapsed();
         std::cout << "DRY RUN: no primes were tested or verified\n";
         return 0;
@@ -787,12 +888,18 @@ int main(int argc, char* argv[])
     master_stats.print();
     std::cout << '\n';
     master_stats.print_producer();
+    print_mpi();
     print_elapsed();
 
+    int exit_code = 0;
     if (master_stats.unresolved_count > 0 ||
         master_stats.certified_inequality_fail_count > 0) {
-        return 1;
+        exit_code = 1;
     }
-
-    return 0;
+#ifdef LPR_MPI
+    if (options.mpi) { // Rank 0 decides (it has every rank's counts)
+        MPI_Bcast(&exit_code, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    }
+#endif
+    return exit_code;
 }

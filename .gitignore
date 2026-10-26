@@ -76,6 +76,8 @@ Testing/
 # Executables
 lpr
 lpr_g
+lpr_mpi
+lpr_mpi_g
 dfs_test
 
 # Python bytecode caches

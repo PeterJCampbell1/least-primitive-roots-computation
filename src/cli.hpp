@@ -16,6 +16,7 @@
 
 #include "config.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -44,6 +45,13 @@ struct Options {
     std::string resume_file; // --resume PATH: continue the run saved there (empty = new search)
     bool resume_any_commit = false; // --resume-any-commit: accept a checkpoint from another commit
     std::uint64_t expected_candidates = 0; // --expected-candidates N: total for the progress ETA (0 = unknown)
+    // MPI (lpr_mpi only; docs/mpi.md)
+    bool mpi = false; // --mpi: one search across all MPI ranks
+    bool mpi_static = false; // --mpi-static: hand out a fixed split of the root, no rebalancing (testing)
+    unsigned mpi_request_idle = 2; // --mpi-request-idle N: ask rank 0 for work when N workers are idle (capped at --threads)
+    unsigned mpi_pool_reserve = 4; // --mpi-pool-reserve N: tasks rank 0 keeps ready beyond the open requests
+    bool mpi_tuning_given = false; // Any --mpi-* tuning option was given
+    bool mpi_stress = false; // --mpi-stress: random delays, late starts, constant donations (testing)
     bool help = false;
 
     bool checkpointing() const { return !checkpoint_file.empty() || !resume_file.empty(); }
@@ -119,6 +127,15 @@ Checkpoints (with --single, --parallel or --dry-run; see docs/checkpointing.md):
                          combined with --checkpoint PATH (the same file)
   --resume-any-commit    With --resume: accept a checkpoint written by another commit
 
+Several nodes (lpr_mpi only, one MPI rank per node; see docs/mpi.md):
+  --mpi                  With --parallel or --dry-run, under srun or mpirun: one
+                         search across all ranks, --threads workers per rank. Not
+                         yet combinable with --checkpoint or --resume
+  --mpi-request-idle N   A rank asks rank 0 for work once N of its workers are
+                         idle (default 2, at most --threads)
+  --mpi-pool-reserve N   Tasks rank 0 keeps ready beyond the open requests
+                         (default 4)
+
 Testing options:
   --split-test N         With --single or a 1-thread --dry-run: split the search
                          region every N DFS steps into a work list and run the
@@ -126,6 +143,10 @@ Testing options:
   --split-test-order O   lifo (default) or fifo order for the --split-test work list
   --steal-stress         With --parallel or a threaded --dry-run: idle threads ask
                          for work continuously, without backing off
+  --mpi-static           With --mpi: rank 0 splits the root once and hands the
+                         pieces out, with no rebalancing (tests the task plumbing)
+  --mpi-stress           With --mpi: random delays in the communication threads,
+                         late starts and constant donations
   --steal-max-prefix K   With --parallel or a threaded --dry-run: split a region only
                          while its fixed prefix has fewer than K primes (default
                          omega, i.e. any depth; e.g. omega - 3 never splits the
@@ -137,6 +158,8 @@ Exit codes:
   2  usage error
   3  interrupted (SIGTERM/SIGINT): partial run, nothing is verified, no checkpoint
   4  interrupted (SIGTERM/SIGINT) and a checkpoint was written: continue with --resume
+  5  (lpr_mpi) a rank aborted the MPI job: a fatal protocol error, or the watchdog
+     found a rank silent for 120 s
 )";
 }
 
@@ -251,6 +274,18 @@ inline ParseResult parse(int argc, char* argv[]) {
             if (!v || (*v != "lifo" && *v != "fifo")) return {std::nullopt, "--split-test-order needs lifo or fifo"};
             options.split_test_fifo = (*v == "fifo");
             split_order_given = true;
+        } else if (arg == "--mpi" && flag_only()) {
+            options.mpi = true;
+        } else if (arg == "--mpi-static" && flag_only()) {
+            options.mpi_static = true;
+        } else if (arg == "--mpi-stress" && flag_only()) {
+            options.mpi_stress = true;
+        } else if (arg == "--mpi-request-idle" || arg == "--mpi-pool-reserve") {
+            const auto v = value();
+            const auto n = v ? parse_unsigned(*v) : std::nullopt;
+            if (!n) return {std::nullopt, arg + " needs a non-negative integer"};
+            (arg == "--mpi-request-idle" ? options.mpi_request_idle : options.mpi_pool_reserve) = *n;
+            options.mpi_tuning_given = true;
         } else if (arg == "--steal-stress" && flag_only()) {
             options.steal_stress = true;
         } else if (arg == "--steal-max-prefix") {
@@ -350,6 +385,33 @@ inline ParseResult parse(int argc, char* argv[]) {
     }
     if (options.checkpointing() && options.split_test_interval > 0) {
         return {std::nullopt, "--checkpoint and --resume cannot be combined with --split-test"};
+    }
+
+    // MPI
+    const bool mpi_tuning = options.mpi_static || options.mpi_stress || options.mpi_tuning_given;
+    if (mpi_tuning && !options.mpi) {
+        return {std::nullopt, "--mpi-static, --mpi-stress, --mpi-request-idle and --mpi-pool-reserve need --mpi"};
+    }
+    if (options.mpi) {
+#ifndef LPR_MPI
+        return {std::nullopt, "--mpi needs lpr_mpi (this binary was built without MPI)"};
+#endif
+        if (options.mode != RunMode::Parallel && options.mode != RunMode::DryRun) {
+            return {std::nullopt, "--mpi works with --parallel or --dry-run"};
+        }
+        if (options.checkpointing()) {
+            return {std::nullopt, "--checkpoint and --resume are not supported with --mpi yet"};
+        }
+        if (options.split_test_interval > 0) {
+            return {std::nullopt, "--split-test cannot be combined with --mpi"};
+        }
+        if (options.mpi_static && options.mpi_stress) {
+            return {std::nullopt, "--mpi-static and --mpi-stress cannot be combined"};
+        }
+        if (options.mpi_request_idle == 0) {
+            return {std::nullopt, "--mpi-request-idle must be at least 1"};
+        }
+        options.mpi_request_idle = std::min(options.mpi_request_idle, options.threads);
     }
 
     return {options, ""};
