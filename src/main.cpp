@@ -376,8 +376,15 @@ int main(int argc, char* argv[])
     if (options.mpi) {
         lpr::log::set_tag("rank " + std::to_string(mpi_rank) + ": ");
     }
-    if (!options.log_file.empty() && !lpr::log::open_file(options.log_file)) {
-        std::cerr << "Error: cannot open log file '" << options.log_file << "'\n";
+    // Under MPI each rank writes its own log (ranks on different nodes appending to one
+    // file on a shared filesystem can interleave or lose lines): rank 0 the given path,
+    // rank r the path plus ".rank<r>"
+    std::string log_path = options.log_file;
+    if (options.mpi && mpi_rank != 0 && !log_path.empty()) {
+        log_path += ".rank" + std::to_string(mpi_rank);
+    }
+    if (!log_path.empty() && !lpr::log::open_file(log_path)) {
+        std::cerr << "Error: cannot open log file '" << log_path << "'\n";
         return 2;
     }
 
@@ -596,7 +603,10 @@ int main(int argc, char* argv[])
     const double earlier_elapsed = resuming ? resumed.elapsed_seconds : 0.0;
 
     // Print run and configuration settings
-    const std::string log_target = options.log_file.empty() ? "stderr" : options.log_file;
+    std::string log_target = options.log_file.empty() ? "stderr" : options.log_file;
+    if (options.mpi && mpi_size > 1) {
+        log_target += options.log_file.empty() ? " (every rank)" : " (rank 0; rank r to " + options.log_file + ".rank<r>)";
+    }
     std::cout << "Run:\n"
               << "mode: " << lpr::cli::mode_name(mode) << '\n';
     const bool threaded = mode == RunMode::Parallel || mode == RunMode::ParallelQueue

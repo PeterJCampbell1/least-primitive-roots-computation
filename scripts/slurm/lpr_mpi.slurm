@@ -71,7 +71,10 @@ case " $lpr_args " in
     *" --parallel "*|*" --dry-run "*) lpr_mode="" ;;
     *) lpr_mode="--parallel" ;;
 esac
-cmd=(./lpr_mpi $lpr_mode --mpi --threads "$threads" --log-interval "${LPR_LOG_INTERVAL:-60}" $lpr_args)
+# Progress log: rank 0 writes lpr_mpi_<jobid>.log (its lines cover every rank: mpi_pool,
+# all_ranks_processed, all_ranks_candidates); rank r writes lpr_mpi_<jobid>.log.rank<r>
+cmd=(./lpr_mpi $lpr_mode --mpi --threads "$threads" --log-interval "${LPR_LOG_INTERVAL:-60}"
+     --log-file "lpr_mpi_${SLURM_JOB_ID}.log" $lpr_args)
 echo "Launch: $launch"
 echo "Command: ${cmd[*]}"
 $launch "${cmd[@]}"

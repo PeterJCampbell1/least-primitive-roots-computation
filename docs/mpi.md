@@ -12,7 +12,11 @@ LPR_JOB=$HOME/lpr/scripts/slurm/lpr_mpi.slurm scripts/submit.sh -n mpi_s29 \
 ```
 - `--threads N` is per rank (per node). Run **one rank per node**; with `mpirun`, add `--map-by ppr:1:node --bind-to none` (Open MPI otherwise binds each rank, and so all its threads, to one core).
 - Only rank 0 prints the header and summary. The summary is the merge of every rank's statistics, so it must equal `--single`'s exactly. An "MPI summary" table follows, with one row per rank.
-- Logs and warnings come from every rank on stderr, tagged `rank r:`.
+- **Logs:** every rank logs, each line tagged `rank r:`.
+  - Without `--log-file`, the lines go to stderr.
+  - With `--log-file PATH`, rank 0 writes PATH and rank r writes `PATH.rank<r>`, so ranks never share a file on the shared filesystem. `lpr_mpi.slurm` passes `--log-file lpr_mpi_<jobid>.log`.
+  - Rank 0's progress lines cover every rank: `mpi_pool`, `all_ranks_processed`, `all_ranks_candidates`.
+  - Warnings always go to stderr as well.
 - **Options:**
   - `--mpi-request-idle N` (default 2, capped at `--threads`): the L1 trigger.
   - `--mpi-pool-reserve N` (default 4): the L2 reserve.
