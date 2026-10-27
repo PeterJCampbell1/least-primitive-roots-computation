@@ -51,7 +51,7 @@ Status: **Parts 1 and 2 implemented and verified locally, 27/10/26** (`mpi.md` Â
 3. **Limits:** check each cluster's (`sacctmgr show qos`, `scontrol show partition`, `sbatch --version`, `sinfo -o "%20N %4c %40f"`) to size OMEGA=31's job segments.
 4. **Requeue under MPI:** after Parts 1 and 2, an MPI OMEGA=32 run with a short `--time`, so that it checkpoints, requeues and resumes at least once.
 
-## Pinned (deferred)
+## Pinned (deferred; now steps 3â€“4 of `production_plan.md`, kernels a future idea there)
 - **Dynamic allocations:**
   - `--nodes=2-4`;
   - `--prefer=<feature>` for the larger nodes, `--mincpus`;
