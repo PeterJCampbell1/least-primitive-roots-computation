@@ -28,7 +28,16 @@
 # it delivers Slurm's signals to every rank. Set LPR_LAUNCH if the hello test shows that
 # another launcher works.
 #
-# No checkpoints under MPI yet: give --time enough to finish; the job does not requeue.
+# Checkpoints (docs/checkpointing.md, docs/mpi.md): rank 0 saves the whole search to
+# lpr.ckpt in the run directory every LPR_CHECKPOINT_INTERVAL seconds (default 600) and
+# when the job's time limit approaches. Slurm signals this script (--signal=B:USR1@300),
+# which forwards SIGUSR1 to the launcher; srun and mpirun both pass it to every rank
+# without killing anything, the ranks checkpoint together and exit with code 4. If
+# lpr.ckpt exists when the job starts, the run continues from it, on any number of nodes.
+# After an exit with code 4 the job requeues itself (LPR_REQUEUE=1, the default) until the
+# search is complete, at most LPR_MAX_RUNS runs (default 20); a requeued job rebuilds on
+# its new nodes. A node failure ends the whole job (plain MPI cannot lose a rank); with
+# --requeue Slurm may requeue it, and it resumes from the last periodic checkpoint.
 # Exit codes as lpr, plus 5: an MPI fatal error (a rank aborted the job, e.g. the
 # watchdog found a rank silent for 120 s).
 #
@@ -42,6 +51,9 @@
 #   LPR_MPI_CFLAGS, LPR_MPI_LIBS: MPI compile and link flags instead of the wrapper's
 #   LPR_LAUNCH      launch command (e.g. "srun --mpi=pmi2"), instead of the choice above
 #   LPR_LOG_INTERVAL seconds between progress lines (default 60)
+#   LPR_CHECKPOINT_INTERVAL seconds between checkpoints (default 600)
+#   LPR_REQUEUE     0: do not requeue after a checkpoint (continue with resubmit.sh)
+#   LPR_MAX_RUNS    most runs of one job when requeueing (default 20)
 
 #SBATCH --job-name=lpr_mpi
 #SBATCH --account=<account>
@@ -52,6 +64,9 @@
 #SBATCH --mem=4G
 #SBATCH --time=<HH:MM:SS>
 #SBATCH --exclusive
+#SBATCH --signal=B:USR1@300
+#SBATCH --requeue
+#SBATCH --open-mode=append
 #SBATCH --output=lpr_mpi_%j.out
 #SBATCH --error=lpr_mpi_%j.err
 
@@ -70,7 +85,7 @@ fi
 
 nodes=${SLURM_NNODES:-1}
 threads=${SLURM_CPUS_PER_TASK:-1}
-echo "Job ${SLURM_JOB_ID}: ${nodes} nodes (${SLURM_JOB_NODELIST}), ${threads} threads per rank, $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Job ${SLURM_JOB_ID}: ${nodes} nodes (${SLURM_JOB_NODELIST}), ${threads} threads per rank (run $(( ${SLURM_RESTART_COUNT:-0} + 1 )) of this job, $(date '+%Y-%m-%d %H:%M:%S'))"
 
 # An MPI library must be available: its compiler wrapper (for the flags) and launcher,
 # unless both are given explicitly
@@ -82,7 +97,17 @@ if { [ $have_flags = 0 ] && ! command -v mpicxx > /dev/null 2>&1; } \
     echo "Load one: set MPI_MODULE in this script, or submit with MPI_MODULE=<module> (see module avail mpi)."
     exit 2
 fi
-echo "MPI: ${MPI_MODULE:-no module}; $(mpirun --version 2>&1 | head -1)"
+# The MPI library's version: Open MPI and Intel MPI print it on the first line of
+# `mpirun --version`; MPICH's Hydra launcher prints "HYDRA build details:" there and the
+# version on a later "Version:" line
+mpi_version() {
+    local text; text=$(mpirun --version 2>&1)
+    case "$text" in
+        *"HYDRA build details"*) echo "MPICH (Hydra) $(echo "$text" | sed -n 's/^ *Version: *//p' | head -1)" ;;
+        *) echo "$text" | head -1 ;;
+    esac
+}
+echo "MPI: ${MPI_MODULE:-no module}; $(mpi_version)"
 
 # MPI compile and link flags (unless given)
 mpi_cflags=${LPR_MPI_CFLAGS:-}
@@ -106,6 +131,7 @@ if [ -z "$launch" ]; then
     plugins=$(srun --mpi=list 2>&1 || true)
     srun_step="-N ${nodes} -n ${nodes} --ntasks-per-node=1 -c ${threads}"
     if mpirun --version 2>&1 | grep -q "Open MPI"; then
+        export PMIX_MCA_psec=native # PMIx's optional munge security plugin is often missing: no warnings
         if echo "$plugins" | grep -qw pmix; then launch="srun --mpi=pmix $srun_step"
         else launch="mpirun -np ${nodes} --map-by ppr:1:node --bind-to none"; fi
     else # MPICH, Intel MPI and their derivatives speak PMI-2 under Slurm
@@ -142,13 +168,30 @@ case " $lpr_args " in
     *" --parallel "*|*" --dry-run "*) lpr_mode="" ;;
     *) lpr_mode="--parallel" ;;
 esac
+# Checkpoints: a requeued or resubmitted job finds lpr.ckpt and continues from it
+checkpoint_args="--checkpoint lpr.ckpt --checkpoint-interval ${LPR_CHECKPOINT_INTERVAL:-600}"
+if [ -f lpr.ckpt ]; then
+    checkpoint_args="$checkpoint_args --resume lpr.ckpt"
+    echo "Continuing from lpr.ckpt: $(grep -E '^(segments|elapsed_seconds|complete) ' lpr.ckpt | tr '\n' ' ')"
+fi
 # Progress log: rank 0 writes lpr_mpi_<jobid>.log (its all_ranks_* fields cover every
 # rank); rank r writes lpr_mpi_<jobid>.log.rank<r>
-args="$lpr_mode --mpi --threads $threads --log-interval ${LPR_LOG_INTERVAL:-60} --log-file lpr_mpi_${SLURM_JOB_ID}.log $lpr_args"
+args="$lpr_mode --mpi --threads $threads --log-interval ${LPR_LOG_INTERVAL:-60} --log-file lpr_mpi_${SLURM_JOB_ID}.log $checkpoint_args $lpr_args"
 echo "Launch: $launch"
 echo "Running: $binary $args"
-$launch $binary $args
-status=$?
+# The launcher runs in the background so that this script can forward Slurm's warning
+# (SIGUSR1, --signal=B:USR1@300) to it; it passes the signal on to every rank
+$launch $binary $args &
+launcher=$!
+trap 'echo "Time limit approaching: asking lpr_mpi to checkpoint ($(date "+%H:%M:%S"))"; kill -USR1 $launcher 2>/dev/null' USR1
+status=0
+while true; do
+    wait $launcher
+    status=$?
+    # wait returns >128 when interrupted by the trapped signal; wait again for the real status
+    kill -0 $launcher 2>/dev/null || break
+done
+trap - USR1
 
 case ${status} in
     0) case " ${lpr_args} " in
@@ -157,7 +200,21 @@ case ${status} in
        esac ;;
     1) echo "lpr_mpi finished: Grosswald failure or unresolved candidate (see lpr_mpi_${SLURM_JOB_ID}.err)" ;;
     2) echo "lpr_mpi did not start: usage error (see the Running: line above and lpr_mpi_${SLURM_JOB_ID}.err)" ;;
-    3) echo "lpr_mpi was interrupted: partial run, nothing verified (no checkpoints under MPI yet)" ;;
+    3) echo "lpr_mpi was interrupted: partial run, nothing verified, no checkpoint written" ;;
+    4|143) # 143: SIGTERM before lpr_mpi had started (lpr.ckpt, if any, is untouched)
+       if [ ${status} = 143 ] && [ ! -f lpr.ckpt ]; then
+           echo "lpr_mpi was killed by SIGTERM before it started; no checkpoint exists"
+           exit ${status}
+       fi
+       runs=$(grep '^segments ' lpr.ckpt 2>/dev/null | awk '{print $2}')
+       echo "lpr_mpi was interrupted and saved its progress to lpr.ckpt (${runs:-?} runs so far)"
+       if [ "${LPR_REQUEUE:-1}" = 1 ] && [ "${runs:-0}" -lt "${LPR_MAX_RUNS:-20}" ]; then
+           echo "Requeueing job ${SLURM_JOB_ID} to continue"
+           scontrol requeue "${SLURM_JOB_ID}" && exit 0
+           echo "scontrol requeue failed: continue with resubmit.sh in $(pwd)"
+       else
+           echo "Not requeueing (LPR_REQUEUE=${LPR_REQUEUE:-1}, limit LPR_MAX_RUNS=${LPR_MAX_RUNS:-20}): continue with resubmit.sh in $(pwd)"
+       fi ;;
     5) echo "lpr_mpi aborted: an MPI fatal error (see lpr_mpi_${SLURM_JOB_ID}.err)" ;;
     *) echo "lpr_mpi exited with status ${status}" ;;
 esac

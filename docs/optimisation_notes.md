@@ -1080,3 +1080,17 @@ Design, usage and the full verification log are in `mpi.md`.
   - Idle time 0.05% of worker time.
 - **OMEGA=32 S=29, clang 21 on 1 node (job 697335):** 3,452 s, against 4,444 s with GCC (job 690984), with an identical summary.
 - **Builds:** GMP's headers are now included with `-isystem`, which silences clang 21's `-Wdeprecated-literal-operator` warnings from `gmpxx.h`.
+
+## Coordinated checkpoints under MPI (27/10/26)
+Design and verification: `mpi.md` §4 and `mpi_checkpoint_plan.md`.
+- **Protocol:**
+  1. Rank 0 sends PAUSE, on a timer or when any rank reports SIGTERM, SIGINT or SIGUSR1.
+  2. Each rank pauses its workers and returns its remaining tasks and `Counters`.
+  3. Rank 0 checks that nothing is in transit and that no tasks overlap, then writes one checkpoint in the single-node format.
+  4. Then RESUME, or EXIT with code 4 after a signal.
+- **Resuming:** a checkpoint resumes on any number of ranks, or without MPI.
+- **`lpr_mpi.slurm`:** forwards Slurm's warning to the ranks as SIGUSR1 (`--signal=B:USR1@300`), and requeues on exit 4.
+- **Correct:**
+  - interrupt-and-resume chains that change the rank count between segments (e.g. S=29 full over 7 segments on 2, 4, 3, 1, 2, 4, 4 ranks), cross-mode resumes, and the debug build: all exact;
+  - the 104-run MPI regression matrix: exact.
+- **Cost:** a pause takes about 15 ms with 2–4 ranks locally. Checkpoints every 10 s cost about 1%; at the default 600 s interval, nothing measurable. With checkpoints off the new build matches the previous one.

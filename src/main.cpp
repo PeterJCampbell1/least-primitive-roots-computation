@@ -200,12 +200,14 @@ public:
         double checkpoint_interval = 0,
         std::string checkpoint_path = "",
         std::uint64_t expected_candidates = 0,
-        std::function<lpr::stats::Counters()> eta_source = {}
+        std::function<lpr::stats::Counters()> eta_source = {},
+        bool handle_signals = true // False under MPI: the ranks' communication threads handle them
     ) : log_interval_(log_interval), start_(start), mode_fields_(std::move(mode_fields)),
         checkpoint_(std::move(checkpoint)), checkpoint_interval_(checkpoint_interval),
         checkpoint_path_(std::move(checkpoint_path)), expected_candidates_(expected_candidates),
         eta_source_(std::move(eta_source)),
-        start_candidates_(lpr::stats::get_master_stats().snapshot().candidate_count) {
+        start_candidates_(lpr::stats::get_master_stats().snapshot().candidate_count),
+        ignore_signals_(!handle_signals) {
         thread_ = std::thread([this]() { run(); });
     }
 
@@ -237,7 +239,7 @@ private:
     // MPI, rank 0 passes the totals over every rank)
     std::function<lpr::stats::Counters()> eta_source_;
     std::uint64_t start_candidates_; // Candidates done in earlier runs (resumed), excluded from the rate
-    bool ignore_signals_ = false; // A signal arrived while the search was finishing
+    bool ignore_signals_ = false; // Not handled here (MPI), or one arrived while the search was finishing
     std::mutex mutex_;
     std::condition_variable cv_;
     bool stop_ = false;
@@ -363,6 +365,7 @@ int main(int argc, char* argv[])
     // handled by the monitor once the search starts (a checkpoint, if enabled)
     std::signal(SIGTERM, on_signal);
     std::signal(SIGINT, on_signal);
+    std::signal(SIGUSR1, on_signal); // Like SIGTERM; Open MPI's mpirun forwards it without killing the ranks
 
     const lpr::cli::ParseResult parsed = lpr::cli::parse(argc, argv);
     if (!parsed.options) {
@@ -594,16 +597,30 @@ int main(int argc, char* argv[])
                       << "run with --resume " << options.checkpoint_file << ", or delete the file to start a new search\n";
             return 2;
         }
-        // Fail now rather than hours later: the checkpoint's temporary file must be creatable
-        const std::string probe = options.checkpoint_file + ".tmp";
-        const int fd = ::open(probe.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) {
-            std::cerr << "Error: cannot write checkpoints: cannot create '" << probe << "': "
-                      << std::strerror(errno) << '\n';
+        // Fail now rather than hours later: the checkpoint's temporary file must be
+        // creatable (under MPI only rank 0 writes checkpoints; every rank must agree
+        // on the outcome, so rank 0's result is broadcast)
+        int probe_ok = 1;
+        if (mpi_rank == 0) {
+            const std::string probe = options.checkpoint_file + ".tmp";
+            const int fd = ::open(probe.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd < 0) {
+                std::cerr << "Error: cannot write checkpoints: cannot create '" << probe << "': "
+                          << std::strerror(errno) << '\n';
+                probe_ok = 0;
+            } else {
+                ::close(fd);
+                ::unlink(probe.c_str());
+            }
+        }
+#ifdef LPR_MPI
+        if (options.mpi) {
+            MPI_Bcast(&probe_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        }
+#endif
+        if (!probe_ok) {
             return 2;
         }
-        ::close(fd);
-        ::unlink(probe.c_str());
     }
     const std::uint64_t segment = resuming ? resumed.segments + 1 : 1;
     const double earlier_elapsed = resuming ? resumed.elapsed_seconds : 0.0;
@@ -703,7 +720,7 @@ int main(int argc, char* argv[])
                    + " s=" + std::to_string(search.s)
                    + " commit=" + LPR_GIT_COMMIT
                    + (resuming ? " resumed_from=" + options.resume_file + " run=" + std::to_string(segment) : ""));
-    if (resuming) {
+    if (resuming && mpi_rank == 0) { // (Under MPI only rank 0: the final reduction sums every rank)
         lpr::stats::get_master_stats().merge(resumed.stats); // The earlier runs' work
     }
 
@@ -724,13 +741,33 @@ int main(int argc, char* argv[])
         node_options.pool_reserve = options.mpi_pool_reserve;
         node_options.stress = options.mpi_stress;
         node_options.static_split = options.mpi_static;
+        node_options.checkpoints = !options.checkpoint_file.empty();
+        node_options.checkpoint_interval = options.checkpoint_interval;
         std::vector<lpr::producer::detail::Task> initial;
         if (mpi_rank == 0) {
-            initial = options.mpi_static
+            initial = options.mpi_static && !resuming
                 ? lpr::mpi::static_split(primes, bound, 4 * static_cast<std::size_t>(mpi_size))
-                : tasks;
+                : tasks; // The root task, or the resumed checkpoint's tasks
         }
-        mpi_node.emplace(scheduler, primes, bound, mpi_rank, mpi_size, node_options, std::move(initial));
+        // Rank 0 writes the checkpoints the ranks coordinate (same format as single-node)
+        lpr::mpi::CheckpointWriter writer = [&](const std::vector<lpr::producer::detail::Task>& ck_tasks,
+                                                const lpr::stats::Counters& ck_stats, std::string& error) {
+            lpr::checkpoint::Checkpoint ck;
+            ck.fingerprint = fingerprint;
+            ck.segments = segment;
+            ck.elapsed_seconds = earlier_elapsed
+                + std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+            ck.stats = ck_stats;
+            ck.tasks = ck_tasks;
+            if (!lpr::checkpoint::write_atomic(options.checkpoint_file, ck, error)) {
+                return false;
+            }
+            lpr::log::info("checkpoint: written to " + options.checkpoint_file + " ("
+                           + std::to_string(ck_stats.total_support_count) + " supports processed)");
+            return true;
+        };
+        mpi_node.emplace(scheduler, primes, bound, mpi_rank, mpi_size, node_options, std::move(initial), &g_signal,
+                         std::move(writer));
     }
 #endif
 
@@ -794,7 +831,7 @@ int main(int argc, char* argv[])
 #endif
             if (work_stealing) return "queue=- active_workers=" + std::to_string(scheduler.active_workers());
             return "queue=-";
-        }, options.checkpoint_file.empty() ? Monitor::CheckpointFn{} : Monitor::CheckpointFn(take_checkpoint),
+        }, options.checkpoint_file.empty() || options.mpi ? Monitor::CheckpointFn{} : Monitor::CheckpointFn(take_checkpoint),
            options.checkpoint_interval, options.checkpoint_file, options.expected_candidates,
 #ifdef LPR_MPI
            // Under MPI, rank 0's candidate rate and ETA count every rank
@@ -804,7 +841,7 @@ int main(int argc, char* argv[])
 #else
            std::function<lpr::stats::Counters()>{}
 #endif
-           );
+           , !options.mpi); // Under MPI the communication threads handle signals and checkpoints
 
         if (options.mpi) {
 #ifdef LPR_MPI
@@ -814,7 +851,35 @@ int main(int argc, char* argv[])
                 if (mode == RunMode::DryRun) scheduler.run<false>();
                 else scheduler.run<true>();
             });
-            mpi_node->run();
+            const int exit_code = mpi_node->run();
+            if (exit_code >= 0) {
+                // Interrupted by a signal: rank 0 has coordinated a checkpoint (exit
+                // code 4) or not (3). The workers are paused (or running if a pause
+                // failed), so they are not joined: print, finalise MPI and exit.
+                const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+                if (mpi_rank == 0) {
+                    const lpr::stats::Counters snapshot = mpi_node->saved_stats();
+                    const std::string notice = "INTERRUPTED by a signal after " + std::to_string(seconds)
+                        + " s: partial run, nothing has been verified ("
+                        + (exit_code == 4 ? "checkpoint written to " + options.checkpoint_file
+                                            + "; continue with --resume " + options.checkpoint_file
+                                          : mpi_node->exit_reason())
+                        + ")";
+                    lpr::log::info(notice);
+                    lpr::log::info(progress_line(snapshot, 0.0, "queue=- (all ranks)"));
+                    std::cout << '\n' << notice << "\n\n";
+                    snapshot.print();
+                    std::cout << '\n';
+                    snapshot.print_producer();
+                    std::cout << "Elapsed time: " << seconds << " s\n" << notice << '\n';
+                } else {
+                    lpr::log::info("stopping: rank 0 ended the run (exit code " + std::to_string(exit_code) + ")");
+                }
+                std::cout.flush();
+                std::cerr.flush();
+                MPI_Finalize();
+                std::_Exit(exit_code);
+            }
             workers.join();
 #endif
         } else if (use_scheduler && mode == RunMode::DryRun) {
@@ -880,8 +945,9 @@ int main(int argc, char* argv[])
     lpr::log::info(progress_line(master_stats, 0.0, "queue=-"));
     const double total_elapsed = earlier_elapsed + elapsed.count();
 
-    // The final checkpoint: the search is complete (resuming it prints this summary)
-    if (!options.checkpoint_file.empty()) {
+    // The final checkpoint: the search is complete (resuming it prints this summary).
+    // Under MPI rank 0 writes it, with every rank's statistics.
+    if (!options.checkpoint_file.empty() && mpi_rank == 0) {
         lpr::checkpoint::Checkpoint ck;
         ck.fingerprint = fingerprint;
         ck.segments = segment;

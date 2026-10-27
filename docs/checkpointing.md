@@ -2,6 +2,8 @@
 
 Status: **implemented 24/10/26** (phase 6 of [`work_stealing_plan.md`](work_stealing_plan.md)). Code: `src/checkpoint.hpp` (file format), `src/work_stealing.hpp` (pausing the workers), `src/generate_supports.hpp` (`Task`, `DfsStack::task`, `DfsStack::restore`), `src/main.cpp` (options, monitor, final checkpoint), `scripts/slurm/lpr.slurm` and `scripts/submit.sh` (cluster workflow).
 
+**Under MPI** (`lpr_mpi --mpi`, 27/10/26): rank 0 coordinates one checkpoint of the whole search across all ranks, in this same file format; see `mpi.md` §4. Such a checkpoint resumes with any number of ranks, or without MPI, and the other way round. SIGUSR1 is handled like SIGTERM, in every mode.
+
 ## 1. Usage
 
 ```bash

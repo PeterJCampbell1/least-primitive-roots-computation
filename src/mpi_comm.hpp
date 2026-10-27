@@ -30,6 +30,21 @@
  * message, and the ranks' statistics are gathered and merged (Counters::merge)
  * on rank 0.
  *
+ * Checkpoints (docs/mpi_checkpoint_plan.md): rank 0 coordinates them, every
+ * checkpoint_interval seconds or when any rank reports a signal (SIGTERM, SIGINT,
+ * SIGUSR1; every rank only reports, rank 0 acts once). Rank 0 stops handing out
+ * tasks and asking for donations and sends PAUSE. Each rank finishes any donation in
+ * progress, pauses its workers (Scheduler::pause) and answers PAUSED with its
+ * remaining tasks (Scheduler::remaining_tasks, checked by replay) and its Counters.
+ * Messages between two ranks arrive in order, so every TASK sent before PAUSE has
+ * arrived before it, and every TASK_IN sent before PAUSED has reached rank 0's pool:
+ * once every rank has answered, the pool plus the ranks' tasks are all the work
+ * left, with nothing in transit. Rank 0 checks them (disjoint, issued = received),
+ * writes one checkpoint in the single-node format through the writer callback, and
+ * sends RESUME, or EXIT (code 4 after a signal; 3 if no checkpoint was written),
+ * which every rank acknowledges with EXIT_ACK as its last message. A resumed run
+ * may use any number of ranks: rank 0 reads the checkpoint and pools its tasks.
+ *
  * Watchdog: rank 0 sends every rank a heartbeat every HEARTBEAT_TO_RANKS, and
  * every rank sends rank 0 a Status every STATUS_INTERVAL. A rank that hears
  * nothing from rank 0 for WATCHDOG (or rank 0 from a rank) calls MPI_Abort, so
@@ -51,10 +66,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <list>
@@ -98,16 +115,25 @@ private:
     int size_ = 1;
 };
 
+// Messages to rank 0 have tags below TAG_TO_RANKS; every one starts with a Status
 enum Tag : int {
-    TAG_REQUEST = 1, // rank -> 0: Status; wants a task
-    TAG_STATUS,      // rank -> 0: Status only
-    TAG_TASK_IN,     // rank -> 0: Status + a donated task
-    TAG_NO_DONATION, // rank -> 0: Status; nothing to give
-    TAG_STOP_ACK,    // rank -> 0: Status; the last message from this rank
-    TAG_TASK,        // 0 -> rank: a task
-    TAG_DONATE,      // 0 -> rank: split off a task for the pool
-    TAG_HEARTBEAT,   // 0 -> rank: rank 0 is alive
-    TAG_STOP,        // 0 -> rank: no work is left anywhere
+    TAG_REQUEST = 1,  // rank -> 0: Status; wants a task
+    TAG_STATUS,       // rank -> 0: Status only
+    TAG_TASK_IN,      // rank -> 0: Status + a donated task
+    TAG_NO_DONATION,  // rank -> 0: Status; nothing to give
+    TAG_STOP_ACK,     // rank -> 0: Status; the last message from this rank
+    TAG_SIGNAL,       // rank -> 0: Status + signal number; this rank received a signal
+    TAG_PAUSED,       // rank -> 0: Status + remaining tasks + Counters (checkpoint)
+    TAG_PAUSE_FAILED, // rank -> 0: Status; the workers did not stop in time
+    TAG_EXIT_ACK,     // rank -> 0: Status; the last message before exiting
+    TAG_TO_RANKS = 20,
+    TAG_TASK = TAG_TO_RANKS, // 0 -> rank: a task
+    TAG_DONATE,       // 0 -> rank: split off a task for the pool
+    TAG_HEARTBEAT,    // 0 -> rank: rank 0 is alive
+    TAG_STOP,         // 0 -> rank: no work is left anywhere
+    TAG_PAUSE,        // 0 -> rank: pause for a checkpoint
+    TAG_RESUME,       // 0 -> rank: continue after a checkpoint
+    TAG_EXIT,         // 0 -> rank: exit with the code given
 };
 
 inline const char* tag_name(int tag) {
@@ -121,6 +147,13 @@ inline const char* tag_name(int tag) {
     case TAG_DONATE: return "DONATE";
     case TAG_HEARTBEAT: return "HEARTBEAT";
     case TAG_STOP: return "STOP";
+    case TAG_SIGNAL: return "SIGNAL";
+    case TAG_PAUSED: return "PAUSED";
+    case TAG_PAUSE_FAILED: return "PAUSE_FAILED";
+    case TAG_EXIT_ACK: return "EXIT_ACK";
+    case TAG_PAUSE: return "PAUSE";
+    case TAG_RESUME: return "RESUME";
+    case TAG_EXIT: return "EXIT";
     }
     return "?";
 }
@@ -181,6 +214,35 @@ inline bool read_task(const Words& w, std::size_t offset, Task& t) {
     return true;
 }
 
+// A list of Tasks as words: count, then (length, task words) for each
+inline void append_tasks(Words& w, const std::vector<Task>& tasks) {
+    w.push_back(tasks.size());
+    for (const Task& t : tasks) {
+        Words one;
+        append_task(one, t);
+        w.push_back(one.size());
+        w.insert(w.end(), one.begin(), one.end());
+    }
+}
+
+// Reads a task list at w[offset]; offset moves past it. False if malformed.
+inline bool read_tasks(const Words& w, std::size_t& offset, std::vector<Task>& tasks) {
+    if (offset >= w.size()) return false;
+    const std::uint64_t n = w[offset++];
+    for (std::uint64_t k = 0; k < n; ++k) {
+        if (offset >= w.size()) return false;
+        const std::uint64_t len = w[offset++];
+        if (len > w.size() - offset) return false;
+        const Words one(w.begin() + static_cast<std::ptrdiff_t>(offset),
+                        w.begin() + static_cast<std::ptrdiff_t>(offset + len));
+        Task t;
+        if (!read_task(one, 0, t)) return false;
+        tasks.push_back(std::move(t));
+        offset += len;
+    }
+    return true;
+}
+
 // Counters as words (Counters::for_each_field order) and back
 inline Words counters_words(stats::Counters c) {
     Words w;
@@ -212,12 +274,15 @@ struct NodeCounters {
     std::uint64_t supports_processed = 0;
     std::uint64_t supports_emitted = 0;
     std::uint64_t elapsed_ns = 0;
-    static constexpr std::size_t WORDS = 15;
+    std::uint64_t paused_ns = 0;         // Time this rank's workers were paused for checkpoints
+    std::uint64_t checkpoints_written = 0; // Rank 0
+    std::uint64_t checkpoints_failed = 0;  // Rank 0: collected but not written
+    static constexpr std::size_t WORDS = 18;
 
     Words words() const {
         return {tasks_received, requests_sent, request_wait_ns, donations_asked, donations_sent, donations_refused,
                 messages_sent, messages_received, tasks_issued, donations_requested, pool_max, worker_idle_ns,
-                supports_processed, supports_emitted, elapsed_ns};
+                supports_processed, supports_emitted, elapsed_ns, paused_ns, checkpoints_written, checkpoints_failed};
     }
     static NodeCounters from(const std::uint64_t* w) {
         NodeCounters c;
@@ -225,6 +290,7 @@ struct NodeCounters {
         c.donations_sent = w[4]; c.donations_refused = w[5]; c.messages_sent = w[6]; c.messages_received = w[7];
         c.tasks_issued = w[8]; c.donations_requested = w[9]; c.pool_max = w[10]; c.worker_idle_ns = w[11];
         c.supports_processed = w[12]; c.supports_emitted = w[13]; c.elapsed_ns = w[14];
+        c.paused_ns = w[15]; c.checkpoints_written = w[16]; c.checkpoints_failed = w[17];
         return c;
     }
 };
@@ -234,7 +300,15 @@ struct NodeOptions {
     unsigned pool_reserve = 1;  // L2: tasks rank 0 keeps beyond the open requests
     bool stress = false;        // Random delays, late start, constant donations
     bool static_split = false;  // M1: hand out a fixed split, never rebalance
+    bool checkpoints = false;   // Write checkpoints (through the writer callback)
+    double checkpoint_interval = 0; // Seconds between periodic checkpoints (0: only on signals)
+    std::chrono::milliseconds pause_timeout{60000}; // Workers must stop within this (watchdog: 120 s)
 };
+
+// Rank 0: writes a checkpoint of `tasks` and `stats` (the earlier runs' work
+// included); false with a reason if it could not
+using CheckpointWriter = std::function<bool(const std::vector<Task>& tasks, const stats::Counters& stats,
+                                            std::string& error)>;
 
 inline std::string hostname() {
     char name[256] = {};
@@ -286,13 +360,16 @@ public:
     static constexpr auto DONOR_RETRY = std::chrono::milliseconds(20); // After a NO_DONATION
     static constexpr auto REQUEST_DEBOUNCE = std::chrono::milliseconds(2); // Idle this long before L1
 
-    // initial: rank 0's pool at the start (the root task, or M1's pieces)
+    // initial: rank 0's pool at the start (the root task, M1's pieces, or a
+    // checkpoint's tasks). signal_flag: set (non-zero) by the process's signal
+    // handler. writer: rank 0's checkpoint writer (needed if options.checkpoints).
     Node(stealing::Scheduler& scheduler, const std::vector<unsigned>& primes, const mpz_class& bound,
-         int rank, int size, NodeOptions options, std::vector<Task> initial)
+         int rank, int size, NodeOptions options, std::vector<Task> initial,
+         const volatile std::sig_atomic_t* signal_flag = nullptr, CheckpointWriter writer = {})
         : scheduler_(scheduler), primes_(primes), bound_(bound), rank_(rank), size_(size), options_(options),
           check_stack_(bound, primes.size()), check_support_(producer::initial_support(primes)),
           rng_(0x9e3779b97f4a7c15ULL * static_cast<std::uint64_t>(rank + 1)),
-          trace_(std::getenv("LPR_MPI_TRACE") != nullptr) {
+          trace_(std::getenv("LPR_MPI_TRACE") != nullptr), signal_flag_(signal_flag), writer_(std::move(writer)) {
         if (rank_ == 0) {
             pool_.assign(initial.begin(), initial.end());
             ranks_.resize(static_cast<std::size_t>(size_));
@@ -303,8 +380,13 @@ public:
     Node(const Node&) = delete;
     Node& operator=(const Node&) = delete;
 
-    // Runs until STOP (on the thread that initialised MPI)
-    void run() {
+    /*
+     * Runs until STOP (on the thread that initialised MPI) and returns -1, or until
+     * rank 0 ends the run after a signal and returns the exit code (4: checkpoint
+     * written; 3: none). After an exit code the workers may still be paused or
+     * running: the caller prints, finalises MPI and exits without joining them.
+     */
+    int run() {
         const auto start = Clock::now();
         if (options_.stress) { // Late start: up to 200 ms
             std::this_thread::sleep_for(std::chrono::milliseconds(random_below(200)));
@@ -313,6 +395,7 @@ public:
         if (rank_ == 0) {
             for (auto& view : ranks_) view.last_heard = Clock::now();
             last_heartbeat_sent_ = Clock::now();
+            next_checkpoint_ = Clock::now() + checkpoint_period();
             if (options_.static_split) { // M1: hand out every piece now, round-robin
                 int r = 0;
                 while (!pool_.empty()) {
@@ -329,7 +412,7 @@ public:
             Words data;
             while (receive(source, tag, data)) {
                 acted = true;
-                if (tag <= TAG_STOP_ACK) {
+                if (tag < TAG_TO_RANKS) {
                     server_receive(source, tag, data);
                 } else {
                     client_receive(tag, data);
@@ -341,10 +424,13 @@ public:
             if (stopped_ && (rank_ != 0 || stop_acks_ == static_cast<unsigned>(size_))) {
                 break;
             }
+            if (exiting_ && (rank_ != 0 || exit_acks_ == static_cast<unsigned>(size_))) {
+                break;
+            }
             watchdog();
             // Poll quickly while something is happening, back off when quiet
             quiet_loops = acted ? 0 : quiet_loops + 1;
-            const bool urgent = rank_ == 0 || request_open_ || donation_.active;
+            const bool urgent = rank_ == 0 || request_open_ || donation_.active || pause_pending_ || paused_;
             const unsigned max_us = urgent ? 1000 : 5000;
             unsigned us = std::min<unsigned>(max_us, 20u << std::min(quiet_loops, 8u));
             if (options_.stress) us += static_cast<unsigned>(random_below(2000));
@@ -355,7 +441,13 @@ public:
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
         counters_.elapsed_ns = elapsed_ns(start);
+        return exiting_ ? exit_code_ : -1;
     }
+
+    // After run() returned an exit code (rank 0): the statistics collected at the
+    // last pause (every rank's work, earlier runs included), and what happened
+    const stats::Counters& saved_stats() const { return saved_stats_; }
+    const std::string& exit_reason() const { return exit_reason_; }
 
     // For progress lines (any thread; rank 0's values cover every rank)
     std::uint64_t pool_size() const { return pool_size_.load(std::memory_order_relaxed); }
@@ -377,6 +469,7 @@ private:
         bool hungry = false;    // Its request is open
         bool donating = false;  // A DONATE to it is unanswered
         bool acked = false;     // STOP_ACK received
+        bool exited = false;    // EXIT_ACK received
         Clock::time_point retry_at{}; // No DONATE before this (after a refusal)
         Clock::time_point last_heard{};
     };
@@ -401,6 +494,8 @@ private:
     std::vector<unsigned> check_support_;
     std::uint64_t rng_;
     const bool trace_; // LPR_MPI_TRACE set: log every message (testing)
+    const volatile std::sig_atomic_t* signal_flag_;
+    CheckpointWriter writer_;
     NodeCounters counters_;
 
     // Transport
@@ -422,6 +517,12 @@ private:
     Donation donation_;
     bool stopped_ = false;
     stats::Counters progress_{}; // Last statistics snapshot (for Status)
+    bool signal_reported_ = false;
+    bool pause_pending_ = false;  // PAUSE received; pausing once any donation is done
+    bool paused_ = false;         // Workers paused, PAUSED sent; waiting for RESUME or EXIT
+    Clock::time_point paused_since_{};
+    bool exiting_ = false;        // EXIT received: this rank stops after EXIT_ACK
+    int exit_code_ = -1;
 
     // Server (rank 0)
     std::deque<Task> pool_;
@@ -432,6 +533,21 @@ private:
     std::atomic<std::uint64_t> pool_size_{0};
     mutable std::mutex global_mutex_; // Guards global_ (read by the monitor thread)
     stats::Counters global_;
+    // Checkpoints (rank 0)
+    bool collecting_ = false;     // PAUSE sent, waiting for every rank's answer
+    bool exit_after_ = false;     // Exit once this checkpoint is done (a signal)
+    unsigned replies_ = 0;
+    bool pause_failed_ = false;
+    std::vector<Task> collected_;
+    stats::Counters collected_stats_;
+    Clock::time_point collect_started_{};
+    Clock::time_point next_checkpoint_{};
+    bool exit_sent_ = false;      // EXIT sent to every rank (including this one)
+    unsigned exit_acks_ = 0;
+    stats::Counters saved_stats_;
+    std::string exit_reason_;
+    int signal_number_ = 0;
+    int signal_rank_ = -1;
 
     static std::uint64_t elapsed_ns(Clock::time_point since) {
         return static_cast<std::uint64_t>(
@@ -556,10 +672,28 @@ private:
 
     void client_receive(int tag, const Words& data) {
         last_from_root_ = Clock::now();
-        if (stopped_) {
-            fatal(std::string("message ") + tag_name(tag) + " after STOP");
+        if (stopped_ || exiting_) {
+            fatal(std::string("message ") + tag_name(tag) + (stopped_ ? " after STOP" : " after EXIT"));
         }
         switch (tag) {
+        case TAG_PAUSE:
+            if (pause_pending_ || paused_) fatal("PAUSE while already pausing");
+            pause_pending_ = true; // client_step pauses once any donation in progress is done
+            break;
+        case TAG_RESUME:
+            if (paused_) {
+                scheduler_.resume();
+                counters_.paused_ns += elapsed_ns(paused_since_);
+                paused_ = false;
+            } // Else this rank's pause had failed: it is running already
+            break;
+        case TAG_EXIT:
+            if (data.size() != 1) fatal("malformed EXIT message");
+            exit_code_ = static_cast<int>(data[0]);
+            exiting_ = true;
+            if (paused_) counters_.paused_ns += elapsed_ns(paused_since_);
+            send_to_root(TAG_EXIT_ACK); // The last message from this rank
+            break;
         case TAG_TASK: {
             Task task;
             std::string why;
@@ -584,8 +718,9 @@ private:
         case TAG_HEARTBEAT:
             break;
         case TAG_STOP:
-            if (scheduler_.regions() != 0 || donation_.active || scheduler_.pending_tasks() != 0) {
-                fatal("STOP while this rank still holds work");
+            if (scheduler_.regions() != 0 || donation_.active || scheduler_.pending_tasks() != 0
+                || pause_pending_ || paused_) {
+                fatal("STOP while this rank still holds work or is paused");
             }
             stopped_ = true;
             if (request_open_) {
@@ -655,9 +790,69 @@ private:
         send_to_root(TAG_NO_DONATION);
     }
 
+    // Pauses this rank's workers and answers PAUSED (or PAUSE_FAILED)
+    void pause_workers() {
+        pause_pending_ = false;
+        const auto result = scheduler_.pause(options_.pause_timeout);
+        if (result != stealing::Scheduler::PauseResult::Paused) {
+            // TimedOut (SearchFinishing cannot happen: workers wait for finish())
+            lpr::log::warn("MPI: checkpoint: this rank's workers did not stop within "
+                           + std::to_string(options_.pause_timeout.count() / 1000) + " s");
+            send_to_root(TAG_PAUSE_FAILED);
+            return;
+        }
+        paused_ = true;
+        paused_since_ = Clock::now();
+        stats::publish_thread_local_stats(); // This thread's own counters (e.g. M1's splits)
+        const stats::Counters stats = stats::get_master_stats().snapshot(); // Workers published when parking
+        std::vector<Task> tasks;
+        std::string error;
+        if (!scheduler_.remaining_tasks(tasks, error)) {
+            lpr::log::warn("MPI: checkpoint: this rank's tasks failed their checks: " + error);
+            scheduler_.resume();
+            paused_ = false;
+            send_to_root(TAG_PAUSE_FAILED);
+            return;
+        }
+        const Status st = current_status();
+        Words w;
+        st.append_to(w);
+        append_tasks(w, tasks);
+        const Words c = counters_words(stats);
+        w.insert(w.end(), c.begin(), c.end());
+        send(0, TAG_PAUSED, std::move(w));
+        reported_ = true;
+        reported_empty_ = st.regions == 0;
+        reported_busy_ = st.base_depth > 0;
+        reported_received_ = st.received;
+        last_status_ = Clock::now();
+    }
+
     void client_step(bool& acted) {
-        if (stopped_) return;
+        if (exiting_ || stopped_) return; // (After STOP a signal changes nothing: the search is complete)
+        // A signal: report it once; rank 0 runs the checkpoint and ends the run
+        if (signal_flag_ != nullptr && *signal_flag_ != 0 && !signal_reported_) {
+            signal_reported_ = true;
+            acted = true;
+            if (rank_ == 0) {
+                server_signal(0, *signal_flag_);
+            } else {
+                Status st = current_status();
+                Words w;
+                st.append_to(w);
+                w.push_back(static_cast<std::uint64_t>(*signal_flag_));
+                send(0, TAG_SIGNAL, std::move(w));
+            }
+        }
+        if (paused_) return; // Nothing until RESUME or EXIT
         donation_step(acted);
+        if (pause_pending_) {
+            if (!donation_.active) {
+                pause_workers();
+                acted = true;
+            }
+            return;
+        }
         const auto now = Clock::now();
         const bool periodic = !reported_ || now - last_status_ >= (options_.stress
             ? std::chrono::duration_cast<Clock::duration>(std::chrono::milliseconds(50))
@@ -707,7 +902,9 @@ private:
         if (rank_ == 0) {
             for (int r = 0; r < size_; ++r) {
                 const RankView& v = ranks_[static_cast<std::size_t>(r)];
-                if (!v.acked && now - v.last_heard > WATCHDOG) {
+                // (A paused rank sends nothing until RESUME, which follows promptly once
+                // every rank has answered; each answer comes within the pause timeout.)
+                if (!v.acked && !v.exited && now - v.last_heard > WATCHDOG) {
                     fatal("no message from rank " + std::to_string(r) + " for " + std::to_string(WATCHDOG.count())
                           + " s");
                 }
@@ -780,6 +977,37 @@ private:
             v.acked = true;
             ++stop_acks_;
             break;
+        case TAG_SIGNAL:
+            if (data.size() != Status::WORDS + 1) fatal("malformed SIGNAL message");
+            server_signal(source, static_cast<int>(data[Status::WORDS]));
+            break;
+        case TAG_PAUSED: {
+            if (!collecting_) fatal("unexpected PAUSED from rank " + std::to_string(source));
+            // Every task issued to it arrived before PAUSE, and any donation it made
+            // arrived before PAUSED (messages between two ranks keep their order)
+            if (v.status.received != v.issued || v.donating) {
+                fatal("rank " + std::to_string(source) + " paused with work in transit");
+            }
+            std::size_t offset = Status::WORDS;
+            std::vector<Task> tasks;
+            if (!read_tasks(data, offset, tasks)) fatal("malformed PAUSED message (tasks)");
+            const std::size_t fields = counters_words(stats::Counters{}).size();
+            if (data.size() - offset != fields) fatal("malformed PAUSED message (statistics)");
+            collected_stats_.merge(counters_from(data.data() + offset));
+            for (Task& t : tasks) collected_.push_back(std::move(t));
+            ++replies_;
+            break;
+        }
+        case TAG_PAUSE_FAILED:
+            if (!collecting_) fatal("unexpected PAUSE_FAILED from rank " + std::to_string(source));
+            pause_failed_ = true;
+            ++replies_;
+            break;
+        case TAG_EXIT_ACK:
+            if (!exit_sent_ || v.exited) fatal("unexpected EXIT_ACK from rank " + std::to_string(source));
+            v.exited = true;
+            ++exit_acks_;
+            break;
         default:
             fatal("unexpected message tag " + std::to_string(tag));
         }
@@ -812,13 +1040,116 @@ private:
         return best;
     }
 
+    Clock::duration checkpoint_period() const {
+        const double seconds = options_.checkpoint_interval > 0 ? options_.checkpoint_interval : 1e9;
+        return std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(seconds));
+    }
+
+    // Rank 0: a rank (or rank 0 itself) received a signal
+    void server_signal(int source, int sig) {
+        if (exit_sent_) return;
+        if (signal_rank_ < 0) {
+            signal_rank_ = source;
+            signal_number_ = sig;
+        }
+        if (stop_sent_) {
+            lpr::log::info("MPI: signal " + std::to_string(sig) + " on rank " + std::to_string(source)
+                           + " while the search is finishing: completing normally");
+            return;
+        }
+        lpr::log::info("MPI: signal " + std::to_string(sig) + " on rank " + std::to_string(source)
+                       + ": " + (options_.checkpoints ? "checkpointing and stopping" : "stopping (no checkpoints)"));
+        exit_after_ = true;
+        if (!collecting_) start_collecting();
+    }
+
+    // Rank 0: pause every rank and collect its tasks and statistics
+    void start_collecting() {
+        collecting_ = true;
+        replies_ = 0;
+        pause_failed_ = false;
+        collected_.clear();
+        collected_stats_ = stats::Counters{};
+        collect_started_ = Clock::now();
+        for (int r = 0; r < size_; ++r) send(r, TAG_PAUSE, {});
+    }
+
+    // Rank 0: every rank has answered PAUSE. Writes the checkpoint (if enabled and
+    // the collection is complete), then sends RESUME or EXIT.
+    void finish_collecting() {
+        collecting_ = false;
+        std::vector<Task> tasks = collected_;
+        tasks.insert(tasks.end(), pool_.begin(), pool_.end());
+        bool written = false;
+        std::string error;
+        bool consistent = !pause_failed_;
+        if (pause_failed_) {
+            error = "a rank's workers did not stop in time, or its tasks failed their checks";
+        } else {
+            for (int r = 0; r < size_ && consistent; ++r) {
+                const RankView& v = ranks_[static_cast<std::size_t>(r)];
+                if (v.status.received != v.issued || v.donating) {
+                    consistent = false;
+                    error = "rank " + std::to_string(r) + " has work in transit";
+                }
+            }
+            if (consistent && !producer::detail::tasks_disjoint(tasks, &error)) {
+                consistent = false;
+                error = "tasks overlap: " + error;
+            }
+        }
+        const double pause_s = std::chrono::duration<double>(Clock::now() - collect_started_).count();
+        if (consistent && tasks.empty()) {
+            // Nothing is left: the search is finishing (as Scheduler's SearchFinishing)
+            lpr::log::info("MPI: checkpoint skipped: no work is left, the search is finishing");
+            exit_after_ = false;
+        } else if (consistent && options_.checkpoints) {
+            written = writer_ && writer_(tasks, collected_stats_, error);
+            if (written) {
+                ++counters_.checkpoints_written;
+                lpr::log::info("MPI: checkpoint written: " + std::to_string(tasks.size()) + " tasks, "
+                               + std::to_string(collected_stats_.total_support_count) + " supports processed ("
+                               + std::to_string(pause_s) + " s paused)");
+            }
+        }
+        if (!written && options_.checkpoints && !(consistent && tasks.empty())) {
+            ++counters_.checkpoints_failed;
+            lpr::log::warn("MPI: checkpoint not written: " + error);
+        }
+        if (exit_after_) {
+            saved_stats_ = collected_stats_;
+            exit_reason_ = written ? "checkpoint written" : (options_.checkpoints ? "checkpoint NOT written: " + error
+                                                                                  : "no checkpoint (--checkpoint not given)");
+            if (pause_failed_) exit_reason_ += "; the statistics may be incomplete";
+            exit_sent_ = true; // This rank's own copy of EXIT ends its client side too
+            for (int r = 0; r < size_; ++r) send(r, TAG_EXIT, {static_cast<std::uint64_t>(written ? 4 : 3)});
+        } else {
+            for (int r = 0; r < size_; ++r) send(r, TAG_RESUME, {});
+        }
+        next_checkpoint_ = Clock::now() + checkpoint_period();
+    }
+
     void server_step(bool& acted) {
         const auto now = Clock::now();
-        if (now - last_heartbeat_sent_ >= HEARTBEAT_TO_RANKS && !stop_sent_) {
+        if (now - last_heartbeat_sent_ >= HEARTBEAT_TO_RANKS && !stop_sent_ && !exit_sent_) {
             for (int r = 1; r < size_; ++r) send(r, TAG_HEARTBEAT, {});
             last_heartbeat_sent_ = now;
         }
-        if (stop_sent_) return;
+        if (stop_sent_ || exit_sent_) return;
+        // Checkpoints: while collecting, nothing moves (no tasks issued, no donations
+        // asked); every rank's answer completes it
+        if (collecting_) {
+            if (replies_ == static_cast<unsigned>(size_)) {
+                finish_collecting();
+                acted = true;
+            }
+            return;
+        }
+        if (options_.checkpoints && options_.checkpoint_interval > 0 && now >= next_checkpoint_) {
+            start_collecting();
+            acted = true;
+            return;
+        }
         // Serve open requests: ranks holding nothing first, then most idle workers
         while (!pool_.empty()) {
             int pick = -1;
@@ -927,6 +1258,10 @@ inline void print_summary(const std::vector<NodeCounters>& rows, const std::vect
         const NodeCounters& r0 = rows[0];
         std::cout << "Rank 0 pool: " << r0.tasks_issued << " tasks issued, " << r0.donations_requested
                   << " donations requested, largest pool " << r0.pool_max << '\n';
+        double paused = 0;
+        for (const NodeCounters& c : rows) paused = std::max(paused, c.paused_ns / 1e9);
+        std::cout << "Checkpoints: " << r0.checkpoints_written << " written, " << r0.checkpoints_failed
+                  << " not written; workers paused " << paused << " s in total (longest rank)\n";
     }
 }
 

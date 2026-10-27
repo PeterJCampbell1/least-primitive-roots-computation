@@ -117,7 +117,7 @@ Options:
 
 Checkpoints (with --single, --parallel or --dry-run; see docs/checkpointing.md):
   --checkpoint PATH      Save progress to PATH every --checkpoint-interval seconds,
-                         on SIGTERM/SIGINT (then exit with code 4) and at the end
+                         on SIGTERM/SIGINT/SIGUSR1 (then exit with code 4) and at the end
   --checkpoint-interval SECONDS
                          Seconds between checkpoints (default 600; decimals allowed;
                          0 = only on signals and at the end)
@@ -129,8 +129,9 @@ Checkpoints (with --single, --parallel or --dry-run; see docs/checkpointing.md):
 
 Several nodes (lpr_mpi only, one MPI rank per node; see docs/mpi.md):
   --mpi                  With --parallel or --dry-run, under srun or mpirun: one
-                         search across all ranks, --threads workers per rank. Not
-                         yet combinable with --checkpoint or --resume
+                         search across all ranks, --threads workers per rank. With
+                         --checkpoint, rank 0 coordinates checkpoints of the whole
+                         search; --resume continues one with any number of ranks
   --mpi-request-idle N   A rank asks rank 0 for work once N of its workers are
                          idle (default 2, at most --threads)
   --mpi-pool-reserve N   Tasks rank 0 keeps ready beyond the open requests
@@ -156,8 +157,8 @@ Exit codes:
   0  complete: every candidate certified and Grosswald's inequality holds
   1  complete, but a Grosswald failure or an unresolved candidate was found
   2  usage error
-  3  interrupted (SIGTERM/SIGINT): partial run, nothing is verified, no checkpoint
-  4  interrupted (SIGTERM/SIGINT) and a checkpoint was written: continue with --resume
+  3  interrupted (SIGTERM/SIGINT/SIGUSR1): partial run, nothing is verified, no checkpoint
+  4  interrupted (SIGTERM/SIGINT/SIGUSR1) and a checkpoint was written: continue with --resume
   5  (lpr_mpi) a rank aborted the MPI job: a fatal protocol error, or the watchdog
      found a rank silent for 120 s
 )";
@@ -398,9 +399,6 @@ inline ParseResult parse(int argc, char* argv[]) {
 #endif
         if (options.mode != RunMode::Parallel && options.mode != RunMode::DryRun) {
             return {std::nullopt, "--mpi works with --parallel or --dry-run"};
-        }
-        if (options.checkpointing()) {
-            return {std::nullopt, "--checkpoint and --resume are not supported with --mpi yet"};
         }
         if (options.split_test_interval > 0) {
             return {std::nullopt, "--split-test cannot be combined with --mpi"};

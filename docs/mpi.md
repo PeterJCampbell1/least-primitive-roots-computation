@@ -1,6 +1,6 @@
-# MPI: one search across several nodes (M1 + M2)
+# MPI: one search across several nodes (M1, M2 and M4)
 
-Status: **implemented 26/10/26** (steps M1 and M2 of [`mpi_plan.md`](mpi_plan.md); checkpoints under MPI, M4, are not done yet). Code: `src/mpi_comm.hpp` (the protocol), the external endpoint in `src/work_stealing.hpp`, the `--mpi*` options in `src/cli.hpp`, `main.cpp` (start-up, final reduction), `make lpr_mpi`, `scripts/slurm/lpr_mpi.slurm`. Verified locally (x86-64 Open MPI 5.0.3 under Rosetta, oversubscribed) and on 2 Rangpur nodes (MPICH).
+Status: **implemented 26/10/26** (steps M1 and M2 of [`mpi_plan.md`](mpi_plan.md)); **coordinated checkpoints (M4) 27/10/26** ([`mpi_checkpoint_plan.md`](mpi_checkpoint_plan.md), §4 below). Code: `src/mpi_comm.hpp` (the protocol), the external endpoint in `src/work_stealing.hpp`, the `--mpi*` options in `src/cli.hpp`, `main.cpp` (start-up, final reduction), `make lpr_mpi`, `scripts/slurm/lpr_mpi.slurm`. Verified locally (x86-64 Open MPI 5.0.3 under Rosetta, oversubscribed) and on 2 Rangpur nodes (MPICH).
 
 ## 1. Usage
 ```bash
@@ -38,8 +38,9 @@ LPR_JOB=$HOME/lpr/scripts/slurm/lpr_mpi.slurm scripts/submit.sh -n mpi_s29 \
   - `--mpi-pool-reserve N` (default 4): the L2 reserve.
   - Testing only: `--mpi-static` (M1) and `--mpi-stress`.
   - `LPR_MPI_TRACE=1` logs every message.
+- **Checkpoints** work as for single-node runs (`--checkpoint`, `--checkpoint-interval`, `--resume`; §4). A checkpoint can be resumed with any number of ranks, or without MPI, and the other way round.
 - **Refused with exit 2:**
-  - `--mpi` with `--checkpoint`/`--resume` (until M4), `--single`, `--parallel-queue` or `--split-test`;
+  - `--mpi` with `--single`, `--parallel-queue` or `--split-test`;
   - more than one rank without `--mpi`;
   - `--mpi` in the plain `lpr`.
 - **Exit codes:** as `lpr`, the same on every rank (rank 0 broadcasts its code), plus 5 when a rank aborts the job (an MPI fatal error, e.g. the watchdog).
@@ -61,8 +62,9 @@ See the header comment of `src/mpi_comm.hpp` for the protocol in full. In short:
 - **Termination:** a rank whose last Status says "0 regions, received k" with k = tasks issued to it holds nothing. Messages between two ranks arrive in order, so its earlier donations have arrived. When the pool is empty, no DONATE is unanswered and every rank is in that state, rank 0 sends STOP. Every rank answers STOP_ACK as its last message; then `MPI_Gather` merges the statistics with `Counters::merge` (sums, maxima, the wrapping checksum).
 - **The watchdog:** rank 0 sends a heartbeat every 10 s and every rank sends a Status every 1 s. Silence for 120 s in either direction means `MPI_Abort`, so a dead or hung rank ends the job instead of idling until the time limit.
 - **Failures:**
-  - Any rank dying ends the job (plain MPI has no fault tolerance), and rank 0 is no worse than the others.
-  - Until M4 the run's work is lost. With M4 (coordinated checkpoints by rank 0) plus `--requeue`, the job resumes from the last checkpoint on any number of nodes.
+  - **Any rank dying ends the job.** Plain MPI has no fault tolerance, and rank 0 is no worse than the others. Slurm never takes one node away from a running job (preemption, cancellation and time limits act on whole jobs), but a node can crash.
+  - **Recovery** is from the last periodic checkpoint (§4): with `#SBATCH --requeue`, Slurm may requeue the job after a node failure, and it resumes on any number of nodes. At most one checkpoint interval of work is lost.
+  - **Continuing without the lost node** would need fault-tolerant MPI (ULFM) or re-issuing that rank's work from the last checkpoint; it is deferred (`mpi_checkpoint_plan.md`, pinned items).
 
 ## 3. Verification log (25/10/26, M2 Air under Rosetta, x86-64 Open MPI 5.0.3, oversubscribed)
 Every test compares the full search and producer summaries with the single-threaded reference (`cmp.sh`: every count, the winners histograms, the supports checksum and the DFS counters; only timing and stealing lines are ignored). The test harness (`run_matrix.sh`, `cmp.sh`, `overhead_bench.sh`) lived in the untracked scratch copy `.bench/mpi/`.
@@ -140,8 +142,47 @@ Every test compares the full search and producer summaries with the single-threa
 - **Idle time is negligible on a long run:** 36.2 s on rank 0 and 1.3 s on rank 1, out of 78,650 worker-seconds (0.05%). The donation-size question above matters only for short runs.
 - **Transfers:** 636 tasks issued and 687 donations requested.
 
-## 4. Next steps
+## 4. Coordinated checkpoints (M4, 27/10/26)
+**Protocol** (`src/mpi_comm.hpp`, header comment):
+- **Who decides:** rank 0, every `--checkpoint-interval` seconds, or when any rank reports a signal (SIGTERM, SIGINT or SIGUSR1). Every rank only reports a signal; rank 0 acts once.
+- **Pause:**
+  1. Rank 0 stops handing out tasks and asking for donations, and sends PAUSE.
+  2. Each rank finishes any donation in progress, pauses its workers (`Scheduler::pause`, at most 60 s) and answers PAUSED. The answer carries its remaining tasks (`remaining_tasks`, checked by replay) and its `Counters`.
+- **Why nothing is missed:** messages between two ranks keep their order. So every task rank 0 sent before PAUSE has arrived, and every donation sent before PAUSED is in rank 0's pool. Once all ranks have answered, rank 0's pool plus their tasks is all the work left.
+- **Write:** rank 0 checks that the tasks are disjoint and that every issued task was received, merges the statistics, and writes one checkpoint in the single-node format.
+- **Finish:** rank 0 sends RESUME. After a signal it sends EXIT instead, with code 4, or 3 if nothing could be written. Every rank answers EXIT_ACK, prints (rank 0 prints the saved statistics), finalises MPI and exits with that code.
+- **Corner cases:**
+  - a signal after STOP (the search is finishing) is ignored;
+  - a collection that finds no work left skips the checkpoint, as single-node runs do;
+  - if a rank's workers don't stop within 60 s, that checkpoint is abandoned (after a signal: exit 3).
+- **Resuming:**
+  - Every rank reads and validates the checkpoint, so they agree on refusing it.
+  - Only rank 0 merges its statistics and pools its tasks.
+  - Only rank 0 creates the probe file, and the result is broadcast to the others.
+- **Signals in `lpr_mpi.slurm`:** `#SBATCH --signal=B:USR1@300` signals the batch script, which forwards SIGUSR1 to the launcher. `srun` and `mpirun` both pass SIGUSR1 to every rank without killing anything; SIGTERM to `mpirun` kills the ranks. On exit 4 the job requeues itself, as `lpr.slurm` does, and rebuilds on its new nodes. `PMIX_MCA_psec=native` silences PMIx's munge warnings under Open MPI.
+
+**Verification (local, x86-64 Open MPI 5.0.3 under Rosetta; every final summary compared exactly with the single-threaded reference):**
+
+| Test | Result |
+|---|---|
+| Periodic checkpoints every 1 s, 1/2/4 ranks: S=30, S=29 dry, S=30 with `--mpi-stress` | 9/9 exact; 2–31 checkpoints per run, final checkpoint `complete 1` |
+| Interrupt-and-resume chains, the rank count changing between segments | 9/9 exact; e.g. S=29 full over 7 segments on 2, 4, 3, 1, 2, 4, 4 ranks |
+| Signal kinds and targets | SIGTERM, SIGUSR1 and SIGINT, to every rank (as `srun` does) or to one random rank: all exact |
+| Debug build (`lpr_mpi_g`), 3 chains, 17 segments | exact, no assertion failures |
+| Signal at start-up; near the end; resuming a completed checkpoint; signal without `--checkpoint` | exit 4 then exact; exact; same summary again; exit 3 with the partial statistics |
+| Cross-mode: `--parallel` → MPI(3) → `--single` → MPI(2), and dry MPI(2) → dry `--parallel` | exact |
+| Refusals (every rank exits 2) | a different search; a dry-run checkpoint in a full run; a damaged file; an existing file without `--resume`; an unwritable path |
+| `lpr_mpi.slurm` in a fake-Slurm simulation (2 nodes; SIGUSR1 to the batch script; fake `scontrol requeue`) | 5 runs, 4 requeues, a rebuild on both nodes each time, periodic checkpoints every 5 s, exact |
+| Native `lpr` | SIGUSR1 checkpoints and exits 4; resume exact; plain runs unchanged |
+| Regression: the full MPI matrix (plumbing, stress, dry runs, debug build, S=29) | 104/104 exact |
+
+**Speed** (S=29, 8 workers as 2×4 and 4×2 ranks, 3 rotating rounds; the Mac slowed by about 10% between rounds, so compare within a round):
+- **New build with checkpoints off:** the same as the previous build (ee9d1b7), within ±1 s of runs of about 100–113 s.
+- **Checkpoints every 10 s:** each pause took 13–16 ms; runs were about 1% slower than the adjacent runs without checkpoints.
+- **At the default 600 s interval** the cost is negligible.
+
+## 5. Next steps
 1. **Rangpur:** 4 nodes (OMEGA=32 on 2 nodes is done: job 699035, exact, 2.11×).
-2. **M4:** coordinated checkpoints (rank 0 PAUSE → drain → gather tasks and counters → one file) plus `--stop-at`/USR1. Then requeue on multiple nodes.
+2. **M4 on the clusters:** an MPI run with a short `--time`, so that it checkpoints, requeues and resumes at least once (Rangpur and Friday).
 3. **Bigger donations:** a work-aware split that can step into the donor's current subtree. Today the rank without the large part of the search idles about 5–10% of its worker time on 2 nodes.
 4. **M3 (peer stealing):** only if rank 0 limits scaling.
