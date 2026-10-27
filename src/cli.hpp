@@ -22,11 +22,14 @@
 #include <optional>
 #include <string>
 #include <thread>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 namespace lpr::cli {
 
 enum class RunMode { Single, Parallel, ParallelQueue, DryRun };
-enum class ThreadSource { None, CommandLine, Slurm, Hardware };
+enum class ThreadSource { None, CommandLine, Slurm, Hardware, Affinity };
 
 struct Options {
     RunMode mode = RunMode::Single;
@@ -52,6 +55,12 @@ struct Options {
     unsigned mpi_pool_reserve = 4; // --mpi-pool-reserve N: tasks rank 0 keeps ready beyond the open requests
     bool mpi_tuning_given = false; // Any --mpi-* tuning option was given
     bool mpi_stress = false; // --mpi-stress: random delays, late starts, constant donations (testing)
+    // Pool (lpr_mpi --mpi --pool DIR; docs/elastic_pool.md)
+    std::string pool_dir; // --pool DIR: share one search with other jobs through DIR (empty = none)
+    double pool_poll = 10; // --pool-poll SECONDS: how often rank 0 looks at the pool
+    double pool_stale = 600; // --pool-stale SECONDS: release leases without a heartbeat for this long
+    double pool_idle_timeout = 1800; // --pool-idle-timeout SECONDS: leave after this long with nothing to do
+    std::string pool_status_dir; // --pool-status DIR: report on (and merge) a pool, then exit
     bool help = false;
 
     bool checkpointing() const { return !checkpoint_file.empty() || !resume_file.empty(); }
@@ -78,6 +87,7 @@ inline const char* thread_source_name(ThreadSource source) {
     case ThreadSource::CommandLine: return "--threads";
     case ThreadSource::Slurm: return "SLURM_CPUS_PER_TASK";
     case ThreadSource::Hardware: return "hardware concurrency";
+    case ThreadSource::Affinity: return "--threads 0: the CPUs this process may use";
     }
     return "unknown";
 }
@@ -100,7 +110,8 @@ Search parameters (default omega = )" + std::to_string(parameters::DEFAULT_OMEGA
   --s N                  Corollary 4 parameter, 1 <= s <= omega - 3 (overrides --config)
 
 Options:
-  --threads N            Threads for --parallel (N >= 1) or --parallel-queue (N >= 2).
+  --threads N            Threads for --parallel (N >= 1) or --parallel-queue (N >= 2);
+                         0: one per CPU this process may use (its affinity mask).
                          Defaults to SLURM_CPUS_PER_TASK, then the hardware thread
                          count. With --dry-run (default 1), N > 1 searches the
                          tree with work stealing
@@ -136,6 +147,20 @@ Several nodes (lpr_mpi only, one MPI rank per node; see docs/mpi.md):
                          idle (default 2, at most --threads)
   --mpi-pool-reserve N   Tasks rank 0 keeps ready beyond the open requests
                          (default 4)
+  --pool DIR             With --mpi: share one search with any number of other jobs
+                         through DIR on a shared file system; jobs may join and leave
+                         (or die) at any time (docs/elastic_pool.md). The first job
+                         creates DIR (from --resume CKPT if given). Lease state is
+                         written every --checkpoint-interval seconds
+  --pool-poll SECONDS    How often rank 0 looks at the pool (default 10)
+  --pool-stale SECONDS   Release other jobs' leases without a heartbeat for this
+                         long (default 600)
+  --pool-idle-timeout SECONDS
+                         Leave the pool after this long with nothing to do while
+                         other jobs still work (default 1800)
+  --pool-status DIR      Report on a pool and, if its search is complete, verify
+                         and print the merged summary of the whole search (give the
+                         same --omega/--s/--config and --dry-run as the jobs)
 
 Testing options:
   --split-test N         With --single or a 1-thread --dry-run: split the search
@@ -205,6 +230,18 @@ inline std::optional<double> parse_seconds(const std::string& text) {
     return value;
 }
 
+// CPUs this process may run on (sched_getaffinity on Linux; hardware threads elsewhere)
+inline unsigned usable_cpus() {
+#ifdef __linux__
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        return static_cast<unsigned>(CPU_COUNT(&set));
+    }
+#endif
+    return std::thread::hardware_concurrency();
+}
+
 inline ParseResult parse(int argc, char* argv[]) {
     Options options;
     int modes_given = 0;
@@ -251,6 +288,11 @@ inline ParseResult parse(int argc, char* argv[]) {
             options.threads = *n;
             options.thread_source = ThreadSource::CommandLine;
             threads_given = true;
+            if (*n == 0) { // The CPUs this process may run on (its affinity mask, e.g. a Slurm task's CPUs)
+                options.threads = usable_cpus();
+                options.thread_source = ThreadSource::Affinity;
+                if (options.threads == 0) return {std::nullopt, "--threads 0: could not count the usable CPUs"};
+            }
         } else if (arg == "--log-interval") {
             const auto v = value();
             const auto n = v ? parse_unsigned(*v) : std::nullopt;
@@ -286,6 +328,17 @@ inline ParseResult parse(int argc, char* argv[]) {
             const auto n = v ? parse_unsigned(*v) : std::nullopt;
             if (!n) return {std::nullopt, arg + " needs a non-negative integer"};
             (arg == "--mpi-request-idle" ? options.mpi_request_idle : options.mpi_pool_reserve) = *n;
+            options.mpi_tuning_given = true;
+        } else if (arg == "--pool" || arg == "--pool-status") {
+            const auto v = value();
+            if (!v || v->empty()) return {std::nullopt, arg + " needs a directory"};
+            (arg == "--pool" ? options.pool_dir : options.pool_status_dir) = *v;
+        } else if (arg == "--pool-poll" || arg == "--pool-stale" || arg == "--pool-idle-timeout") {
+            const auto v = value();
+            const auto secs = v ? parse_seconds(*v) : std::nullopt;
+            if (!secs || *secs <= 0) return {std::nullopt, arg + " needs a positive number of seconds"};
+            (arg == "--pool-poll" ? options.pool_poll : arg == "--pool-stale" ? options.pool_stale
+                                                                              : options.pool_idle_timeout) = *secs;
             options.mpi_tuning_given = true;
         } else if (arg == "--steal-stress" && flag_only()) {
             options.steal_stress = true;
@@ -374,8 +427,8 @@ inline ParseResult parse(int argc, char* argv[]) {
     }
 
     // Checkpoints
-    if (checkpoint_interval_given && options.checkpoint_file.empty()) {
-        return {std::nullopt, "--checkpoint-interval needs --checkpoint PATH"};
+    if (checkpoint_interval_given && options.checkpoint_file.empty() && options.pool_dir.empty()) {
+        return {std::nullopt, "--checkpoint-interval needs --checkpoint PATH (or --pool DIR)"};
     }
     if (options.resume_any_commit && options.resume_file.empty()) {
         return {std::nullopt, "--resume-any-commit needs --resume PATH"};
@@ -389,6 +442,9 @@ inline ParseResult parse(int argc, char* argv[]) {
     }
 
     // MPI
+    if (!options.pool_dir.empty() && !options.mpi) {
+        return {std::nullopt, "--pool needs --mpi (lpr_mpi; one job may be a single rank)"};
+    }
     const bool mpi_tuning = options.mpi_static || options.mpi_stress || options.mpi_tuning_given;
     if (mpi_tuning && !options.mpi) {
         return {std::nullopt, "--mpi-static, --mpi-stress, --mpi-request-idle and --mpi-pool-reserve need --mpi"};
@@ -408,6 +464,13 @@ inline ParseResult parse(int argc, char* argv[]) {
         }
         if (options.mpi_request_idle == 0) {
             return {std::nullopt, "--mpi-request-idle must be at least 1"};
+        }
+        if (!options.pool_dir.empty() && !options.checkpoint_file.empty()) {
+            return {std::nullopt, "--pool keeps its own state in the pool directory: do not give --checkpoint "
+                                  "(--resume seeds a new pool from a checkpoint)"};
+        }
+        if (!options.pool_dir.empty() && options.mpi_static) {
+            return {std::nullopt, "--mpi-static cannot be combined with --pool"};
         }
         options.mpi_request_idle = std::min(options.mpi_request_idle, options.threads);
     }

@@ -45,6 +45,14 @@
  * which every rank acknowledges with EXIT_ACK as its last message. A resumed run
  * may use any number of ranks: rank 0 reads the checkpoint and pools its tasks.
  *
+ * Pool mode (--pool DIR, pool.hpp, docs/elastic_pool.md): several independent jobs
+ * share one search through a directory. Rank 0 takes tasks from the pool when this
+ * job runs out, gives tasks back when another job asks, keeps its lease alive, and
+ * releases leases of dead jobs. Every change to what this job holds is recorded by a
+ * coordinated collection (as for a checkpoint) that writes the job's lease state; the
+ * job never stops on its own: when it is done with the pool (complete, idle too long,
+ * or a signal) a final collection releases its lease and EXIT ends every rank.
+ *
  * Watchdog: rank 0 sends every rank a heartbeat every HEARTBEAT_TO_RANKS, and
  * every rank sends rank 0 a Status every STATUS_INTERVAL. A rank that hears
  * nothing from rank 0 for WATCHDOG (or rank 0 from a rank) calls MPI_Abort, so
@@ -58,6 +66,7 @@
 
 #include "generate_supports.hpp"
 #include "logging.hpp"
+#include "pool.hpp"
 #include "stats.hpp"
 #include "work_stealing.hpp"
 
@@ -277,12 +286,14 @@ struct NodeCounters {
     std::uint64_t paused_ns = 0;         // Time this rank's workers were paused for checkpoints
     std::uint64_t checkpoints_written = 0; // Rank 0
     std::uint64_t checkpoints_failed = 0;  // Rank 0: collected but not written
-    static constexpr std::size_t WORDS = 18;
+    std::uint64_t threads = 0;             // This rank's worker threads
+    static constexpr std::size_t WORDS = 19;
 
     Words words() const {
         return {tasks_received, requests_sent, request_wait_ns, donations_asked, donations_sent, donations_refused,
                 messages_sent, messages_received, tasks_issued, donations_requested, pool_max, worker_idle_ns,
-                supports_processed, supports_emitted, elapsed_ns, paused_ns, checkpoints_written, checkpoints_failed};
+                supports_processed, supports_emitted, elapsed_ns, paused_ns, checkpoints_written, checkpoints_failed,
+                threads};
     }
     static NodeCounters from(const std::uint64_t* w) {
         NodeCounters c;
@@ -290,7 +301,7 @@ struct NodeCounters {
         c.donations_sent = w[4]; c.donations_refused = w[5]; c.messages_sent = w[6]; c.messages_received = w[7];
         c.tasks_issued = w[8]; c.donations_requested = w[9]; c.pool_max = w[10]; c.worker_idle_ns = w[11];
         c.supports_processed = w[12]; c.supports_emitted = w[13]; c.elapsed_ns = w[14];
-        c.paused_ns = w[15]; c.checkpoints_written = w[16]; c.checkpoints_failed = w[17];
+        c.paused_ns = w[15]; c.checkpoints_written = w[16]; c.checkpoints_failed = w[17]; c.threads = w[18];
         return c;
     }
 };
@@ -303,6 +314,7 @@ struct NodeOptions {
     bool checkpoints = false;   // Write checkpoints (through the writer callback)
     double checkpoint_interval = 0; // Seconds between periodic checkpoints (0: only on signals)
     std::chrono::milliseconds pause_timeout{60000}; // Workers must stop within this (watchdog: 120 s)
+    pool::Pool* pool = nullptr; // Rank 0 in pool mode: the shared pool (owned by the caller)
 };
 
 // Rank 0: writes a checkpoint of `tasks` and `stats` (the earlier runs' work
@@ -548,6 +560,14 @@ private:
     std::string exit_reason_;
     int signal_number_ = 0;
     int signal_rank_ = -1;
+    // Pool mode (rank 0)
+    bool pool_final_ = false;     // The current collection ends this job's part (release, EXIT)
+    int pool_exit_code_ = 0;      // EXIT code after a final release that was not caused by a signal
+    std::uint64_t export_wanted_ = 0; // Ask a rank for a donation to give to another job
+    Clock::time_point next_pool_poll_{};
+    Clock::time_point next_pool_heartbeat_{};
+    Clock::time_point empty_since_{};
+    bool empty_ = false;
 
     static std::uint64_t elapsed_ns(Clock::time_point since) {
         return static_cast<std::uint64_t>(
@@ -1099,6 +1119,10 @@ private:
             }
         }
         const double pause_s = std::chrono::duration<double>(Clock::now() - collect_started_).count();
+        if (options_.pool != nullptr) {
+            finish_pool_collecting(tasks, consistent, error, pause_s);
+            return;
+        }
         if (consistent && tasks.empty()) {
             // Nothing is left: the search is finishing (as Scheduler's SearchFinishing)
             lpr::log::info("MPI: checkpoint skipped: no work is left, the search is finishing");
@@ -1129,6 +1153,147 @@ private:
         next_checkpoint_ = Clock::now() + checkpoint_period();
     }
 
+    // Pool mode: records the collected state as this job's lease state, then either
+    // continues (RESUME) or releases the lease and ends the job (EXIT)
+    void finish_pool_collecting(const std::vector<Task>& tasks, bool consistent, std::string& error, double pause_s) {
+        pool::Pool& pool = *options_.pool;
+        if (!consistent) {
+            // The lease keeps its previous state (still valid); try again later
+            ++counters_.checkpoints_failed;
+            lpr::log::warn("pool: lease state not written: " + error);
+            if (exit_after_ || pool_final_) fatal("pool: cannot release the lease: " + error);
+            for (int r = 0; r < size_; ++r) send(r, TAG_RESUME, {});
+            next_checkpoint_ = Clock::now() + checkpoint_period();
+            return;
+        }
+        if (!pool.write_state(tasks, collected_stats_, error)) {
+            fatal("pool: " + error); // The lease was taken over, or the directory failed: stop at once
+        }
+        ++counters_.checkpoints_written;
+        if (trace_ || exit_after_ || pool_final_) {
+            lpr::log::info("pool: lease state written: " + std::to_string(tasks.size()) + " tasks, "
+                           + std::to_string(collected_stats_.total_support_count) + " supports processed ("
+                           + std::to_string(pause_s) + " s paused)");
+        }
+        if (exit_after_ || pool_final_) {
+            if (!pool.release_own(error)) fatal("pool: " + error);
+            lpr::log::info("pool: lease " + pool.lease() + " released (" + std::to_string(tasks.size())
+                           + " tasks returned to the pool; " + std::to_string(pool.claims()) + " claimed, "
+                           + std::to_string(pool.donations()) + " given away)");
+            saved_stats_ = collected_stats_;
+            const int code = exit_after_ ? 4 : pool_exit_code_;
+            exit_reason_ = exit_after_ ? "lease released, its remaining work returned to the pool"
+                                       : (pool_exit_code_ == 0 ? "the pool has no work left for this job" : "idle");
+            exit_sent_ = true;
+            for (int r = 0; r < size_; ++r) send(r, TAG_EXIT, {static_cast<std::uint64_t>(code)});
+            return;
+        }
+        for (int r = 0; r < size_; ++r) send(r, TAG_RESUME, {});
+        next_checkpoint_ = Clock::now() + checkpoint_period();
+    }
+
+    double seconds_since(Clock::time_point t) const {
+        return std::chrono::duration<double>(Clock::now() - t).count();
+    }
+
+    static Clock::duration seconds(double s) {
+        return std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(s));
+    }
+
+    /*
+     * Pool mode, rank 0, between collections: keep the lease alive, take tasks when
+     * this job runs out, give tasks to jobs that ask, release dead jobs' leases, and
+     * end this job's part when the pool has nothing left for it.
+     */
+    void pool_step(bool& acted) {
+        pool::Pool& pool = *options_.pool;
+        const pool::Options& po = pool.options();
+        const auto now = Clock::now();
+        std::string error;
+        if (now >= next_pool_heartbeat_) {
+            if (!pool.touch_heartbeat(error)) fatal("pool: " + error);
+            next_pool_heartbeat_ = now + seconds(po.heartbeat_seconds);
+        }
+        if (now < next_pool_poll_) return;
+        // (Until every rank has reported, this job's state is unknown: look again soon)
+        if (!std::all_of(ranks_.begin(), ranks_.end(), [](const RankView& v) { return v.known; })) return;
+        next_pool_poll_ = now + seconds(po.poll_seconds);
+
+        bool any_donating = false, any_hungry = false;
+        for (const RankView& v : ranks_) {
+            any_donating = any_donating || v.donating;
+            any_hungry = any_hungry || v.hungry;
+        }
+        const bool all_empty = std::all_of(ranks_.begin(), ranks_.end(),
+                                           [this](const RankView& v) { return holds_nothing(v); });
+        const bool job_empty = pool_.empty() && all_empty && !any_donating;
+        const bool starving = pool_.empty() && any_hungry && !any_donating && pick_donor(true) < 0;
+
+        std::string log;
+        if (pool.release_stale(log) > 0 || !log.empty()) lpr::log::info("pool: " + log);
+
+        if (job_empty || starving) {
+            // Take tasks: a whole empty job takes one per rank (more spread faster), a starving one one
+            auto check = [this](const Task& t, std::string& why) {
+                return check_stack_.restore(t, primes_, bound_, check_support_, &why);
+            };
+            const std::size_t want = job_empty ? static_cast<std::size_t>(size_) : 1;
+            std::vector<Task> got = pool.claim(want, check, error);
+            if (!error.empty()) fatal("pool: " + error);
+            if (!got.empty()) {
+                for (Task& t : got) pool_.push_back(std::move(t));
+                pool.set_request(false);
+                empty_ = false;
+                start_collecting(); // Records the claims in the lease state before the work starts
+                acted = true;
+                return;
+            }
+            if (!job_empty) return;
+            // Nothing to take: ask the other jobs, and leave once the pool has nothing left
+            if (!empty_) {
+                // Just ran out: record that (other jobs then see this lease as idle)
+                empty_ = true;
+                empty_since_ = now;
+                pool.set_request(true);
+                start_collecting();
+                acted = true;
+                return;
+            }
+            std::uint64_t others_remaining = 0;
+            const bool others_busy = pool.others_busy(others_remaining) > 0;
+            if (pool.ready_count() == 0 && !others_busy) {
+                lpr::log::info("pool: no work left for this job (ready 0, other leases idle or none): leaving");
+                pool_final_ = true;
+                pool_exit_code_ = 0;
+                start_collecting();
+                acted = true;
+            } else if (seconds_since(empty_since_) > po.idle_timeout_seconds) {
+                lpr::log::info("pool: idle for " + std::to_string(static_cast<long>(seconds_since(empty_since_)))
+                               + " s with other jobs still working: leaving");
+                pool_final_ = true;
+                pool_exit_code_ = 0;
+                start_collecting();
+                acted = true;
+            }
+            return;
+        }
+        empty_ = false;
+        pool.set_request(false);
+        // Give a task to another job that asks (one per poll), from this job's spare tasks
+        if (pool.other_requests() > 0 && pool.ready_count() == 0) {
+            if (!pool_.empty()) {
+                Task t = std::move(pool_.back());
+                pool_.pop_back();
+                if (!pool.prepare_donation(t, error)) fatal("pool: " + error);
+                export_wanted_ = 0;
+                start_collecting(); // Drops the task from the lease state, then publishes it
+                acted = true;
+            } else {
+                export_wanted_ = 1; // Ask a rank to split off a piece (L2 below)
+            }
+        }
+    }
+
     void server_step(bool& acted) {
         const auto now = Clock::now();
         if (now - last_heartbeat_sent_ >= HEARTBEAT_TO_RANKS && !stop_sent_ && !exit_sent_) {
@@ -1149,6 +1314,10 @@ private:
             start_collecting();
             acted = true;
             return;
+        }
+        if (options_.pool != nullptr) {
+            pool_step(acted);
+            if (collecting_) return;
         }
         // Serve open requests: ranks holding nothing first, then most idle workers
         while (!pool_.empty()) {
@@ -1179,7 +1348,8 @@ private:
             // (With one rank a reserve would only move work out of the rank and back)
             const long long reserve = options_.stress ? 2LL * size_
                                     : size_ == 1 ? 0 : static_cast<long long>(options_.pool_reserve);
-            long long wanted = hungry + reserve - static_cast<long long>(pool_.size()) - donating;
+            long long wanted = hungry + reserve + static_cast<long long>(export_wanted_)
+                               - static_cast<long long>(pool_.size()) - donating;
             while (wanted-- > 0) {
                 const int donor = pick_donor(someone_empty);
                 if (donor < 0) break;
@@ -1191,8 +1361,9 @@ private:
         }
         counters_.pool_max = std::max<std::uint64_t>(counters_.pool_max, pool_.size());
         pool_size_.store(pool_.size(), std::memory_order_relaxed);
-        // Termination: nothing in the pool, in flight, or on any rank
-        if (pool_.empty() && std::all_of(ranks_.begin(), ranks_.end(),
+        // Termination: nothing in the pool, in flight, or on any rank (in pool mode the
+        // job instead takes more work or leaves through pool_step)
+        if (options_.pool == nullptr && pool_.empty() && std::all_of(ranks_.begin(), ranks_.end(),
                                          [this](const RankView& v) { return holds_nothing(v); })) {
             for (int r = 0; r < size_; ++r) send(r, TAG_STOP, {});
             stop_sent_ = true;
@@ -1235,14 +1406,14 @@ inline std::vector<NodeCounters> gather_node_counters(const NodeCounters& mine, 
 inline void print_summary(const std::vector<NodeCounters>& rows, const std::vector<std::string>& hosts) {
     std::cout << "MPI summary:\n"
               << "------------\n"
-              << "rank  host                 supports   emitted    idle_s  tasks_in  requests  wait_s  "
+              << "rank  host               threads    supports   emitted    idle_s  tasks_in  requests  wait_s  "
                  "donated  refused  asked  msgs_out  msgs_in\n";
     for (std::size_t r = 0; r < rows.size(); ++r) {
         const NodeCounters& c = rows[r];
         char line[512];
         std::snprintf(line, sizeof line,
-                      "%4zu  %-18.18s %11llu %9llu %9.2f %9llu %9llu %7.3f %8llu %8llu %6llu %9llu %8llu\n",
-                      r, r < hosts.size() ? hosts[r].c_str() : "?",
+                      "%4zu  %-18.18s %7llu %11llu %9llu %9.2f %9llu %9llu %7.3f %8llu %8llu %6llu %9llu %8llu\n",
+                      r, r < hosts.size() ? hosts[r].c_str() : "?", static_cast<unsigned long long>(c.threads),
                       static_cast<unsigned long long>(c.supports_processed),
                       static_cast<unsigned long long>(c.supports_emitted), c.worker_idle_ns / 1e9,
                       static_cast<unsigned long long>(c.tasks_received),

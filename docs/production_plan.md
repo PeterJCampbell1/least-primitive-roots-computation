@@ -11,6 +11,7 @@ Status: **agreed 27/10/26**, revised the same day; the plan of record. It supers
 - **Then, optionally:** the same test with periodic checkpoints (`LPR_CHECKPOINT_INTERVAL=120`), and a 3- or 4-node OMEGA=32 run.
 
 ## 2. Tuning on Friday
+Step-by-step commands to hand over: [`friday_step2.md`](friday_step2.md).
 - **Compilers:** 1-node OMEGA=33 S=29, GCC 12.3 against the Clang 16 module (`module load` it, then `LPR_CXX=clang++`). If Clang 16 falls well short of Rangpur's clang 21 gain, install LLVM 21 into `~/opt` (the prebuilt release, or conda-forge).
 - **Scaling:** 3- and 4-node OMEGA=32 runs on 28-CPU nodes.
 - **Limits:**
@@ -21,6 +22,7 @@ Status: **agreed 27/10/26**, revised the same day; the plan of record. It supers
 - **Gate:** exact summaries, and a chosen build (compiler and flags) and node type for OMEGA=31.
 
 ## 3. Dynamic allocations, to use Friday better for OMEGA=31
+Status: **implemented and verified locally 27/10/26** (`elastic_pool.md`); to test on Rangpur ([`rangpur_step34.md`](rangpur_step34.md)), then Friday.
 - **`lpr_mpi.slurm`:**
   - `#SBATCH --nodes=MIN-MAX`, so a job starts with whatever nodes are free;
   - `--prefer=<feature>` for the larger nodes, and `--mincpus` to exclude small ones;
@@ -29,6 +31,7 @@ Status: **agreed 27/10/26**, revised the same day; the plan of record. It supers
 - **Gate:** the fake-Slurm simulation with mixed thread counts and node counts, exact; then a mixed-node run on Friday.
 
 ## 4. Tolerating lost nodes, and nodes joining a running computation
+Status: **implemented and verified locally 27/10/26** as option (a): many independent jobs sharing one search through a pool directory (`elastic_pool.md`); to test on Rangpur ([`rangpur_step34.md`](rangpur_step34.md)), then Friday.
 **Goal:** a multi-day OMEGA=31 run that survives a node failure without restarting the whole job from the last checkpoint, and that can take on more nodes as they become free.
 
 Design questions to settle before implementing:

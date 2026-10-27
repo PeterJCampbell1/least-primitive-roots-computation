@@ -38,6 +38,22 @@
 # search is complete, at most LPR_MAX_RUNS runs (default 20); a requeued job rebuilds on
 # its new nodes. A node failure ends the whole job (plain MPI cannot lose a rank); with
 # --requeue Slurm may requeue it, and it resumes from the last periodic checkpoint.
+# Dynamic allocations (docs/elastic_pool.md): without --cpus-per-task, each rank uses
+# every CPU of its own node (srun --whole, and lpr's --threads 0: the CPUs the process
+# may use), so a job may mix node sizes; with --nodes=MIN-MAX Slurm starts the job with
+# as many nodes as it can find. Larger nodes can be preferred with --prefer=<feature>
+# (Slurm 22.05+) and small ones excluded with --mincpus=N, e.g.
+#   sbatch --nodes=2-4 --mincpus=28 --prefer=<feature of the big nodes> lpr_mpi.slurm
+#
+# Shared pool (LPR_POOL=<directory on shared storage>): the job joins (or creates) a
+# pool shared with any number of other jobs, e.g. a job array
+#   LPR_POOL=$HOME/pools/k31 sbatch --array=1-4 --nodes=1-2 lpr_mpi.slurm
+# Jobs may start, leave and die at any time: a job killed by a node failure loses at most
+# its last LPR_CHECKPOINT_INTERVAL seconds, released by another job after LPR_POOL_STALE
+# seconds. A job leaves with exit 0 when the pool has nothing left for it; at the time
+# limit it returns its work to the pool, exits with 4 and requeues itself to rejoin. The
+# last job to leave prints the whole search's merged summary; any time later,
+# `lpr --pool-status <directory>` (with the same --omega/--s) reports on it and verifies it.
 # Exit codes as lpr, plus 5: an MPI fatal error (a rank aborted the job, e.g. the
 # watchdog found a rank silent for 120 s).
 #
@@ -54,6 +70,9 @@
 #   LPR_CHECKPOINT_INTERVAL seconds between checkpoints (default 600)
 #   LPR_REQUEUE     0: do not requeue after a checkpoint (continue with resubmit.sh)
 #   LPR_MAX_RUNS    most runs of one job when requeueing (default 20)
+#   LPR_POOL        a pool directory on shared storage: share the search with other jobs
+#   LPR_POOL_STALE  seconds without a heartbeat before another job releases a lease (600)
+#   LPR_POOL_POLL   seconds between rank 0's looks at the pool (10)
 
 #SBATCH --job-name=lpr_mpi
 #SBATCH --account=<account>
@@ -84,8 +103,17 @@ if [ -n "$MPI_MODULE" ]; then
 fi
 
 nodes=${SLURM_NNODES:-1}
-threads=${SLURM_CPUS_PER_TASK:-1}
-echo "Job ${SLURM_JOB_ID}: ${nodes} nodes (${SLURM_JOB_NODELIST}), ${threads} threads per rank (run $(( ${SLURM_RESTART_COUNT:-0} + 1 )) of this job, $(date '+%Y-%m-%d %H:%M:%S'))"
+# Threads per rank: --cpus-per-task if given; otherwise every CPU of each rank's own node
+# (the launch gives each task its whole node, and lpr counts the CPUs it may use)
+if [ -n "${SLURM_CPUS_PER_TASK:-}" ]; then
+    threads=$SLURM_CPUS_PER_TASK; lpr_threads=$threads; per_node="$threads threads per rank"
+else
+    # Smallest CPU count over the nodes (SLURM_JOB_CPUS_PER_NODE is e.g. "28(x2),36"),
+    # for launchers that cannot give each task its whole node
+    threads=$(echo "${SLURM_JOB_CPUS_PER_NODE:-1}" | tr ',' '\n' | sed 's/(x[0-9]*)//' | sort -n | head -1)
+    lpr_threads=0; per_node="each rank uses its node's CPUs (${SLURM_JOB_CPUS_PER_NODE:-?})"
+fi
+echo "Job ${SLURM_JOB_ID}: ${nodes} nodes (${SLURM_JOB_NODELIST}), ${per_node} (run $(( ${SLURM_RESTART_COUNT:-0} + 1 )) of this job, $(date '+%Y-%m-%d %H:%M:%S'))"
 
 # An MPI library must be available: its compiler wrapper (for the flags) and launcher,
 # unless both are given explicitly
@@ -129,7 +157,11 @@ echo "MPI link flags:${mpi_libs}"
 launch=${LPR_LAUNCH:-}
 if [ -z "$launch" ]; then
     plugins=$(srun --mpi=list 2>&1 || true)
-    srun_step="-N ${nodes} -n ${nodes} --ntasks-per-node=1 -c ${threads}"
+    if [ "$lpr_threads" = 0 ] && srun --help 2>&1 | grep -q -- "--whole"; then
+        srun_step="-N ${nodes} -n ${nodes} --ntasks-per-node=1 --whole" # Each task gets its whole node
+    else
+        srun_step="-N ${nodes} -n ${nodes} --ntasks-per-node=1 -c ${threads}"
+    fi
     if mpirun --version 2>&1 | grep -q "Open MPI"; then
         export PMIX_MCA_psec=native # PMIx's optional munge security plugin is often missing: no warnings
         if echo "$plugins" | grep -qw pmix; then launch="srun --mpi=pmix $srun_step"
@@ -146,7 +178,9 @@ if [ "${LPR_BUILD:-0}" = 1 ]; then
     [ -f "$build_script" ] || build_script=scripts/slurm/build_lpr.sh
     [ -f "$build_script" ] || { echo "build_lpr.sh not found"; exit 2; }
     export LPR_TARGET=lpr_mpi LPR_MPI_CFLAGS="$mpi_cflags" LPR_MPI_LIBS="$mpi_libs"
-    srun --mpi=none -N "${nodes}" -n "${nodes}" --ntasks-per-node=1 -c "${threads}" bash -c '
+    build_cpus="-c ${threads}"
+    [ "$lpr_threads" = 0 ] && srun --help 2>&1 | grep -q -- "--whole" && build_cpus="--whole"
+    srun --mpi=none -N "${nodes}" -n "${nodes}" --ntasks-per-node=1 $build_cpus bash -c '
         host=$(hostname -s); dir=build_$host
         rm -rf "$dir" && mkdir -p "$dir" && cp -R src Makefile "$dir"/ && cp "$1" "$dir"/build_lpr.sh
         cd "$dir" && bash ./build_lpr.sh > build.log 2>&1
@@ -170,13 +204,17 @@ case " $lpr_args " in
 esac
 # Checkpoints: a requeued or resubmitted job finds lpr.ckpt and continues from it
 checkpoint_args="--checkpoint lpr.ckpt --checkpoint-interval ${LPR_CHECKPOINT_INTERVAL:-600}"
-if [ -f lpr.ckpt ]; then
+if [ -n "${LPR_POOL:-}" ]; then
+    # The pool holds the state (no lpr.ckpt); a requeued job simply rejoins it
+    checkpoint_args="--pool ${LPR_POOL} --checkpoint-interval ${LPR_CHECKPOINT_INTERVAL:-600} --pool-stale ${LPR_POOL_STALE:-600} --pool-poll ${LPR_POOL_POLL:-10}"
+    echo "Pool: ${LPR_POOL}"
+elif [ -f lpr.ckpt ]; then
     checkpoint_args="$checkpoint_args --resume lpr.ckpt"
     echo "Continuing from lpr.ckpt: $(grep -E '^(segments|elapsed_seconds|complete) ' lpr.ckpt | tr '\n' ' ')"
 fi
 # Progress log: rank 0 writes lpr_mpi_<jobid>.log (its all_ranks_* fields cover every
 # rank); rank r writes lpr_mpi_<jobid>.log.rank<r>
-args="$lpr_mode --mpi --threads $threads --log-interval ${LPR_LOG_INTERVAL:-60} --log-file lpr_mpi_${SLURM_JOB_ID}.log $checkpoint_args $lpr_args"
+args="$lpr_mode --mpi --threads $lpr_threads --log-interval ${LPR_LOG_INTERVAL:-60} --log-file lpr_mpi_${SLURM_JOB_ID}.log $checkpoint_args $lpr_args"
 echo "Launch: $launch"
 echo "Running: $binary $args"
 # The launcher runs in the background so that this script can forward Slurm's warning
@@ -194,7 +232,11 @@ done
 trap - USR1
 
 case ${status} in
-    0) case " ${lpr_args} " in
+    0) if [ -n "${LPR_POOL:-}" ]; then
+           echo "lpr_mpi left the pool: no work left for this job (see the end of the output: the whole search's summary appears there once the pool is complete)"
+           exit 0
+       fi
+       case " ${lpr_args} " in
            *" --dry-run "*) echo "lpr_mpi finished: dry run (producer only), nothing verified" ;;
            *) echo "lpr_mpi finished: verification complete" ;;
        esac ;;
@@ -202,6 +244,16 @@ case ${status} in
     2) echo "lpr_mpi did not start: usage error (see the Running: line above and lpr_mpi_${SLURM_JOB_ID}.err)" ;;
     3) echo "lpr_mpi was interrupted: partial run, nothing verified, no checkpoint written" ;;
     4|143) # 143: SIGTERM before lpr_mpi had started (lpr.ckpt, if any, is untouched)
+       if [ -n "${LPR_POOL:-}" ]; then
+           # Pool: the job returned its work to the pool; requeue to rejoin it
+           runs=$(( ${SLURM_RESTART_COUNT:-0} + 1 ))
+           echo "lpr_mpi left the pool at the time limit, returning its work (${runs} runs of this job so far)"
+           if [ "${LPR_REQUEUE:-1}" = 1 ] && [ "${runs}" -lt "${LPR_MAX_RUNS:-20}" ]; then
+               echo "Requeueing job ${SLURM_JOB_ID} to rejoin the pool"
+               scontrol requeue "${SLURM_JOB_ID}" && exit 0
+           fi
+           exit ${status}
+       fi
        if [ ${status} = 143 ] && [ ! -f lpr.ckpt ]; then
            echo "lpr_mpi was killed by SIGTERM before it started; no checkpoint exists"
            exit ${status}

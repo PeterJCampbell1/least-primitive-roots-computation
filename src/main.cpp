@@ -11,6 +11,7 @@
 #include "trial_division.hpp"
 #include "logging.hpp"
 #include "mpi_comm.hpp"
+#include "pool.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -625,6 +626,32 @@ int main(int argc, char* argv[])
     const std::uint64_t segment = resuming ? resumed.segments + 1 : 1;
     const double earlier_elapsed = resuming ? resumed.elapsed_seconds : 0.0;
 
+    // --pool-status: report on a pool (and merge it if its search is complete), then exit
+    if (!options.pool_status_dir.empty()) {
+        lpr::pool::Options po;
+        po.stale_seconds = options.pool_stale;
+        lpr::pool::Pool pool(options.pool_status_dir, fingerprint, po);
+        const lpr::pool::Status st = pool.status(true);
+        std::cout << "Pool " << options.pool_status_dir << ": " << st.ready << " ready tasks, " << st.leases
+                  << " active leases (" << st.stale_leases << " without a heartbeat for " << po.stale_seconds
+                  << " s; " << st.leases_remaining_tasks << " tasks in their last states, "
+                  << st.processed_in_leases << " supports processed in them), " << st.done << " done records, "
+                  << st.requests << " requests\n";
+        if (!st.complete) {
+            std::cout << "Not complete: " << st.problem << "\n"
+                      << "Supports processed in done records so far: " << st.merged.total_support_count << '\n';
+            return 3;
+        }
+        std::cout << "Complete: every task created was finished by exactly one lease. Whole search:\n\n";
+        if (mode != RunMode::DryRun) {
+            st.merged.print();
+            std::cout << '\n';
+        }
+        st.merged.print_producer();
+        if (mode == RunMode::DryRun) std::cout << "DRY RUN: no primes were tested or verified\n";
+        return st.merged.unresolved_count > 0 || st.merged.certified_inequality_fail_count > 0 ? 1 : 0;
+    }
+
     // Print run and configuration settings
     std::string log_target = options.log_file.empty() ? "stderr" : options.log_file;
     if (options.mpi && mpi_size > 1) {
@@ -678,6 +705,7 @@ int main(int argc, char* argv[])
     if (options.mpi) {
         mpi_hosts = lpr::mpi::gather_hostnames(mpi_rank, mpi_size);
         std::cout << "mpi: " << mpi_size << " ranks x " << options.threads << " threads"
+                  << (options.thread_source == lpr::cli::ThreadSource::Affinity ? " (rank 0; each rank counts its own CPUs)" : "")
                   << (options.mpi_static ? ", static split (M1)" : "")
                   << ", request when " << options.mpi_request_idle << " workers idle, pool reserve "
                   << options.mpi_pool_reserve
@@ -720,7 +748,9 @@ int main(int argc, char* argv[])
                    + " s=" + std::to_string(search.s)
                    + " commit=" + LPR_GIT_COMMIT
                    + (resuming ? " resumed_from=" + options.resume_file + " run=" + std::to_string(segment) : ""));
-    if (resuming && mpi_rank == 0) { // (Under MPI only rank 0: the final reduction sums every rank)
+    if (resuming && mpi_rank == 0 && options.pool_dir.empty()) {
+        // (Under MPI only rank 0: the final reduction sums every rank. In pool mode the
+        // earlier runs' statistics go into the pool's INIT record instead.)
         lpr::stats::get_master_stats().merge(resumed.stats); // The earlier runs' work
     }
 
@@ -734,6 +764,7 @@ int main(int argc, char* argv[])
                                        steal_max_prefix, options.mpi ? std::vector<lpr::producer::detail::Task>{} : tasks,
                                        options.mpi);
 #ifdef LPR_MPI
+    std::optional<lpr::pool::Pool> pool; // Rank 0 in pool mode
     std::optional<lpr::mpi::Node> mpi_node;
     if (options.mpi) {
         lpr::mpi::NodeOptions node_options;
@@ -741,10 +772,42 @@ int main(int argc, char* argv[])
         node_options.pool_reserve = options.mpi_pool_reserve;
         node_options.stress = options.mpi_stress;
         node_options.static_split = options.mpi_static;
-        node_options.checkpoints = !options.checkpoint_file.empty();
+        node_options.checkpoints = !options.checkpoint_file.empty() || !options.pool_dir.empty();
         node_options.checkpoint_interval = options.checkpoint_interval;
+        if (!options.pool_dir.empty()) {
+            // Rank 0 joins (or creates) the pool and starts this job's lease; every rank
+            // learns whether that worked
+            int ok = 1;
+            if (mpi_rank == 0) {
+                lpr::pool::Options po;
+                po.poll_seconds = options.pool_poll;
+                po.stale_seconds = options.pool_stale;
+                po.idle_timeout_seconds = options.pool_idle_timeout;
+                po.heartbeat_seconds = std::min(30.0, options.pool_stale / 4);
+                pool.emplace(options.pool_dir, fingerprint, po);
+                std::string error;
+                const std::vector<lpr::producer::detail::Task> seed =
+                    resuming ? resumed.tasks : std::vector<lpr::producer::detail::Task>{lpr::producer::detail::root_task(primes.size())};
+                const lpr::stats::Counters seed_stats = resuming ? resumed.stats : lpr::stats::Counters{};
+                const std::string lease = lpr::mpi::hostname() + "." + std::to_string(::getpid()) + "."
+                                          + std::to_string(static_cast<long long>(std::time(nullptr)));
+                if (!pool->open(seed, seed_stats, options.resume_any_commit, error) || !pool->begin_lease(lease, error)) {
+                    std::cerr << "Error: --pool: " << error << '\n';
+                    ok = 0;
+                } else {
+                    lpr::log::info("pool: " + std::string(pool->created() ? "created " : "joined ") + options.pool_dir
+                                   + " as lease " + lease
+                                   + (pool->created() && resuming ? " (seeded from " + options.resume_file + ")" : ""));
+                    std::cout << "pool: " << options.pool_dir << " (" << (pool->created() ? "created" : "joined")
+                              << "; lease " << lease << ")\n";
+                }
+            }
+            MPI_Bcast(&ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            if (!ok) return 2;
+            if (mpi_rank == 0) node_options.pool = &*pool;
+        }
         std::vector<lpr::producer::detail::Task> initial;
-        if (mpi_rank == 0) {
+        if (mpi_rank == 0 && options.pool_dir.empty()) { // (In pool mode the tasks come from the pool)
             initial = options.mpi_static && !resuming
                 ? lpr::mpi::static_split(primes, bound, 4 * static_cast<std::size_t>(mpi_size))
                 : tasks; // The root task, or the resumed checkpoint's tasks
@@ -857,6 +920,41 @@ int main(int argc, char* argv[])
                 // code 4) or not (3). The workers are paused (or running if a pause
                 // failed), so they are not joined: print, finalise MPI and exit.
                 const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+                if (mpi_rank == 0 && pool) {
+                    // Pool mode: this job's part is over (exit code 4 after a signal, else 0)
+                    const lpr::stats::Counters job = mpi_node->saved_stats();
+                    const std::string notice = "This job's part of the pooled search ended after " + std::to_string(seconds)
+                        + " s (" + mpi_node->exit_reason() + "; exit code " + std::to_string(exit_code) + ")";
+                    lpr::log::info(notice);
+                    std::cout << '\n' << notice << "\n\nThis job's share of the search (not the whole search):\n";
+                    if (mode != RunMode::DryRun) {
+                        job.print();
+                        std::cout << '\n';
+                    }
+                    job.print_producer();
+                    std::cout << "Elapsed time: " << seconds << " s\n";
+                    const lpr::pool::Status st = pool->status(true);
+                    int code = exit_code;
+                    if (st.complete) {
+                        lpr::log::info("pool: the search is complete; merged summary printed");
+                        std::cout << "\nPool " << options.pool_dir << " is complete: every task created was finished "
+                                  << "by exactly one lease. Whole search:\n\n";
+                        if (mode != RunMode::DryRun) {
+                            st.merged.print();
+                            std::cout << '\n';
+                        }
+                        st.merged.print_producer();
+                        if (mode == RunMode::DryRun) std::cout << "DRY RUN: no primes were tested or verified\n";
+                        if (st.merged.unresolved_count > 0 || st.merged.certified_inequality_fail_count > 0) code = 1;
+                    } else {
+                        std::cout << "\nPool " << options.pool_dir << " is not complete yet (" << st.problem
+                                  << "); check it later with --pool-status " << options.pool_dir << '\n';
+                    }
+                    std::cout.flush();
+                    std::cerr.flush();
+                    MPI_Finalize();
+                    std::_Exit(code);
+                }
                 if (mpi_rank == 0) {
                     const lpr::stats::Counters snapshot = mpi_node->saved_stats();
                     const std::string notice = "INTERRUPTED by a signal after " + std::to_string(seconds)
@@ -934,6 +1032,7 @@ int main(int argc, char* argv[])
     if (options.mpi) {
         lpr::mpi::NodeCounters& row = mpi_node->counters();
         row.worker_idle_ns = local_stats.worker_idle_ns;
+        row.threads = options.threads;
         row.supports_processed = local_stats.total_support_count;
         row.supports_emitted = local_stats.supports_emitted;
         mpi_rows = lpr::mpi::gather_node_counters(row, mpi_rank, mpi_size);
